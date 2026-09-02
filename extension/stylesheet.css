@@ -1,0 +1,31 @@
+/* PipeDeck Quick Settings menu styling. */
+
+.pipedeck-app-row {
+  spacing: 8px;
+  padding: 4px 0;
+}
+
+.pipedeck-app-icon {
+  icon-size: 16px;
+}
+
+.pipedeck-app-label {
+  min-width: 6em;
+  max-width: 9em;
+  text-overflow: ellipsis;
+}
+
+.pipedeck-app-slider {
+  min-width: 8em;
+}
+
+.pipedeck-mute-button {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+}
+
+.pipedeck-unavailable-item {
+  font-style: italic;
+  opacity: 0.7;
+}

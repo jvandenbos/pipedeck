@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=dev.pipedeck.Daemon
+Exec=/bin/false
+SystemdService=pipedeckd.service

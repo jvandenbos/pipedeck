@@ -1,0 +1,71 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- dev.pipedeck.Daemon1, generated from crates/pipedeckd/src/service.rs and kept
+     honest by the introspection_xml_matches_the_checked_in_copy unit test.
+     Bus name: dev.pipedeck.Daemon   Object path: /dev/pipedeck/Daemon
+     Safe to embed verbatim in a GJS client:
+       Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0] -->
+<node>
+<interface name="dev.pipedeck.Daemon1">
+  <!--
+   Make `name` the default sink or source.
+   -->
+  <method name="SetDefault">
+    <arg name="kind" type="s" direction="in"/>
+    <arg name="name" type="s" direction="in"/>
+  </method>
+  <!--
+   Set the notification sink; an empty name follows the default output.
+   -->
+  <method name="SetNotificationSink">
+    <arg name="name" type="s" direction="in"/>
+  </method>
+  <!--
+   Set the linear volume (0.0–1.5) of a device or stream node.
+   -->
+  <method name="SetVolume">
+    <arg name="id" type="u" direction="in"/>
+    <arg name="volume" type="d" direction="in"/>
+  </method>
+  <!--
+   Mute or unmute a device or stream node.
+   -->
+  <method name="SetMute">
+    <arg name="id" type="u" direction="in"/>
+    <arg name="mute" type="b" direction="in"/>
+  </method>
+  <!--
+   Route one stream at a named sink; an empty name restores the default.
+   -->
+  <method name="SetStreamTarget">
+    <arg name="id" type="u" direction="in"/>
+    <arg name="name" type="s" direction="in"/>
+  </method>
+  <!--
+   Re-read every node's params and re-publish the snapshot.
+   -->
+  <method name="Refresh">
+  </method>
+  <!--
+   "Something changed, re-read the properties." Coalesced to <= 10/s.
+   -->
+  <signal name="Changed">
+  </signal>
+  <!--
+   Sinks and sources: `(id, name, description, kind, is_default, virtual, volume, mute)`.
+   -->
+  <property name="Devices" type="a(usssbbdb)" access="read"/>
+  <!--
+   `node.name` of the notification sink; empty means "follow the default output".
+   -->
+  <property name="NotificationSink" type="s" access="read"/>
+  <!--
+   Playback streams: `(id, app_name, binary, media_name, target_name, volume, mute)`.
+   -->
+  <property name="Streams" type="a(ussssdb)" access="read"/>
+  <!--
+   Daemon version string.
+   -->
+  <property name="Version" type="s" access="read"/>
+</interface>
+</node>

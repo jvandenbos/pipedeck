@@ -1,0 +1,20 @@
+[package]
+name = "pipedeck-cli"
+description = "PipeDeck command line client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pipedeck"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+pipedeckd = { path = "../pipedeckd" }
+tokio.workspace = true
+zbus.workspace = true

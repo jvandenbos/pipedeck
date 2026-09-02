@@ -1,0 +1,15 @@
+[Unit]
+Description=PipeDeck audio control daemon
+Documentation=https://github.com/jvandenbos/pipedeck
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pipedeckd
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

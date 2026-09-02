@@ -1,0 +1,32 @@
+[package]
+name = "pipedeckd"
+description = "PipeDeck daemon: PipeWire audio control over D-Bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pipedeckd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pipedeckd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+libspa = "0.10"
+pipewire = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

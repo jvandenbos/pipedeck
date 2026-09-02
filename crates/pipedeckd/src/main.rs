@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use pipedeckd::config::Config;
+use pipedeckd::eq;
 use pipedeckd::pw::PwThread;
 use pipedeckd::service::{self, Daemon};
 use pipedeckd::state::State;
@@ -63,14 +64,45 @@ async fn serve() -> Result<()> {
         "loaded config"
     );
 
+    // SPEC §7.2: presets live in `<config dir>/eq/*.toml`. A missing directory
+    // is normal — it just means no EQ presets yet.
+    let presets_dir = match eq::presets_dir() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            warn!("running without EQ presets: {e}");
+            None
+        }
+    };
+    let (presets, problems) = presets_dir
+        .as_ref()
+        .map_or_else(|| (Vec::new(), Vec::new()), |dir| eq::load_presets(dir));
+    for problem in &problems {
+        warn!("skipping EQ preset: {problem}");
+    }
+    info!(count = presets.len(), "loaded EQ presets");
+    let presets = Arc::new(RwLock::new(presets));
+
     let state = Arc::new(RwLock::new(State::default()));
     let (revision_tx, revision_rx) = watch::channel(0_u64);
     let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
 
-    let pw = PwThread::spawn(config.clone(), state.clone(), revision_tx, exited_tx)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pw = PwThread::spawn(
+        config.clone(),
+        state.clone(),
+        presets.clone(),
+        revision_tx,
+        exited_tx,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let daemon = Daemon::new(state, pw.handle(), config, config_path);
+    let daemon = Daemon::new(
+        state,
+        pw.handle(),
+        config,
+        config_path,
+        presets,
+        presets_dir,
+    );
 
     // `serve_at` + `request_name` (rather than `name`) so a second instance
     // fails loudly instead of silently queueing behind the first.

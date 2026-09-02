@@ -1,0 +1,9 @@
+# Boost low frequencies for punchier bass
+name = "Bass Boost"
+preamp_db = -5.0
+
+[[band]]
+type = "lowshelf"
+freq = 100.0
+q = 0.707
+gain_db = 5.0

@@ -45,6 +45,11 @@ impl fmt::Display for DeviceKind {
 pub type DeviceTuple = (u32, String, String, String, bool, bool, f64, bool, String);
 /// D-Bus tuple for one entry of the `Streams` property: `(ussssdb)`.
 pub type StreamTuple = (u32, String, String, String, String, f64, bool);
+/// D-Bus tuple for one entry of the `Eq` property: `(us)` — `(node_id, preset
+/// id or "")`, one row per output device (SPEC §7.3).
+pub type EqTuple = (u32, String);
+/// D-Bus tuple for one entry of the `EqPresets` property: `(ss)` — `(id, name)`.
+pub type EqPresetTuple = (String, String);
 
 /// A sink or source node.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +142,10 @@ pub struct State {
     pub streams: BTreeMap<u32, Stream>,
     /// Selectable ports, ordered by `(node id, route index)` (SPEC §6.1).
     pub ports: Vec<Port>,
+    /// The EQ preset in force on each output device, ordered by node id; an
+    /// empty string is "off" (SPEC §7.3). One row per output device, routed or
+    /// not — but never for the daemon's own hidden EQ nodes.
+    pub eq: Vec<EqTuple>,
     /// Effective default sink `node.name`.
     pub default_sink: Option<String>,
     /// Effective default source `node.name`.
@@ -168,6 +177,21 @@ impl State {
     #[must_use]
     pub fn ports_dbus(&self) -> Vec<PortTuple> {
         self.ports.iter().map(Port::to_dbus).collect()
+    }
+
+    /// `Eq` property payload, ordered by node id.
+    #[must_use]
+    pub fn eq_dbus(&self) -> Vec<EqTuple> {
+        self.eq.clone()
+    }
+
+    /// The EQ preset id in force on a node, or `""` when it has none.
+    #[must_use]
+    pub fn eq_of(&self, node_id: u32) -> &str {
+        self.eq
+            .iter()
+            .find(|(id, _)| *id == node_id)
+            .map_or("", |(_, preset)| preset.as_str())
     }
 
     /// Ports belonging to one node, in listing order.
@@ -322,6 +346,22 @@ mod tests {
         assert_eq!(state.ports_of(39).count(), 2);
         assert_eq!(state.active_port(39).map(|p| p.index), Some(4));
         assert_eq!(state.active_port(99), None);
+    }
+
+    /// SPEC §7.3: `Eq a(us)`, one row per output device, "" when off.
+    #[test]
+    fn eq_rows_project_and_look_up() {
+        let state = State {
+            eq: vec![(39, "hd650".to_owned()), (43, String::new())],
+            ..State::default()
+        };
+        assert_eq!(
+            state.eq_dbus(),
+            vec![(39, "hd650".to_owned()), (43, String::new())]
+        );
+        assert_eq!(state.eq_of(39), "hd650");
+        assert_eq!(state.eq_of(43), "");
+        assert_eq!(state.eq_of(99), "");
     }
 
     #[test]

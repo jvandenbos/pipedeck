@@ -49,6 +49,22 @@ install -Dm755 target/release/pipedeck "$BIN_DIR/pipedeck"
 echo "  ✓ pipedeckd"
 echo "  ✓ pipedeck"
 
+# Install EQ presets
+echo "Installing EQ presets..."
+readonly PRESETS_DEST="${HOME}/.config/pipedeck/eq"
+mkdir -p "$PRESETS_DEST"
+PRESETS_ADDED=0
+for preset in "$SCRIPT_DIR"/presets/*.toml; do
+  if [[ -f "$preset" ]]; then
+    preset_name=$(basename "$preset")
+    if [[ ! -e "$PRESETS_DEST/$preset_name" ]]; then   # never overwrite a user's edits
+      cp "$preset" "$PRESETS_DEST/$preset_name"
+      PRESETS_ADDED=$((PRESETS_ADDED + 1))                # not ((x++)): returns 1 under set -e
+    fi
+  fi
+done
+echo "  ✓ $PRESETS_ADDED preset(s) installed (existing presets preserved)"
+
 # Install systemd unit
 if [[ "$NO_SERVICE" != "true" ]]; then
   echo "Installing systemd user unit..."

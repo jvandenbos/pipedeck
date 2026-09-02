@@ -8,10 +8,10 @@ SoundSource-style audio control for PipeWire desktops. A compact menu-bar panel 
 - **Input device picker** — Select the default audio input source  
 - **Notification device picker** — Route notification/event sounds independently (unique to PipeDeck)
 - **Per-application volume sliders** — Control volume and mute for every playback stream
+- **Equalizer presets** — Apply parametric EQ via PipeWire's filter-chain module (v1.1)
 - **Menu-bar integration** — Built into GNOME Quick Settings for quick access
 
-Future (v1.1):
-- EQ presets via PipeWire's filter-chain module
+Future (v1.2):
 - Automatic null sink for notification routing
 
 ## Architecture
@@ -102,6 +102,21 @@ pipedeck mute <stream-id>      # Toggle
 
 # Watch for changes (live updates)
 pipedeck watch
+
+# Equalizer: list available presets
+pipedeck eq list
+
+# Show details of a specific preset
+pipedeck eq show bass-boost
+
+# Apply a preset to an output device (node id)
+pipedeck eq set <node-id> vocal-clarity
+
+# Disable EQ on an output device
+pipedeck eq set <node-id> off
+
+# Import a preset from AutoEq (see https://github.com/crinacle/AutoEq/tree/master/results)
+pipedeck eq import "Sennheiser HD 650 ParametricEQ.txt" --name hd650
 ```
 
 ### GUI
@@ -112,6 +127,57 @@ Open GNOME Settings → Quick Settings (the panel in the top-right) and look for
 2. **Input devices** — radio button list of available sources
 3. **Notification device** — independent routing for event sounds
 4. **Application sliders** — one slider per active audio stream, with mute button
+5. **Equalizer** — A menu of EQ presets for the current default output device
+
+## Equalizer
+
+PipeDeck's equalizer applies parametric EQ through PipeWire's smart filter-chain module, which inserts a virtual filter transparently between applications and the real output device. The real device remains the default, and all port/volume/notification routing continues to work normally — nothing visible changes except the audio signal path.
+
+**Presets** are stored as TOML files in `~/.config/pipedeck/eq/` and describe a set of parametric bands (low-shelf, peaking, high-shelf) plus a preamp gain to prevent clipping. The panel shows an "Equalizer" section when presets are available; selecting one applies it to the current default output device. Selecting "Off" disables EQ. Presets are stored in PipeDeck's config and re-applied when the daemon starts.
+
+### Preset file format
+
+Each preset is a TOML file at `~/.config/pipedeck/eq/<slug>.toml`:
+
+```toml
+name = "My Preset"          # Display name
+preamp_db = -2.0            # Preamp gain (negative = protection against clipping)
+
+[[band]]
+type = "lowshelf"           # lowshelf | peaking | highshelf
+freq = 100.0                # Frequency in Hz (20–20000)
+q = 0.707                   # Q factor (0.5–2.0 typical)
+gain_db = 5.0               # Gain in dB (−8 to +8 typical)
+
+[[band]]
+type = "peaking"
+freq = 2000.0
+q = 1.2
+gain_db = 3.0
+```
+
+Max 1 lowshelf + 12 peaking + 1 highshelf per preset. Unused bands are automatically filtered out when applying.
+
+### AutoEq import
+
+PipeDeck can import presets from AutoEq's parametric EQ files (https://github.com/crinacle/AutoEq/tree/master/results), where each headphone model has a `ParametricEQ.txt` file:
+
+```bash
+pipedeck eq import "Sennheiser HD 650 ParametricEQ.txt" --name hd650
+```
+
+This parses the AutoEq format (`Preamp: -2.5 dB`, `Filter 1: ON PK Fc 200 Hz Gain 2.1 dB Q 0.70`) and writes a TOML preset.
+
+### Bundled presets
+
+| Preset | Description |
+|--------|-------------|
+| **Flat** | No EQ applied (unity response) |
+| **Bass Boost** | +5 dB lowshelf at 100 Hz for punchier bass |
+| **Vocal Clarity** | Vocal presence boost: −2 dB at 250 Hz, +3 dB at 2500 Hz, +1.5 dB shelf at 8 kHz |
+| **Loudness Curve** | Loudness compensation: +4 dB bass, −1 dB midrange, +3 dB treble (subjective loudness) |
+| **Late Night** | Tame bass rumble (−6 dB lowshelf at 120 Hz) for late-night listening |
+| **Treble Tame** | Reduce harsh sibilance (−4 dB highshelf at 6 kHz) |
 
 ## Configuration
 
@@ -126,8 +192,9 @@ notification_sink = ""
 # (media.role "event" and "Notification" are always included)
 notification_apps = []
 
-# v1.1: EQ presets (not yet implemented)
+# EQ preset mapping: sink node.name → preset id (file stem)
 [eq]
+# Example: "alsa_output.pci-0000_28_00.4.analog-stereo" = "vocal-clarity"
 ```
 
 ## Development
@@ -206,16 +273,21 @@ The daemon exposes itself on the session bus with well-known name `dev.pipedeck.
 **Properties:**
 - `Devices` — Array of audio devices (sinks/sources)
 - `Streams` — Array of active audio streams
+- `Ports` — Array of audio device ports (output/input routes)
 - `NotificationSink` — Current notification sink name
+- `EqPresets` — Array of available EQ presets (id, name pairs)
+- `Eq` — Array of current EQ settings per output device (node_id, preset_id pairs; empty preset_id = off)
 - `Version` — Daemon version
 
 **Methods:**
 - `SetDefault(kind: String, name: String)` — Set default sink/source (`kind` = "sink" or "source")
 - `SetNotificationSink(name: String)` — Route notifications to a specific sink (empty = follow default)
+- `SetPort(id: UInt32, index: UInt32)` — Switch output/input port on a device (e.g. headphones ↔ speakers)
 - `SetVolume(id: UInt32, volume: Double)` — Set volume 0.0–3.375 linear (= 0–150 % on the cubic scale wpctl/GNOME show)
 - `SetMute(id: UInt32, mute: Boolean)` — Mute/unmute a device or stream
 - `SetStreamTarget(id: UInt32, name: String)` — Route a stream to a specific sink (advanced)
-- `Refresh()` — Force a state refresh
+- `SetEq(id: UInt32, preset: String)` — Apply an EQ preset to a sink (empty preset = off)
+- `Refresh()` — Force a state refresh (rescans presets, rescans devices/ports/streams)
 
 **Signals:**
 - `Changed()` — Emitted when graph state changes (coalesced to ≤10/s)

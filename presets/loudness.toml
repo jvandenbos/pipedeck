@@ -1,0 +1,21 @@
+# Loudness curve: boost bass and treble for subjective volume
+name = "Loudness Curve"
+preamp_db = -4.0
+
+[[band]]
+type = "lowshelf"
+freq = 80.0
+q = 0.707
+gain_db = 4.0
+
+[[band]]
+type = "peaking"
+freq = 2000.0
+q = 1.0
+gain_db = -1.0
+
+[[band]]
+type = "highshelf"
+freq = 9000.0
+q = 0.707
+gain_db = 3.0

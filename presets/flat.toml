@@ -1,0 +1,3 @@
+# Flat response, no EQ applied
+name = "Flat"
+preamp_db = 0.0

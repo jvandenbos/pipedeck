@@ -57,7 +57,10 @@ pub struct Config {
     pub notification_sink: String,
     /// Extra `application.name` values treated as notification sources.
     pub notification_apps: Vec<String>,
-    /// Reserved for the v1.1 EQ feature. Unknown keys round-trip untouched.
+    /// EQ selections: `"<sink node.name>" = "<preset id>"` (SPEC §7.1).
+    ///
+    /// Kept as a raw table rather than a typed map so a hand-edited file with
+    /// an unexpected value round-trips untouched instead of refusing to load.
     pub eq: toml::Table,
 }
 
@@ -131,6 +134,45 @@ impl Config {
             return Err(ConfigError::Io(e));
         }
         Ok(())
+    }
+
+    /// The preset id configured for a sink, if any (SPEC §7.1's `[eq]` table).
+    ///
+    /// A non-string value is ignored rather than rejected, so a hand-edited
+    /// file cannot stop the daemon from starting.
+    #[must_use]
+    pub fn eq_preset(&self, sink_name: &str) -> Option<&str> {
+        self.eq
+            .get(sink_name)
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Set (or, with an empty preset, clear) the EQ preset for a sink.
+    pub fn set_eq_preset(&mut self, sink_name: &str, preset: &str) {
+        let preset = preset.trim();
+        if preset.is_empty() {
+            self.eq.remove(sink_name);
+        } else {
+            self.eq
+                .insert(sink_name.to_owned(), toml::Value::String(preset.to_owned()));
+        }
+    }
+
+    /// Every `(sink node.name, preset id)` pair in the `[eq]` table, sorted.
+    #[must_use]
+    pub fn eq_entries(&self) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = self
+            .eq
+            .iter()
+            .filter_map(|(k, v)| {
+                let value = v.as_str()?.trim();
+                (!value.is_empty()).then(|| (k.clone(), value.to_owned()))
+            })
+            .collect();
+        entries.sort();
+        entries
     }
 
     /// Trim whitespace and drop empty entries so comparisons are predictable.
@@ -267,6 +309,49 @@ preset = "flat"
             again.eq.get("preset").and_then(toml::Value::as_str),
             Some("flat")
         );
+    }
+
+    /// SPEC §7.1: `[eq]` is `"<sink node.name>" = "<preset id>"`.
+    #[test]
+    fn eq_table_maps_sinks_to_presets() {
+        let mut config = Config::from_toml(
+            r#"
+[eq]
+"alsa_output.pci-0000_28_00.4.analog-stereo" = "hd650"
+"alsa_output.hdmi" = "  "
+"broken" = 5
+"#,
+        )
+        .expect("parses");
+
+        assert_eq!(
+            config.eq_preset("alsa_output.pci-0000_28_00.4.analog-stereo"),
+            Some("hd650")
+        );
+        // Blank and non-string values read as "no preset", never as an error.
+        assert_eq!(config.eq_preset("alsa_output.hdmi"), None);
+        assert_eq!(config.eq_preset("broken"), None);
+        assert_eq!(config.eq_preset("absent"), None);
+        assert_eq!(
+            config.eq_entries(),
+            vec![(
+                "alsa_output.pci-0000_28_00.4.analog-stereo".to_owned(),
+                "hd650".to_owned()
+            )]
+        );
+
+        config.set_eq_preset("alsa_output.hdmi", "flat");
+        assert_eq!(config.eq_preset("alsa_output.hdmi"), Some("flat"));
+        config.set_eq_preset("alsa_output.hdmi", "");
+        assert_eq!(config.eq_preset("alsa_output.hdmi"), None);
+
+        // ... and the whole thing survives a trip through the file format.
+        let again = Config::from_toml(&config.to_toml().expect("serialise")).expect("reparse");
+        assert_eq!(
+            again.eq_preset("alsa_output.pci-0000_28_00.4.analog-stereo"),
+            Some("hd650")
+        );
+        assert!(again.eq.contains_key("broken"));
     }
 
     #[test]

@@ -1,0 +1,21 @@
+# Enhance vocal presence and clarity
+name = "Vocal Clarity"
+preamp_db = 0.0
+
+[[band]]
+type = "peaking"
+freq = 250.0
+q = 1.0
+gain_db = -2.0
+
+[[band]]
+type = "peaking"
+freq = 2500.0
+q = 1.2
+gain_db = 3.0
+
+[[band]]
+type = "highshelf"
+freq = 8000.0
+q = 0.707
+gain_db = 1.5

@@ -63,8 +63,21 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
 - Note: HDMI sink (Dell AW3423DW) vanished from PipeWire mid-session — its route reports
   `available: no`, WirePlumber removed the node. Card/monitor side, not PipeDeck.
 
+## Phase 6 — EQ presets, SPEC §7  — agent: Sonnet (extension) + daemon agent (crates/), concurrent 2026-09-02
+- ☑ Extension side complete against SPEC §7.3/§7.4 (see Handoffs below).
+- ☑ Daemon side complete against SPEC §7.1/§7.2/§7.3 (see Handoffs below): `crates/pipedeckd/src/eq.rs`
+  (filter-chain args, preset files, control mapping, AutoEq importer), filter-chain module
+  load/unload + `Props` control writes + `filters`-metadata bypass in `pw.rs`, `EqPresets`/`Eq`/
+  `SetEq` in `service.rs`, `pipedeck eq {list,show,set,import}` in the CLI. 111 tests, all four
+  container checks clean.
+- ☑ **Diff owed to the extension agent is done and CLEAN** — the regenerated
+  `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml` matches `extension/dbus.js`'s hand-written block
+  exactly (`EqPresets a(ss)`, `Eq a(us)`, `SetEq(node_id u, preset s)`), argument names included.
+  No changes needed on the extension side.
+- ☐ Live verification on chronos once both sides are deployed together (see Handoffs).
+
 ## v1.1 (later)
-- ☐ EQ via filter-chain (SPEC §2.5), preset picker in panel, AutoEq importer.
+- ☑ EQ via filter-chain (SPEC §7) — both sides code-complete, untested on a live graph (Phase 6).
 - ☐ Optional null sink `pipedeck.notifications`.
 
 ## Handoffs / notes between agents
@@ -566,3 +579,259 @@ wpctl set-volume <analog sink id> 0.30 && pipedeck outputs  # external change mu
 If read-back is still stale, `RUST_LOG=debug` and look for `re-enumerating device param after
 info`: no such line means the device `info` event itself is not firing with the PARAMS mask, and
 the next fallback is a timer-free re-enum on every info event regardless of `change_mask`.
+
+### Phase 6 (extension side) completed (2026-09-02) — EQ presets, SPEC §7.3/§7.4
+
+Built concurrently with the daemon agent's filter-chain work; `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`
+had no EQ members yet at the time of this pass, so `dbus.js` was written directly against SPEC
+§7.3's documented wire types rather than diffed against the checked-in XML:
+
+- `extension/dbus.js`: added property `EqPresets` (`a(ss)` = id, name), property `Eq` (`a(us)` =
+  node_id, preset id or "") and method `SetEq(node_id u, preset s)` to the introspection XML,
+  alongside the existing `Ports`/`SetPort` from Phase 5. Doc comment at the top of the file updated
+  to list all five wire types together.
+- `extension/extension.js`:
+  - `unpackEqPreset([id, name])` and `unpackEq([nodeId, preset])`, matching the existing
+    `unpackPort`/`unpackDevice` pattern.
+  - New **Equalizer** section (`_eqHeader`/`_eqSection`) inserted after Notifications and before
+    the per-app rows, added to `_sectionActors` so `setUnavailable()`/`setAvailable()` cover it
+    like every other section.
+  - `_rebuildEqSection(defaultOut, eqPresets, eq)`: "Off" row + one row per preset (label =
+    preset `name`), ornament CHECK on whichever is active for the current default output (found
+    by matching `eq[].nodeId` against `defaultOut.id`; no matching row, or `preset === ''`, means
+    Off). **Hides the header+section entirely** — not a disabled/empty placeholder like the device
+    sections use — when there's no default sink (`defaultOut` falsy) or `eqPresets` is
+    null/empty, per SPEC §7.4's "hidden entirely" wording. This runs on every `rebuild()`, so it
+    re-hides/re-shows correctly on every `Changed`/property-change tick, not just once at startup.
+  - Activation calls `SetEq(defaultOut.id, presetId)` (`''` for Off) via a new `setEq` proxyOp →
+    `SetEqRemote`, try/catch + `console.error` around the call site plus the existing
+    `_callRemote` logging (same double-layer as `_activatePort`).
+  - `_queueRebuild()` unpacks `EqPresets`/`Eq` in the same pass as `Devices`/`Streams`/`Ports`,
+    normalizing an absent property (older daemon, property genuinely not in the introspected
+    interface) to `null` — same convention as `Ports`, and the reason `_rebuildEqSection` treats
+    `null` and `[]` identically (both hide the section) while still distinguishing "no daemon
+    support" from "daemon supports EQ, zero presets configured" is irrelevant to the UI: both look
+    like "nothing to show" from the panel's point of view.
+- `extension/metadata.json`: `version` 2 → 3.
+- No `stylesheet.css` changes — the Equalizer rows reuse plain `PopupMenu.PopupMenuItem`, no new
+  style classes needed.
+
+**Verified in this pass (dev container, no live daemon):** `python3 -m json.tool metadata.json`
+clean; `gjs -c 'import("./dbus.js")'` loads with no output (success); `gjs -c 'import("./extension.js")'`
+fails only on the same `resource:///org/gnome/shell/...` promise-rejection as every prior version
+(no `SyntaxError`, `Gjs-WARNING **: Unhandled promise rejection` from `import()` itself, which is
+the expected failure mode outside a real Shell — matches CLAUDE.md's stated pass/fail bar).
+
+**Owed before this can ship:**
+1. **XML diff against the daemon's checked-in copy.** `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`
+   did not yet have `EqPresets`/`Eq`/`SetEq` when this pass ran — once the daemon agent lands them,
+   diff `extension/dbus.js`'s `DaemonInterfaceXml` against it attribute-for-attribute (arg names,
+   ordering, the exact `a(ss)`/`a(us)` signatures) and reconcile any drift, per this file's own
+   header comment.
+2. **Live verification on chronos** (needs both sides deployed + Jan logged into GNOME, same
+   Wayland hot-reload constraint as every prior extension change):
+   - Import a real AutoEq preset (`pipedeck eq import`), confirm it shows up as a labeled row
+     (not just an id) and picking it moves the CHECK ornament off "Off".
+   - Switch the **default output** (Output section) and confirm the Equalizer section's CHECK
+     follows to that device's own `Eq` entry, not the previous device's.
+   - Daemon with zero presets configured (fresh/no presets dir yet) → Equalizer header+section
+     genuinely absent from the menu, not present-but-empty.
+   - Restart daemon after picking a preset → on reconnect, the row that was CHECKed before the
+     restart is CHECKed again (persisted `[eq]` config re-read into `Eq`).
+   - An older daemon still running v0.2-era code (Phase 5, no EQ support at all) must render the
+     rest of the panel exactly as before with **no console errors and no Equalizer section** —
+     this is the fallback path `eqPresets: null` exists for and wasn't exercisable without a real
+     mixed-version daemon.
+
+
+### Phase 6 → everyone (daemon agent, 2026-09-02) — EQ presets, SPEC §7
+
+**Lane touched: `crates/**` only, plus this file. `Cargo.lock` is unchanged — no new dependencies;
+`pipewire-sys` is reached through the `pipewire` crate's own `pub use pw_sys as sys`.**
+
+- **New module `crates/pipedeckd/src/eq.rs`** — the whole pure half of SPEC §7: `BandKind`/`Band`/
+  `PresetFile`/`Preset`, `parse_preset`/`validate`/`load_presets`/`write_preset`/`slugify`,
+  `preset_to_params`, `build_filter_chain_args`, the node-naming + hiding helpers, and
+  `parse_autoeq`/`autoeq_to_preset`. No PipeWire types, so all of it is unit-tested without a graph;
+  `pw.rs` is still the only module linking libpipewire.
+- **`pw.rs`** gained: `ModuleHandle` (a `*mut pw_impl_module` that `pw_impl_module_destroy`s on
+  drop), `EqInstance` (one per target sink), `load_filter_chain` (the one new `unsafe` call —
+  `pw::sys::pw_context_load_module(context.as_raw_ptr(), …)` with a null `pw_properties`), the
+  `eq_params_pod` control write, and an `Inner::apply_eq` reconciler run on every graph change,
+  `SetConfig` and `Refresh`. It also binds the WirePlumber **`filters`** metadata alongside
+  `default`, and every node global now carries a `hidden` flag from
+  `eq::is_eq_node(pipedeck.eq, node.link-group)`.
+- **Hiding**: hidden nodes are tracked (we need the main node's id to write controls and to key the
+  metadata) but skipped in `publish()`, so they never appear in `Devices`/`Streams`; `sink_exists`
+  ignores them too, which is what stops an EQ node ever becoming the notification sink or a
+  `SetStreamTarget` destination.
+- **Config**: `[eq]` stays a `toml::Table` (so a hand-edited non-string value round-trips instead of
+  refusing to load) with typed accessors `eq_preset` / `set_eq_preset` / `eq_entries`. Every
+  pre-existing config test is untouched and still green.
+- **Checks**: `cargo build --workspace`, `cargo test --workspace` (**111 tests** = 94 daemon lib +
+  17 CLI, up from 77), `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`
+  — all clean in the `pipedeck-dev` image.
+
+**→ extension agent: the XML is regenerated and your `dbus.js` needs no change.** The
+`introspection_xml_matches_the_checked_in_copy` test pins
+`crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml` to the live interface, and it now carries exactly
+the three members you wrote by hand, argument names included:
+
+```xml
+<method name="SetEq">
+  <arg name="node_id" type="u" direction="in"/>
+  <arg name="preset" type="s" direction="in"/>
+</method>
+<property name="Eq" type="a(us)" access="read"/>
+<property name="EqPresets" type="a(ss)" access="read"/>
+```
+
+Full interface, in the order zbus emits it (methods in declaration order, properties alphabetical):
+`SetDefault(ss)`, `SetNotificationSink(s)`, `SetVolume(ud)`, `SetMute(ub)`, `SetStreamTarget(us)`,
+`SetPort(uu)`, `SetEq(us)`, `Refresh()`; signal `Changed()`; properties `Devices a(usssbbdbs)`,
+`Eq a(us)`, `EqPresets a(ss)`, `NotificationSink s`, `Ports a(uussbb)`, `Streams a(ussssdb)`,
+`Version s` — all read-only.
+
+Behaviours the panel should count on:
+- **`Eq` has one row per output device, always** — including sinks with no EQ, whose preset string
+  is `""`. It reports the *configured* selection resolved against the library, not the chain's
+  internal state, so the ornament lands on the right row the instant `SetEq` returns rather than
+  after the filter chain's node shows up. A configured id that no longer names a preset reads as
+  `""` (SPEC §7.1's "unknown preset name → treat as off").
+- **`PropertiesChanged` for `Eq`** rides the same coalesced tick as `Devices`/`Streams`/`Ports`.
+  `EqPresets` emits its own `PropertiesChanged` from `SetEq` (it is rescanned there), so a preset
+  file dropped in while the panel is open appears after any `SetEq` or `Refresh`.
+- **`SetEq` errors**: `NotFound` for an unknown node id or an unknown preset, `InvalidArgument` for
+  a source (EQ is output-only). `SetEq(id, "")` on a sink that already has no EQ is a silent no-op.
+- **The EQ sinks never appear in `Devices`** — the real sink stays the default and stays the row the
+  user picks, exactly as SPEC §7.1 intends. There is nothing new for the Output section to filter.
+
+**→ packaging agent:** `presets/*.toml` all parse against the loader as shipped, and
+`crates/pipedeckd/src/eq.rs` has a test (`the_shipped_presets_parse`) that `include_str!`s
+`presets/flat.toml` and `presets/loudness.toml` so a format drift between the lanes fails the build
+instead of failing on chronos. If you rename or delete either file, that test needs the same edit.
+`install.sh`'s `~/.config/pipedeck/eq` destination is exactly where the daemon scans.
+
+**→ main session, live verification on chronos (exact commands, SPEC §7.5).** Node ids change every
+session — take them from `pipedeck outputs` first.
+
+```bash
+# 0. deploy + restart, then confirm the new surface is on the bus
+./install.sh && systemctl --user restart pipedeckd && sleep 2
+gdbus introspect --session --dest dev.pipedeck.Daemon --object-path /dev/pipedeck/Daemon \
+  | grep -E "SetEq|EqPresets|\"?Eq\"?"
+pipedeck eq list          # the six shipped presets, by id and name
+
+# 1. SPEC §7.5 acceptance 9 — the smart filter really gets inserted.
+#    Start music on the analog sink FIRST, then:
+pipedeck eq set <analog sink id> loudness
+pw-link -l | grep -i pipedeck            # stream -> pipedeck.eq.<sink>, pipedeck.eq.<sink>.out -> <sink>
+pipedeck outputs                          # "{eq: Loudness Curve}" after the port bracket
+wpctl status | head -30                   # the DEFAULT SINK MUST STILL BE THE REAL SINK
+pipedeck status                           # no pipedeck.eq.* node listed anywhere
+
+#    Audible check with a deliberately extreme preset:
+cat > ~/.config/pipedeck/eq/shout.toml <<'EOF'
+name = "Shout (test)"
+preamp_db = -6.0
+[[band]]
+type = "lowshelf"
+freq = 120.0
+q = 0.707
+gain_db = 12.0
+EOF
+pipedeck eq set <analog sink id> shout    # rescans on SetEq, no Refresh needed; bass jumps
+
+# 2. SPEC §7.5 acceptance 10 — off goes back to a direct link with no reload
+pipedeck eq set <analog sink id> off
+pw-link -l | grep -i pipedeck             # links go direct; the eq nodes are STILL THERE (bypassed)
+pw-metadata -n filters                    # filter.smart.disabled = true on the main node's id
+pipedeck eq set <analog sink id> loudness # re-enables instantly, no module reload
+
+# 3. SPEC §7.5 acceptance 11 — persistence and hot-unplug
+grep -A3 '\[eq\]' ~/.config/pipedeck/config.toml
+systemctl --user restart pipedeckd && sleep 2 && pipedeck outputs   # EQ re-applied from config
+#    then remove the sink (unplug HDMI, or `systemctl --user restart wireplumber`) and watch:
+journalctl --user -u pipedeckd -f         # "sink gone; unloading its EQ filter chain", no crash
+#    ... and when it returns, the chain must come back on its own.
+
+# 4. the AutoEq importer (SPEC §7.2). Any AutoEq ParametricEQ.txt will do:
+pipedeck eq import ~/Downloads/"Sennheiser HD 650 ParametricEQ.txt"
+pipedeck eq show sennheiser-hd-650
+pipedeck eq list
+
+# 5. error paths — all should print a dev.pipedeck.Error message, not hang
+pipedeck eq set 99999 loudness            # NotFound (no such node)
+pipedeck eq set <analog source id> loudness   # InvalidArgument (input)
+pipedeck eq set <analog sink id> nosuchpreset # NotFound (no such preset)
+
+# 6. nothing regressed from v0.2 while a chain is loaded
+pipedeck vol <analog sink id> 45 && wpctl get-volume <analog sink id>
+pipedeck set-port <analog sink id> analog-output-lineout && pactl list sinks | grep "Active Port"
+pipedeck set-notify <analog sink name> && canberra-gtk-play -i bell
+pipedeck ports && pipedeck streams
+
+# 7. panel (SPEC §7.5 acceptance 12) — Equalizer section switches presets on the default output
+```
+
+**Things that could only be reasoned about in the container — watch these first on chronos:**
+1. **Re-entrancy on the module load.** `apply_eq` runs while `inner.borrow_mut()` is held (it is
+   called from the registry/metadata listeners), and it calls `pw_context_load_module` from inside
+   that borrow. This is safe *if* module loading never synchronously re-enters one of our own
+   listeners — it should not, because the new nodes only reach us as registry globals after a
+   server round-trip, and our core listener's `error` closure never touches `Inner`. If it does
+   re-enter, the symptom is unmistakable: an immediate `already mutably borrowed: BorrowMutError`
+   panic in the `pipedeck-pw` thread on the first `pipedeck eq set`. The fix would be to defer the
+   load onto a loop idle callback rather than doing it inline.
+2. **Whether `pw_context_load_module` finds a usable core.** The module is loaded into the daemon's
+   own already-connected context, EasyEffects-style. If it returns NULL you get
+   `could not load libpipewire-module-filter-chain` in the journal — check `RUST_LOG=debug` for the
+   PipeWire-side reason (missing module, or a graph the parser rejected).
+3. **The module argument string.** It is built by `eq::build_filter_chain_args` and unit-tested to
+   be valid strict JSON with every SPEC §7.1 key in place, but only a live load proves filter-chain
+   *accepts* it. `RUST_LOG=debug` logs "loading the EQ filter chain" with the channel count just
+   before the call; the args themselves are not logged (they are ~4 KB) — add a `debug!(%args)` in
+   `Inner::eq_enable` if the load fails.
+4. **`SPA_PROP_params` = `0x80001`** (`SPA_PROP_START_Other + 1`, confirmed against
+   `/usr/include/spa-0.2/spa/param/props.h` in the container) and the value is a `Struct` of
+   alternating `String`/`Float`. The pod builds and re-parses in a unit test, but if a preset
+   selects with no audible change, this write is the first suspect —
+   `pw-cli s <main node id> Props '{ params = [ "ls:Gain" 12.0 ] }'` by hand tells you whether the
+   chain accepts controls at all.
+5. **`audio.position`.** Taken from the target sink's `audio.position` prop and only passed through
+   when its length matches the channel count; otherwise the key is omitted and filter-chain infers a
+   layout. Worth an eye on a 5.1 HDMI sink — `pw-dump <sink id> | grep -A2 audio.position`.
+6. **The `filters` metadata may not exist until something has used a smart filter.** If it is
+   absent, `SetEq(id, "")` falls back to unloading the module (logged: "the WirePlumber `filters`
+   metadata is missing; unloading the EQ filter chain instead") and the next `SetEq` reloads it.
+   That is a correct-but-slower path, not a fault — but if it happens *always*, the instant-bypass
+   half of SPEC §7.1 is not being exercised at all.
+
+**Deliberate choices / deviations from §7, all small and all flagged:**
+- **`Eq` reports the configured selection, not the chain's applied state** (see above). SPEC §7.3
+  just says "(node_id, preset id or \"\")"; reporting configuration is what makes the panel's
+  ornament stable across the load → node-appears → controls-written sequence.
+- **The graph is built once and never rebuilt.** SPEC §7.1 already says so ("controls updated
+  live"), and `preset_to_params` always writes *every* control on the graph — unused bands get
+  `Gain 0` at their slot defaults — so switching from a 9-band preset to a 2-band one cannot leave
+  bands from the previous preset behind. That is the one non-obvious invariant in the module.
+- **A chain is loaded lazily**, only when a sink actually has a preset, and is unloaded (not
+  bypassed) when its sink disappears or when "off" is asked for before its node ever came up.
+  Steady-state "off" on a sink that *had* EQ is the metadata bypass SPEC §7.1 asks for.
+- **`SetEq` rescans the preset directory before validating** (SPEC §7.3 says the property is
+  rescanned there), so a file dropped in a second ago is selectable without a `Refresh` first.
+  `Refresh` rescans too. A directory that cannot be read leaves the previous library in place — a
+  transient I/O error must not silently empty the panel's preset list.
+- **Preset ids are slugs.** The file stem is `slugify`d (lowercase, `[a-z0-9-]`), so
+  `HD 650.toml` and `hd-650.toml` are the same id. `eq import` derives the id from `--name`, or
+  from the file stem with AutoEq's ` ParametricEQ` suffix stripped.
+- **Validation ranges** (freq 10–24000 Hz, Q 0.05–20, gain ±30 dB, preamp ±30 dB) are the ones the
+  task set; SPEC §7.2 fixes only the band *counts*. The importer **clamps** out-of-range AutoEq
+  values with a warning rather than rejecting the file, because a single wild band should not cost
+  the user the import; a hand-written preset file with the same value is rejected outright.
+- **`pipedeck eq show` and `eq import` read and write the presets directory directly** rather than
+  going through D-Bus — the bus only carries `(id, name)`, and the directory is the daemon's own
+  source of truth. `import` ends with a best-effort `Refresh` so `eq list` is immediately current.
+- **`{eq: <name>}` shows on `status`, `outputs` and `inputs`** (they share one `device_line`
+  renderer); SPEC §7.3 only asked for `outputs`, and sources never have an EQ row so it is invisible
+  there anyway. Same reasoning as the Phase 5 port bracket.

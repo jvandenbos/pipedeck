@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check ext-check install uninstall help
+.PHONY: build test clippy fmt check ext-check presets-check install uninstall help
 .PHONY: docker-build docker-test docker-clippy docker-fmt docker-check docker-ext-check
 
 # Docker image name
@@ -12,8 +12,9 @@ help:
 	@echo "  test        - Run Rust tests (in Docker)"
 	@echo "  clippy      - Run clippy linter with -D warnings (in Docker)"
 	@echo "  fmt         - Check code formatting (in Docker)"
-	@echo "  check       - Run all checks (build, test, clippy, fmt)"
+	@echo "  check       - Run all checks (build, test, clippy, fmt, presets-check)"
 	@echo "  ext-check   - Check extension JavaScript syntax (in Docker)"
+	@echo "  presets-check - Validate EQ preset TOML files"
 	@echo ""
 	@echo "  install     - Install to system (Linux only, runs build + install.sh)"
 	@echo "  uninstall   - Uninstall from system (Linux only)"
@@ -38,7 +39,15 @@ clippy: docker-build
 fmt: docker-build
 	docker run $(DOCKER_FLAGS) $(DOCKER_IMAGE) cargo fmt --check
 
-check: build test clippy fmt
+presets-check:
+	@echo "Validating EQ preset TOML files..."
+	@for f in presets/*.toml; do \
+		if [ -f "$$f" ]; then \
+			python3 -c "import tomllib,os,sys; d=tomllib.load(open('$$f','rb')); name=d.get('name','(no name)'); bands=len(d.get('band',[])); print(f'  ✓ {os.path.basename(\"$$f\"):20} {name} ({bands} band(s))')"; \
+		fi; \
+	done
+
+check: build test clippy fmt presets-check
 	@echo "✓ All checks passed"
 
 ext-check: docker-build

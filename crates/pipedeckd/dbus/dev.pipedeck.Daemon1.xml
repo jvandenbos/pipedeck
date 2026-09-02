@@ -49,6 +49,13 @@
     <arg name="route_index" type="u" direction="in"/>
   </method>
   <!--
+   Apply an EQ preset to an output device; an empty preset turns EQ off.
+   -->
+  <method name="SetEq">
+    <arg name="node_id" type="u" direction="in"/>
+    <arg name="preset" type="s" direction="in"/>
+  </method>
+  <!--
    Re-read every node's params and re-publish the snapshot.
    -->
   <method name="Refresh">
@@ -62,6 +69,14 @@
    Sinks and sources: `(id, name, description, kind, is_default, virtual, volume, mute, nick)`.
    -->
   <property name="Devices" type="a(usssbbdbs)" access="read"/>
+  <!--
+   The EQ preset on each output device: `(node_id, preset id or "")`.
+   -->
+  <property name="Eq" type="a(us)" access="read"/>
+  <!--
+   Available EQ presets: `(id, name)`, scanned from the presets directory.
+   -->
+  <property name="EqPresets" type="a(ss)" access="read"/>
   <!--
    `node.name` of the notification sink; empty means "follow the default output".
    -->

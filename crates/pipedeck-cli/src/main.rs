@@ -5,12 +5,15 @@
 
 mod proxy;
 
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt as _;
 
+use pipedeckd::eq;
 use pipedeckd::route::PortTuple;
-use pipedeckd::state::{DeviceKind, DeviceTuple, StreamTuple};
+use pipedeckd::state::{DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, StreamTuple};
 use pipedeckd::volume::{linear_to_percent, percent_to_linear, MAX_VOLUME};
 
 use proxy::DaemonProxy;
@@ -62,6 +65,9 @@ enum Cmd {
         /// Route name (`analog-output-lineout`), description, or index.
         port: String,
     },
+    /// EQ presets (SPEC §7.3).
+    #[command(subcommand)]
+    Eq(EqCmd),
     /// Ask the daemon to re-read the graph.
     Refresh,
     /// Print a line every time the daemon signals a change.
@@ -72,6 +78,32 @@ enum Cmd {
 struct NameArg {
     /// `node.name` of the device (see `pipedeck outputs`).
     name: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum EqCmd {
+    /// List the available presets.
+    List,
+    /// Show one preset's bands.
+    Show {
+        /// Preset id, from `pipedeck eq list`.
+        id: String,
+    },
+    /// Apply a preset to an output device; `off` turns EQ off.
+    Set {
+        /// Node id, from `pipedeck outputs`.
+        id: u32,
+        /// Preset id, or `off`/`none`/`-`.
+        preset: String,
+    },
+    /// Import an AutoEq `ParametricEQ.txt` as a preset.
+    Import {
+        /// Path to the AutoEq file.
+        file: std::path::PathBuf,
+        /// Display name; the id is derived from it. Defaults to the file stem.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -146,6 +178,7 @@ async fn main() -> Result<()> {
             println!("{id} port -> {label}");
             Ok(())
         }
+        Cmd::Eq(cmd) => eq_command(&daemon, cmd).await,
         Cmd::Refresh => {
             daemon.refresh().await?;
             println!("refreshed");
@@ -168,7 +201,7 @@ async fn current_mute(daemon: &DaemonProxy<'_>, id: u32) -> Result<bool> {
 /// One device row: nick first (ALSA descriptions truncate), then the active
 /// port in brackets when the node has more than one (SPEC §6.1), then the full
 /// description and `node.name` on continuation lines.
-fn device_line(device: &DeviceTuple, ports: &[PortTuple]) -> String {
+fn device_line(device: &DeviceTuple, ports: &[PortTuple], eq_label: Option<&str>) -> String {
     let (id, name, description, _kind, is_default, virtual_, volume, mute, nick) = device;
     let marker = if *is_default { '*' } else { ' ' };
     let label = if nick.is_empty() { description } else { nick };
@@ -182,6 +215,8 @@ fn device_line(device: &DeviceTuple, ports: &[PortTuple]) -> String {
     } else {
         String::new()
     };
+    // SPEC §7.3: `{eq: <name>}` after the port bracket, only when EQ is on.
+    let eq = eq_label.map_or_else(String::new, |name| format!(" {{eq: {name}}}"));
 
     let mut flags = String::new();
     if *mute {
@@ -192,7 +227,7 @@ fn device_line(device: &DeviceTuple, ports: &[PortTuple]) -> String {
     }
 
     let mut line = format!(
-        "{marker} {id:>5}  {:>4.0}%  {label}{port}{flags}",
+        "{marker} {id:>5}  {:>4.0}%  {label}{port}{eq}{flags}",
         linear_to_percent(*volume)
     );
     if description != label && !description.is_empty() {
@@ -237,6 +272,24 @@ fn resolve_port(ports: &[PortTuple], id: u32, wanted: &str) -> Result<u32> {
     )
 }
 
+/// Node id -> preset *display name*, for the `{eq: ...}` bracket.
+///
+/// An id the daemon reports but the preset list does not know is shown as the
+/// raw id rather than dropped — that combination means someone edited the
+/// config by hand, and hiding it would be confusing.
+fn eq_labels(eq: &[EqTuple], presets: &[EqPresetTuple]) -> BTreeMap<u32, String> {
+    eq.iter()
+        .filter(|(_, preset)| !preset.is_empty())
+        .map(|(id, preset)| {
+            let name = presets
+                .iter()
+                .find(|(pid, _)| pid == preset)
+                .map_or_else(|| preset.clone(), |(_, name)| name.clone());
+            (*id, name)
+        })
+        .collect()
+}
+
 fn stream_line(stream: &StreamTuple) -> String {
     let (id, app_name, binary, media_name, target_name, volume, mute) = stream;
     let label = if app_name.is_empty() {
@@ -259,6 +312,10 @@ fn stream_line(stream: &StreamTuple) -> String {
 async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
     let devices = daemon.devices().await?;
     let ports = daemon.ports().await.unwrap_or_default();
+    let eq = eq_labels(
+        &daemon.eq().await.unwrap_or_default(),
+        &daemon.eq_presets().await.unwrap_or_default(),
+    );
     let streams = daemon.streams().await?;
     let notify = daemon.notification_sink().await?;
     let version = daemon.version().await.unwrap_or_default();
@@ -280,7 +337,10 @@ async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
         println!("\n{title}:");
         let mut any = false;
         for device in devices.iter().filter(|d| d.3 == kind.as_str()) {
-            println!("{}", device_line(device, &ports));
+            println!(
+                "{}",
+                device_line(device, &ports, eq.get(&device.0).map(String::as_str))
+            );
             any = true;
         }
         if !any {
@@ -301,9 +361,16 @@ async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
 async fn list_devices(daemon: &DaemonProxy<'_>, kind: DeviceKind) -> Result<()> {
     let devices = daemon.devices().await?;
     let ports = daemon.ports().await.unwrap_or_default();
+    let eq = eq_labels(
+        &daemon.eq().await.unwrap_or_default(),
+        &daemon.eq_presets().await.unwrap_or_default(),
+    );
     let mut any = false;
     for device in devices.iter().filter(|d| d.3 == kind.as_str()) {
-        println!("{}", device_line(device, &ports));
+        println!(
+            "{}",
+            device_line(device, &ports, eq.get(&device.0).map(String::as_str))
+        );
         any = true;
     }
     if !any {
@@ -332,6 +399,118 @@ async fn list_streams(daemon: &DaemonProxy<'_>) -> Result<()> {
         println!("{}", stream_line(stream));
     }
     Ok(())
+}
+
+/// `pipedeck eq …` (SPEC §7.3).
+///
+/// `list` and `set` go through the daemon; `show` and `import` are local file
+/// work, since the presets directory is the daemon's source of truth and the
+/// daemon exposes only `(id, name)` on the bus.
+async fn eq_command(daemon: &DaemonProxy<'_>, cmd: EqCmd) -> Result<()> {
+    match cmd {
+        EqCmd::List => {
+            let presets = daemon.eq_presets().await?;
+            if presets.is_empty() {
+                let dir = eq::presets_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|_| "<no config dir>".to_owned());
+                println!("(no EQ presets; drop preset files in {dir})");
+            }
+            for (id, name) in &presets {
+                println!("  {id:<24}  {name}");
+            }
+            Ok(())
+        }
+        EqCmd::Show { id } => {
+            let dir = eq::presets_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let path = dir.join(format!("{id}.toml"));
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("could not read {}", path.display()))?;
+            let preset = eq::parse_preset(&id, &text).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{}  ({})", preset.name, preset.id);
+            println!("preamp: {:+.1} dB", preset.preamp_db);
+            if preset.bands.is_empty() {
+                println!("  (no bands — flat)");
+            }
+            for band in &preset.bands {
+                println!(
+                    "  {:<10}  {:>8.1} Hz  Q {:<5.2}  {:+.1} dB",
+                    band.kind.as_str(),
+                    band.freq,
+                    band.q,
+                    band.gain_db
+                );
+            }
+            Ok(())
+        }
+        EqCmd::Set { id, preset } => {
+            let preset = if is_off(&preset) {
+                String::new()
+            } else {
+                preset
+            };
+            daemon.set_eq(id, &preset).await?;
+            if preset.is_empty() {
+                println!("{id} eq -> off");
+            } else {
+                println!("{id} eq -> {preset}");
+            }
+            Ok(())
+        }
+        EqCmd::Import { file, name } => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("could not read {}", file.display()))?;
+            let import = eq::parse_autoeq(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let label = name.unwrap_or_else(|| import_label(&file));
+            let id = eq::slugify(&label);
+            if id.is_empty() {
+                bail!("`{label}` has no usable preset id; pass --name");
+            }
+            let preset =
+                eq::autoeq_to_preset(&id, &label, &import).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let dir = eq::presets_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let path = eq::write_preset(&dir, &preset)
+                .with_context(|| format!("could not write into {}", dir.display()))?;
+            for warning in &import.warnings {
+                eprintln!("warning: {warning}");
+            }
+            println!(
+                "{} -> {} ({} band(s), preamp {:+.1} dB)",
+                path.display(),
+                preset.id,
+                preset.bands.len(),
+                preset.preamp_db
+            );
+            println!("{}", preset.id);
+            // The daemon rescans on SetEq/Refresh; nudge it so `eq list` is
+            // immediately current.
+            let _ = daemon.refresh().await;
+            Ok(())
+        }
+    }
+}
+
+/// Is this argument one of the spellings that mean "no preset"?
+fn is_off(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty()
+        || value == "-"
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("none")
+}
+
+/// Default display name for an import: the file stem, minus AutoEq's usual
+/// ` ParametricEQ` suffix.
+fn import_label(path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("preset")
+        .trim();
+    stem.strip_suffix(" ParametricEQ")
+        .or_else(|| stem.strip_suffix("ParametricEQ"))
+        .map_or(stem, str::trim)
+        .to_owned()
 }
 
 async fn watch(daemon: &DaemonProxy<'_>) -> Result<()> {
@@ -373,6 +552,7 @@ mod tests {
             "set-port",
             "vol",
             "mute",
+            "eq",
             "watch",
         ] {
             assert!(names.contains(&expected), "missing subcommand {expected}");
@@ -465,14 +645,14 @@ mod tests {
         d.5 = true;
         d.6 = 0.125; // 50 % on the cubic scale wpctl shows
         d.7 = true;
-        let line = device_line(&d, &[]);
+        let line = device_line(&d, &[], None);
         assert!(line.starts_with('*'));
         assert!(line.contains("50%"));
         assert!(line.contains("[muted]"));
         assert!(line.contains("[virtual]"));
         assert!(line.contains("sink-a"));
 
-        let plain = device_line(&device(12, "sink-b", "HDMI", "Dell AW3423DW"), &[]);
+        let plain = device_line(&device(12, "sink-b", "HDMI", "Dell AW3423DW"), &[], None);
         assert!(plain.starts_with(' '));
         assert!(!plain.contains("[muted]"));
     }
@@ -487,6 +667,7 @@ mod tests {
                 "ALC892 Analog",
             ),
             &[],
+            None,
         );
         let first = line.lines().next().expect("a first line");
         assert!(first.contains("ALC892 Analog"));
@@ -495,21 +676,29 @@ mod tests {
         assert!(line.contains("alsa_output.pci-0000_28_00.4.analog-stereo"));
 
         // No nick: fall back to the description, and do not print it twice.
-        let bare = device_line(&device(12, "sink-b", "HDMI", ""), &[]);
+        let bare = device_line(&device(12, "sink-b", "HDMI", ""), &[], None);
         assert_eq!(bare.matches("HDMI").count(), 1);
     }
 
     #[test]
     fn device_line_shows_the_active_port_only_when_there_is_a_choice() {
-        let multi = device_line(&device(39, "sink-a", "Analog", "ALC892 Analog"), &ports());
+        let multi = device_line(
+            &device(39, "sink-a", "Analog", "ALC892 Analog"),
+            &ports(),
+            None,
+        );
         assert!(multi.contains("[Headphones]"));
 
         // One port is not a choice: no bracket.
-        let single = device_line(&device(43, "sink-hdmi", "HDMI", "Dell AW3423DW"), &ports());
+        let single = device_line(
+            &device(43, "sink-hdmi", "HDMI", "Dell AW3423DW"),
+            &ports(),
+            None,
+        );
         assert!(!single.contains("[HDMI / DisplayPort]"));
 
         // No ports at all (virtual sink).
-        let none = device_line(&device(60, "null", "Null", "Null"), &ports());
+        let none = device_line(&device(60, "null", "Null", "Null"), &ports(), None);
         assert!(!none.contains('['));
     }
 
@@ -571,6 +760,114 @@ mod tests {
             }
             other => panic!("wrong subcommand: {other:?}"),
         }
+    }
+
+    /// SPEC §7.3: `outputs` shows `{eq: <name>}` after the port bracket.
+    #[test]
+    fn device_line_shows_the_eq_bracket_after_the_port() {
+        let line = device_line(
+            &device(39, "sink-a", "Analog", "ALC892 Analog"),
+            &ports(),
+            Some("Sennheiser HD 650"),
+        );
+        let first = line.lines().next().expect("a first line");
+        assert!(first.contains("[Headphones]"));
+        assert!(first.contains("{eq: Sennheiser HD 650}"));
+        assert!(
+            first.find("[Headphones]") < first.find("{eq:"),
+            "eq must come after the port bracket: {first}"
+        );
+
+        // Off means no bracket at all.
+        let off = device_line(
+            &device(39, "sink-a", "Analog", "ALC892 Analog"),
+            &ports(),
+            None,
+        );
+        assert!(!off.contains("{eq:"));
+    }
+
+    #[test]
+    fn eq_labels_resolve_names_and_skip_the_off_rows() {
+        let presets = vec![
+            ("hd650".to_owned(), "Sennheiser HD 650".to_owned()),
+            ("flat".to_owned(), "Flat".to_owned()),
+        ];
+        let eq = vec![
+            (39, "hd650".to_owned()),
+            (43, String::new()),
+            (44, "handedited".to_owned()),
+        ];
+        let labels = eq_labels(&eq, &presets);
+        assert_eq!(
+            labels.get(&39).map(String::as_str),
+            Some("Sennheiser HD 650")
+        );
+        assert!(!labels.contains_key(&43));
+        // An id with no matching preset still shows, as the raw id.
+        assert_eq!(labels.get(&44).map(String::as_str), Some("handedited"));
+        assert!(eq_labels(&[], &presets).is_empty());
+    }
+
+    #[test]
+    fn eq_off_spellings() {
+        for value in ["off", "OFF", "none", "-", "", "  "] {
+            assert!(is_off(value), "{value} should mean off");
+        }
+        for value in ["hd650", "flat", "offset"] {
+            assert!(!is_off(value), "{value} should not mean off");
+        }
+    }
+
+    #[test]
+    fn import_label_strips_the_autoeq_suffix() {
+        use std::path::Path;
+        assert_eq!(
+            import_label(Path::new("/tmp/Sennheiser HD 650 ParametricEQ.txt")),
+            "Sennheiser HD 650"
+        );
+        assert_eq!(
+            import_label(Path::new("/tmp/HD650ParametricEQ.txt")),
+            "HD650"
+        );
+        assert_eq!(import_label(Path::new("/tmp/hd650.txt")), "hd650");
+        assert_eq!(
+            eq::slugify(&import_label(Path::new("x/HD 650.txt"))),
+            "hd-650"
+        );
+    }
+
+    #[test]
+    fn eq_subcommands_parse() {
+        let cli = Cli::try_parse_from(["pipedeck", "eq", "set", "39", "hd650"]).expect("parses");
+        match cli.command {
+            Cmd::Eq(EqCmd::Set { id, ref preset }) => {
+                assert_eq!(id, 39);
+                assert_eq!(preset, "hd650");
+            }
+            ref other => panic!("wrong subcommand: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "pipedeck",
+            "eq",
+            "import",
+            "hd650.txt",
+            "--name",
+            "Sennheiser HD 650",
+        ])
+        .expect("parses");
+        match cli.command {
+            Cmd::Eq(EqCmd::Import { ref file, ref name }) => {
+                assert_eq!(file.to_str(), Some("hd650.txt"));
+                assert_eq!(name.as_deref(), Some("Sennheiser HD 650"));
+            }
+            ref other => panic!("wrong subcommand: {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["pipedeck", "eq", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["pipedeck", "eq", "show", "hd650"]).is_ok());
+        assert!(Cli::try_parse_from(["pipedeck", "eq"]).is_err());
     }
 
     #[test]

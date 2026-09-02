@@ -1,0 +1,9 @@
+# Reduce harsh high-frequency sibilance
+name = "Treble Tame"
+preamp_db = 0.0
+
+[[band]]
+type = "highshelf"
+freq = 6000.0
+q = 0.707
+gain_db = -4.0

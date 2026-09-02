@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
@@ -20,7 +21,7 @@ use spa::pod::serialize::PodSerializer;
 use spa::pod::{ChoiceValue, Object, Pod, Property, Value, ValueArray};
 use spa::utils::{Choice, ChoiceEnum, SpaTypes};
 
-use pw::context::ContextRc;
+use pw::context::{ContextRc, ContextWeak};
 use pw::device::{Device as PwDevice, DeviceChangeMask, DeviceListener};
 use pw::main_loop::MainLoopRc;
 use pw::metadata::{Metadata, MetadataListener};
@@ -35,6 +36,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::command::Command;
 use crate::config::Config;
+use crate::eq::{self, Preset};
 use crate::error::{Error, Result};
 use crate::matching::is_notification_stream;
 use crate::meta;
@@ -63,6 +65,9 @@ mod keys {
     pub const CARD_PROFILE_DEVICE: &str = "card.profile.device";
     pub const LINK_OUTPUT_NODE: &str = "link.output.node";
     pub const LINK_INPUT_NODE: &str = "link.input.node";
+    pub const NODE_LINK_GROUP: &str = "node.link-group";
+    pub const AUDIO_CHANNELS: &str = "audio.channels";
+    pub const AUDIO_POSITION: &str = "audio.position";
 }
 
 /// `media.class` of the card objects that own routes (SPEC §6.1).
@@ -126,8 +131,14 @@ struct NodeEntry {
     media_name: String,
     media_role: String,
     virtual_: bool,
+    /// One of our own filter-chain nodes (SPEC §7.1): tracked, never published.
+    hidden: bool,
     serial: Option<u64>,
     channels: usize,
+    /// `audio.channels`, when the node advertises it in its props.
+    audio_channels: Option<usize>,
+    /// `audio.position`, split into channel names.
+    audio_position: Vec<String>,
     volume: f64,
     mute: bool,
 }
@@ -148,6 +159,50 @@ struct RouteTarget {
     props: RouteProps,
 }
 
+/// An owned `libpipewire-module-filter-chain` instance.
+///
+/// The pointer is only ever touched on the PipeWire thread, which is also the
+/// only thread that can construct one — [`Inner`] is `!Send` and never leaves it.
+struct ModuleHandle(*mut pw::sys::pw_impl_module);
+
+impl ModuleHandle {
+    /// Unload the module. Idempotent: the pointer is nulled as it goes.
+    fn destroy(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        // SAFETY: the pointer came from `pw_context_load_module` on this
+        // thread's context, has not been destroyed yet (it is nulled below),
+        // and we are on the PipeWire thread.
+        unsafe { pw::sys::pw_impl_module_destroy(self.0) };
+        self.0 = std::ptr::null_mut();
+    }
+}
+
+impl Drop for ModuleHandle {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+/// One EQ filter chain, per target sink (SPEC §7.1).
+struct EqInstance {
+    /// The loaded module. Held for ownership only — dropping the instance is
+    /// what unloads it, exactly like `NodeEntry`'s `_listener`.
+    _module: ModuleHandle,
+    /// `node.name` of the sink the chain filters.
+    sink_name: String,
+    /// `node.name` of the chain's main (capture) node.
+    node_name: String,
+    /// Node id of that main node, once its global appears.
+    main_node_id: Option<u32>,
+    /// The preset whose controls are currently written into the chain.
+    applied_preset: Option<Preset>,
+    /// True while bypassed through the `filters` metadata (SPEC §7.1's "EQ
+    /// off": the module stays loaded, WirePlumber just stops routing through it).
+    disabled: bool,
+}
+
 /// The bound `default` metadata object.
 struct MetadataEntry {
     proxy: Metadata,
@@ -159,6 +214,18 @@ struct Inner {
     state: Arc<RwLock<State>>,
     notify: watch::Sender<u64>,
     config: Config,
+    /// The preset library, rescanned by the D-Bus side (SPEC §7.3).
+    presets: Arc<RwLock<Vec<Preset>>>,
+    /// Our own context, for `pw_context_load_module`. Weak so the listener
+    /// closures that hold [`Inner`] cannot keep the context alive by themselves.
+    context: ContextWeak,
+    /// Loaded filter chains by target sink `node.name`.
+    eq: HashMap<String, EqInstance>,
+    /// `(sink, preset id)` pairs already reported as unknown, so the warning is
+    /// logged once rather than on every graph event.
+    eq_warned: HashSet<(String, String)>,
+    /// The WirePlumber `filters` metadata, when it exists.
+    filters_metadata: Option<Rc<MetadataEntry>>,
     nodes: HashMap<u32, NodeEntry>,
     /// `Audio/Device` globals by id, holding their route tables.
     devices: HashMap<u32, DeviceEntry>,
@@ -220,10 +287,14 @@ impl Inner {
         })
     }
 
+    /// Is there a real (non-EQ) sink by this name?
+    ///
+    /// SPEC §7.1: the daemon's own filter-chain nodes are never selectable, so
+    /// they can never become a stream target or the notification sink.
     fn sink_exists(&self, name: &str) -> bool {
         self.nodes
             .values()
-            .any(|n| n.role == NodeRole::Sink && n.name == name)
+            .any(|n| n.role == NodeRole::Sink && !n.hidden && n.name == name)
     }
 
     fn is_notification(&self, entry: &NodeEntry) -> bool {
@@ -246,8 +317,14 @@ impl Inner {
         };
 
         let mut ports: Vec<Port> = Vec::new();
+        let mut eq_rows: Vec<(u32, String)> = Vec::new();
 
         for (id, entry) in &self.nodes {
+            // SPEC §7.1: our own filter-chain nodes are tracked (we write their
+            // controls) but never published as devices or streams.
+            if entry.hidden {
+                continue;
+            }
             if let Some(kind) = entry.role.device_kind() {
                 // On ALSA cards WirePlumber owns volume through the device
                 // `Route` param, so that is what the panel must be shown
@@ -264,6 +341,9 @@ impl Inner {
                             mute = m;
                         }
                     }
+                }
+                if kind == DeviceKind::Sink {
+                    eq_rows.push((*id, self.eq_selection(&entry.name)));
                 }
                 state.devices.insert(
                     *id,
@@ -298,6 +378,8 @@ impl Inner {
         }
         ports.sort_by_key(|p| (p.node_id, p.index));
         state.ports = ports;
+        eq_rows.sort_by_key(|(id, _)| *id);
+        state.eq = eq_rows;
         state.refresh_defaults();
 
         match self.state.write() {
@@ -310,6 +392,273 @@ impl Inner {
 
         self.revision = self.revision.wrapping_add(1);
         let _ = self.notify.send(self.revision);
+    }
+
+    // -----------------------------------------------------------------
+    // EQ (SPEC §7.1)
+    // -----------------------------------------------------------------
+
+    /// The preset id to report for a sink in the `Eq` property.
+    ///
+    /// This is the *configured* selection, resolved against the preset library:
+    /// an id that no longer names a preset reads as "off" (SPEC §7.1: "unknown
+    /// preset name → log warn, treat as off"). Reporting the configuration
+    /// rather than the instance's applied state keeps the row stable while a
+    /// freshly loaded chain waits for its node to appear.
+    fn eq_selection(&self, sink_name: &str) -> String {
+        let Some(wanted) = self.config.eq_preset(sink_name) else {
+            return String::new();
+        };
+        if self.preset_by_id(wanted).is_some() {
+            wanted.to_owned()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Look one preset up in the shared library.
+    fn preset_by_id(&self, id: &str) -> Option<Preset> {
+        let guard = match self.presets.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.iter().find(|p| p.id == id).cloned()
+    }
+
+    /// Everything [`build_filter_chain_args`](crate::eq::build_filter_chain_args)
+    /// needs about a target sink.
+    fn eq_target(&self, sink_name: &str) -> Option<(String, usize, Vec<String>)> {
+        let entry = self
+            .nodes
+            .values()
+            .find(|n| n.role == NodeRole::Sink && !n.hidden && n.name == sink_name)?;
+        let channels = entry
+            .audio_channels
+            .filter(|c| *c > 0)
+            .unwrap_or(entry.channels)
+            .max(1);
+        let position = if entry.audio_position.len() == channels {
+            entry.audio_position.clone()
+        } else {
+            Vec::new()
+        };
+        Some((entry.nick.clone(), channels, position))
+    }
+
+    /// Adopt a newly appeared filter-chain main node, if it is one of ours.
+    fn attach_eq_node(&mut self, id: u32) {
+        let Some(entry) = self.nodes.get(&id) else {
+            return;
+        };
+        if !entry.hidden || entry.role != NodeRole::Sink {
+            return;
+        }
+        let name = entry.name.clone();
+        if let Some(instance) = self.eq.values_mut().find(|i| i.node_name == name) {
+            if instance.main_node_id != Some(id) {
+                debug!(node = id, sink = %instance.sink_name, "EQ filter chain node appeared");
+                instance.main_node_id = Some(id);
+                instance.applied_preset = None;
+            }
+        }
+    }
+
+    /// Forget a filter-chain main node that has gone away.
+    fn detach_eq_node(&mut self, id: u32) {
+        for instance in self.eq.values_mut() {
+            if instance.main_node_id == Some(id) {
+                instance.main_node_id = None;
+                instance.applied_preset = None;
+            }
+        }
+    }
+
+    /// Reconcile the loaded filter chains with the `[eq]` config (SPEC §7.1).
+    ///
+    /// Idempotent, and safe to call on every graph change: it loads a chain for
+    /// a sink that has gained a preset, bypasses one that has lost it, pushes
+    /// controls when the preset (or the chain's node) changed, and unloads a
+    /// chain whose sink has disappeared.
+    fn apply_eq(&mut self) {
+        let live: HashSet<String> = self
+            .nodes
+            .values()
+            .filter(|n| n.role == NodeRole::Sink && !n.hidden)
+            .map(|n| n.name.clone())
+            .collect();
+
+        // A sink that went away takes its chain with it.
+        let stale: Vec<String> = self
+            .eq
+            .keys()
+            .filter(|name| !live.contains(*name))
+            .cloned()
+            .collect();
+        for name in stale {
+            info!(sink = %name, "sink gone; unloading its EQ filter chain");
+            self.eq.remove(&name);
+        }
+
+        let mut sinks: Vec<String> = live.into_iter().collect();
+        sinks.sort();
+        for sink in sinks {
+            let configured = self.config.eq_preset(&sink).map(str::to_owned);
+            let wanted = configured.as_ref().and_then(|id| {
+                let found = self.preset_by_id(id);
+                if found.is_some() {
+                    self.eq_warned.remove(&(sink.clone(), id.clone()));
+                } else if self.eq_warned.insert((sink.clone(), id.clone())) {
+                    // SPEC §7.1: unknown preset name -> log warn, treat as off.
+                    warn!(sink = %sink, preset = %id, "unknown EQ preset; treating as off");
+                }
+                found
+            });
+
+            match wanted {
+                Some(preset) => self.eq_enable(&sink, &preset),
+                None => self.eq_disable(&sink),
+            }
+        }
+    }
+
+    /// Make sure `sink` has a live chain running `preset`.
+    fn eq_enable(&mut self, sink: &str, preset: &Preset) {
+        if !self.eq.contains_key(sink) {
+            let Some((nick, channels, position)) = self.eq_target(sink) else {
+                return;
+            };
+            let Some(context) = self.context.upgrade() else {
+                warn!(sink = %sink, "PipeWire context is gone; cannot load the EQ filter chain");
+                return;
+            };
+            let args = eq::build_filter_chain_args(sink, &nick, channels, &position);
+            debug!(sink = %sink, channels, "loading the EQ filter chain");
+            match load_filter_chain(&context, &args) {
+                Some(module) => {
+                    info!(sink = %sink, preset = %preset.id, "EQ filter chain loaded");
+                    self.eq.insert(
+                        sink.to_owned(),
+                        EqInstance {
+                            _module: module,
+                            sink_name: sink.to_owned(),
+                            node_name: eq::eq_node_name(sink),
+                            main_node_id: None,
+                            applied_preset: None,
+                            disabled: false,
+                        },
+                    );
+                }
+                None => {
+                    error!(sink = %sink, "could not load {}", eq::FILTER_CHAIN_MODULE);
+                    return;
+                }
+            }
+        }
+
+        // Un-bypass before writing controls, so a re-enable is one step.
+        let needs_enable = self.eq.get(sink).is_some_and(|i| i.disabled);
+        if needs_enable && self.set_filter_disabled(sink, false) {
+            if let Some(instance) = self.eq.get_mut(sink) {
+                instance.disabled = false;
+            }
+        }
+
+        let (node_id, stale) = match self.eq.get(sink) {
+            Some(instance) => (
+                instance.main_node_id,
+                instance.applied_preset.as_ref() != Some(preset),
+            ),
+            None => return,
+        };
+        if let (Some(node_id), true) = (node_id, stale) {
+            if self.write_eq_params(node_id, preset) {
+                if let Some(instance) = self.eq.get_mut(sink) {
+                    instance.applied_preset = Some(preset.clone());
+                }
+            }
+        }
+    }
+
+    /// Bypass `sink`'s chain, if it has one.
+    ///
+    /// SPEC §7.1 prefers the `filters` metadata (instant re-link, no reload).
+    /// When that metadata does not exist we fall back to unloading the module,
+    /// and say so — the next `SetEq` reloads it.
+    fn eq_disable(&mut self, sink: &str) {
+        let Some(instance) = self.eq.get(sink) else {
+            return;
+        };
+        if instance.disabled {
+            return;
+        }
+        if instance.main_node_id.is_none() {
+            // Nothing is routed through it yet, so there is nothing to bypass.
+            debug!(sink = %sink, "unloading an EQ filter chain that never came up");
+            self.eq.remove(sink);
+            return;
+        }
+        if self.set_filter_disabled(sink, true) {
+            if let Some(instance) = self.eq.get_mut(sink) {
+                instance.disabled = true;
+                instance.applied_preset = None;
+            }
+        } else {
+            warn!(
+                sink = %sink,
+                "the WirePlumber `{}` metadata is missing; unloading the EQ filter chain instead",
+                eq::METADATA_NAME_FILTERS
+            );
+            self.eq.remove(sink);
+        }
+    }
+
+    /// Write `filter.smart.disabled` for a chain. `false` when there is no
+    /// `filters` metadata or no main node to key it on yet.
+    fn set_filter_disabled(&self, sink: &str, disabled: bool) -> bool {
+        let Some(instance) = self.eq.get(sink) else {
+            return false;
+        };
+        let Some(node_id) = instance.main_node_id else {
+            return false;
+        };
+        let Some(metadata) = self.filters_metadata.as_ref() else {
+            return false;
+        };
+        debug!(sink = %sink, node = node_id, disabled, "setting filter.smart.disabled");
+        metadata.proxy.set_property(
+            node_id,
+            eq::KEY_FILTER_SMART_DISABLED,
+            Some(meta::TYPE_SPA_JSON),
+            Some(if disabled { "true" } else { "false" }),
+        );
+        true
+    }
+
+    /// Push a preset's control values into a chain's main node.
+    fn write_eq_params(&self, node_id: u32, preset: &Preset) -> bool {
+        let Some(entry) = self.nodes.get(&node_id) else {
+            return false;
+        };
+        let params = eq::preset_to_params(preset);
+        let Some(bytes) = eq_params_pod(&params) else {
+            error!(preset = %preset.id, "could not build the EQ params pod");
+            return false;
+        };
+        let Some(pod) = Pod::from_bytes(&bytes) else {
+            error!(preset = %preset.id, "built an invalid EQ params pod");
+            return false;
+        };
+        debug!(node = node_id, preset = %preset.id, controls = params.len(), "applying EQ preset");
+        entry.proxy.set_param(ParamType::Props, 0, pod);
+        true
+    }
+
+    /// Unload every chain. Called once the main loop has stopped.
+    fn teardown_eq(&mut self) {
+        if !self.eq.is_empty() {
+            info!(chains = self.eq.len(), "unloading EQ filter chains");
+        }
+        self.eq.clear();
     }
 
     /// Point every matching notification stream at the configured sink, and
@@ -422,6 +771,7 @@ impl PwThread {
     pub fn spawn(
         config: Config,
         state: Arc<RwLock<State>>,
+        presets: Arc<RwLock<Vec<Preset>>>,
         notify: watch::Sender<u64>,
         exited: UnboundedSender<()>,
     ) -> std::result::Result<Self, String> {
@@ -431,7 +781,7 @@ impl PwThread {
         let handle = std::thread::Builder::new()
             .name("pipedeck-pw".to_owned())
             .spawn(move || {
-                let result = run(config, state, notify, receiver, &ready_tx);
+                let result = run(config, state, presets, notify, receiver, &ready_tx);
                 // If we failed before signalling readiness, report it now.
                 let _ = ready_tx.send(result.clone());
                 if let Err(e) = result {
@@ -478,6 +828,7 @@ impl Drop for PwThread {
 fn run(
     config: Config,
     state: Arc<RwLock<State>>,
+    presets: Arc<RwLock<Vec<Preset>>>,
     notify: watch::Sender<u64>,
     receiver: pw::channel::Receiver<Command>,
     ready: &std::sync::mpsc::Sender<std::result::Result<(), String>>,
@@ -497,6 +848,11 @@ fn run(
         state,
         notify,
         config,
+        presets,
+        context: context.downgrade(),
+        eq: HashMap::new(),
+        eq_warned: HashSet::new(),
+        filters_metadata: None,
         nodes: HashMap::new(),
         devices: HashMap::new(),
         links: HashMap::new(),
@@ -553,6 +909,10 @@ fn run(
     let _ = ready.send(Ok(()));
 
     main_loop.run();
+
+    // SPEC §7.1: unload the filter chains on shutdown, while the context and
+    // the loop they were created on are both still alive.
+    inner.borrow_mut().teardown_eq();
 
     // Mark the snapshot stale so clients can tell the graph link is gone.
     if let Ok(mut guard) = inner.borrow().state.write() {
@@ -615,6 +975,11 @@ fn on_node_global(
         || props
             .get(keys::FACTORY_NAME)
             .is_some_and(|f| f.contains("null-audio-sink"));
+    // SPEC §7.1: our own filter-chain nodes are hidden from Devices/Streams.
+    let hidden = eq::is_eq_node(
+        props.get(eq::PROP_PIPEDECK_EQ),
+        props.get(keys::NODE_LINK_GROUP),
+    );
 
     let listener = {
         let inner = inner.clone();
@@ -666,15 +1031,23 @@ fn on_node_global(
         media_name: props.get(keys::MEDIA_NAME).unwrap_or_default().to_owned(),
         media_role: props.get(keys::MEDIA_ROLE).unwrap_or_default().to_owned(),
         virtual_,
+        hidden,
         serial: props.get(keys::OBJECT_SERIAL).and_then(|s| s.parse().ok()),
         channels: 2,
+        audio_channels: props.get(keys::AUDIO_CHANNELS).and_then(|s| s.parse().ok()),
+        audio_position: props
+            .get(keys::AUDIO_POSITION)
+            .map(eq::parse_positions)
+            .unwrap_or_default(),
         volume: 1.0,
         mute: false,
     };
 
     let mut guard = inner.borrow_mut();
     guard.nodes.insert(id, entry);
+    guard.attach_eq_node(id);
     guard.apply_notification_routing();
+    guard.apply_eq();
     guard.publish();
 }
 
@@ -902,13 +1275,17 @@ fn on_metadata_global(
     global: &GlobalObject<&spa::utils::dict::DictRef>,
 ) {
     let Some(props) = global.props else { return };
-    if props.get(keys::METADATA_NAME) != Some(meta::METADATA_NAME_DEFAULT) {
+    let name = props.get(keys::METADATA_NAME).unwrap_or_default();
+    // `default` carries the default-device selections (SPEC §2.1); `filters`
+    // is where a smart filter is bypassed without unloading it (SPEC §7.1).
+    let is_filters = name == eq::METADATA_NAME_FILTERS;
+    if name != meta::METADATA_NAME_DEFAULT && !is_filters {
         return;
     }
     let metadata: Metadata = match registry.bind(global) {
         Ok(m) => m,
         Err(e) => {
-            warn!(id = global.id, "could not bind default metadata: {e}");
+            warn!(id = global.id, name, "could not bind metadata: {e}");
             return;
         }
     };
@@ -924,14 +1301,22 @@ fn on_metadata_global(
             .register()
     };
 
-    let mut guard = inner.borrow_mut();
-    guard.metadata = Some(Rc::new(MetadataEntry {
+    let entry = Rc::new(MetadataEntry {
         proxy: metadata,
         _listener: listener,
-    }));
-    guard.apply_notification_routing();
+    });
+
+    let mut guard = inner.borrow_mut();
+    if is_filters {
+        guard.filters_metadata = Some(entry);
+        info!(id = global.id, "bound the `filters` metadata object");
+        guard.apply_eq();
+    } else {
+        guard.metadata = Some(entry);
+        info!(id = global.id, "bound the `default` metadata object");
+        guard.apply_notification_routing();
+    }
     guard.publish();
-    info!(id = global.id, "bound the `default` metadata object");
 }
 
 fn on_link_global(inner: &Rc<RefCell<Inner>>, global: &GlobalObject<&spa::utils::dict::DictRef>) {
@@ -952,6 +1337,7 @@ fn on_link_global(inner: &Rc<RefCell<Inner>>, global: &GlobalObject<&spa::utils:
 
 fn on_global_remove(inner: &Rc<RefCell<Inner>>, id: u32) {
     let mut guard = inner.borrow_mut();
+    guard.detach_eq_node(id);
     let mut changed = guard.nodes.remove(&id).is_some();
     changed |= guard.devices.remove(&id).is_some();
     changed |= guard.links.remove(&id).is_some();
@@ -965,8 +1351,17 @@ fn on_global_remove(inner: &Rc<RefCell<Inner>>, id: u32) {
         guard.metadata = None;
         changed = true;
     }
+    if guard
+        .filters_metadata
+        .as_ref()
+        .is_some_and(|m| m.proxy.upcast_ref().id() == id)
+    {
+        guard.filters_metadata = None;
+        changed = true;
+    }
     if changed {
         guard.apply_notification_routing();
+        guard.apply_eq();
     }
     guard.publish();
 }
@@ -1105,6 +1500,7 @@ fn handle_command(inner: &Rc<RefCell<Inner>>, command: Command) {
             let mut guard = inner.borrow_mut();
             guard.config = (**config).clone();
             guard.apply_notification_routing();
+            guard.apply_eq();
             guard.publish();
             Ok(())
         }
@@ -1124,6 +1520,7 @@ fn handle_command(inner: &Rc<RefCell<Inner>>, command: Command) {
                     .enum_params(0, Some(ParamType::Route), 0, u32::MAX);
             }
             guard.apply_notification_routing();
+            guard.apply_eq();
             guard.publish();
             Ok(())
         }
@@ -1300,6 +1697,81 @@ fn set_stream_target(inner: &Rc<RefCell<Inner>>, id: u32, name: &str) -> Result<
     }
     guard.publish();
     Ok(())
+}
+
+/// Load `libpipewire-module-filter-chain` into the daemon's own context
+/// (SPEC §7.1).
+///
+/// pipewire-rs 0.10 has no safe wrapper for module loading, so this is the one
+/// `unsafe` call in the crate besides the pod helpers. It **must** run on the
+/// PipeWire thread: `pw_context_load_module` builds nodes on the context's loop
+/// and is not thread-safe. Every caller is reached from a listener or a command
+/// handler, both of which the loop invokes on that thread.
+///
+/// The returned handle owns the module and unloads it on drop.
+fn load_filter_chain(context: &ContextRc, args: &str) -> Option<ModuleHandle> {
+    let name = CString::new(eq::FILTER_CHAIN_MODULE).ok()?;
+    let args = CString::new(args)
+        .inspect_err(|_| error!("EQ module arguments contained a NUL byte"))
+        .ok()?;
+    // SAFETY: `context` is this thread's live context; both strings outlive the
+    // call; a null `properties` is the documented "no extra properties" value.
+    let module = unsafe {
+        pw::sys::pw_context_load_module(
+            context.as_raw_ptr(),
+            name.as_ptr(),
+            args.as_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if module.is_null() {
+        None
+    } else {
+        Some(ModuleHandle(module))
+    }
+}
+
+/// Build the `Props` pod that sets a filter chain's named controls.
+///
+/// SPEC §7.1: `Object(Props){ params: Struct[ "pre:Mult", <f>, "ls:Freq", … ] }`
+/// — filter-chain's documented runtime-control interface, a Struct of
+/// alternating string and float.
+fn eq_params_pod(params: &[(String, f32)]) -> Option<Vec<u8>> {
+    let mut fields: Vec<Value> = Vec::with_capacity(params.len() * 2);
+    for (name, value) in params {
+        fields.push(Value::String(name.clone()));
+        fields.push(Value::Float(*value));
+    }
+    props_pod(vec![Property::new(
+        spa::sys::SPA_PROP_params,
+        Value::Struct(fields),
+    )])
+}
+
+/// Read an EQ params pod back into `(control, value)` pairs.
+///
+/// Only used by the round-trip test — nothing on the graph sends these to us —
+/// but it is the only way to prove the pod shape without a server.
+#[cfg(test)]
+fn parse_eq_params(param: &Pod) -> Option<Vec<(String, f32)>> {
+    let (_rest, value) = PodDeserializer::deserialize_any_from(param.as_bytes()).ok()?;
+    let Value::Object(object) = value else {
+        return None;
+    };
+    let fields = object.properties.iter().find_map(|p| {
+        (p.key == spa::sys::SPA_PROP_params).then(|| match &p.value {
+            Value::Struct(fields) => Some(fields.clone()),
+            _ => None,
+        })
+    })??;
+    let mut out = Vec::with_capacity(fields.len() / 2);
+    for pair in fields.chunks(2) {
+        let [Value::String(name), Value::Float(value)] = pair else {
+            return None;
+        };
+        out.push((name.clone(), *value));
+    }
+    Some(out)
 }
 
 /// Wrap `Props` properties into a serialised `SPA_TYPE_OBJECT_Props` pod.
@@ -1813,6 +2285,72 @@ mod tests {
             )))),
             Some(2)
         );
+    }
+
+    /// SPEC §7.1's preset write: `Object(Props){ params: Struct[ String, Float,
+    /// … ] }`, round-tripped through libspa without a server — same style as the
+    /// `Route` pod test above.
+    #[test]
+    fn eq_params_pod_round_trips_the_control_struct() {
+        use crate::eq::{Band, BandKind, Preset};
+
+        let preset = Preset {
+            id: "hd650".to_owned(),
+            name: "HD 650".to_owned(),
+            preamp_db: -6.4,
+            bands: vec![
+                Band {
+                    kind: BandKind::Lowshelf,
+                    freq: 105.0,
+                    q: 0.7,
+                    gain_db: 5.1,
+                },
+                Band {
+                    kind: BandKind::Peaking,
+                    freq: 1030.0,
+                    q: 1.44,
+                    gain_db: -2.4,
+                },
+                Band {
+                    kind: BandKind::Highshelf,
+                    freq: 10_000.0,
+                    q: 0.7,
+                    gain_db: -1.2,
+                },
+            ],
+        };
+        let params = crate::eq::preset_to_params(&preset);
+        let bytes = eq_params_pod(&params).expect("pod builds");
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+
+        // It really is a Props object carrying SPA_PROP_params.
+        let (_rest, value) =
+            PodDeserializer::deserialize_any_from(pod.as_bytes()).expect("deserialises");
+        let Value::Object(object) = value else {
+            panic!("not an object");
+        };
+        assert_eq!(object.type_, SpaTypes::ObjectParamProps.as_raw());
+        assert_eq!(object.id, ParamType::Props.as_raw());
+        assert_eq!(object.properties.len(), 1);
+        assert_eq!(object.properties[0].key, spa::sys::SPA_PROP_params);
+
+        let read_back = parse_eq_params(pod).expect("parses");
+        assert_eq!(read_back.len(), params.len());
+        for ((a_name, a_value), (b_name, b_value)) in read_back.iter().zip(params.iter()) {
+            assert_eq!(a_name, b_name);
+            assert!((a_value - b_value).abs() < 1e-6, "{a_name}");
+        }
+        assert_eq!(read_back[0].0, "pre:Mult");
+        assert!((read_back[0].1 - crate::eq::preamp_mult(-6.4)).abs() < 1e-6);
+    }
+
+    /// An empty control list is still a well-formed pod, so a preset with no
+    /// bands cannot produce garbage on the wire.
+    #[test]
+    fn eq_params_pod_handles_an_empty_control_list() {
+        let bytes = eq_params_pod(&[]).expect("pod builds");
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        assert_eq!(parse_eq_params(pod), Some(Vec::new()));
     }
 
     #[test]

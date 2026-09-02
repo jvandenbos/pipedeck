@@ -14,10 +14,11 @@ use zbus::object_server::SignalEmitter;
 
 use crate::command::{await_reply, Command};
 use crate::config::Config;
+use crate::eq::{self, Preset};
 use crate::error::{Error, Result};
 use crate::pw::PwHandle;
 use crate::route::PortTuple;
-use crate::state::{DeviceKind, DeviceTuple, State, StreamTuple};
+use crate::state::{DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, State, StreamTuple};
 use crate::volume::clamp_volume;
 
 /// Well-known bus name the daemon owns.
@@ -36,6 +37,10 @@ pub struct Daemon {
     /// read-modify-write on the config file.
     config: Arc<Mutex<Config>>,
     config_path: Option<std::path::PathBuf>,
+    /// The preset library, shared with the PipeWire thread (SPEC §7.3).
+    presets: Arc<RwLock<Vec<Preset>>>,
+    /// Where presets are scanned from; `None` disables rescanning.
+    presets_dir: Option<std::path::PathBuf>,
 }
 
 impl Daemon {
@@ -46,12 +51,68 @@ impl Daemon {
         pw: PwHandle,
         config: Config,
         config_path: Option<std::path::PathBuf>,
+        presets: Arc<RwLock<Vec<Preset>>>,
+        presets_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             state,
             pw,
             config: Arc::new(Mutex::new(config)),
             config_path,
+            presets,
+            presets_dir,
+        }
+    }
+
+    /// Re-read the presets directory into the shared library (SPEC §7.3: the
+    /// `EqPresets` property is rescanned on `Refresh` and on `SetEq`).
+    ///
+    /// A directory that cannot be read leaves the previous library in place — a
+    /// transient I/O error must not silently empty the panel's preset list.
+    fn rescan_presets(&self) {
+        let Some(dir) = self.presets_dir.as_ref() else {
+            return;
+        };
+        let (presets, problems) = eq::load_presets(dir);
+        for problem in problems {
+            warn!("skipping EQ preset: {problem}");
+        }
+        match self.presets.write() {
+            Ok(mut guard) => *guard = presets,
+            Err(poisoned) => {
+                warn!("preset lock was poisoned; recovering");
+                *poisoned.into_inner() = presets;
+            }
+        }
+    }
+
+    /// SPEC §7.3's `SetEq` validation, split out so it can be tested without a
+    /// D-Bus connection (the interface method needs a `SignalEmitter`).
+    ///
+    /// Returns the target sink's `node.name` and the trimmed preset id.
+    fn validate_set_eq(&self, node_id: u32, preset: &str) -> Result<(String, String)> {
+        let preset = preset.trim();
+        let snapshot = self.snapshot();
+        let device = snapshot
+            .devices
+            .get(&node_id)
+            .ok_or_else(|| Error::not_found(format!("no device with id {node_id}")))?;
+        if device.kind != DeviceKind::Sink {
+            return Err(Error::invalid(format!(
+                "node {node_id} is an input; EQ applies to output devices only"
+            )));
+        }
+        if !preset.is_empty() && !self.preset_list().iter().any(|p| p.id == preset) {
+            return Err(Error::not_found(format!("no EQ preset `{preset}`")));
+        }
+        Ok((device.name.clone(), preset.to_owned()))
+    }
+
+    /// A snapshot of the preset library.
+    fn preset_list(&self) -> Vec<Preset> {
+        match self.presets.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -90,6 +151,18 @@ impl Daemon {
     #[zbus(property)]
     async fn streams(&self) -> Vec<StreamTuple> {
         self.snapshot().streams_dbus()
+    }
+
+    /// Available EQ presets: `(id, name)`, scanned from the presets directory.
+    #[zbus(property)]
+    async fn eq_presets(&self) -> Vec<EqPresetTuple> {
+        self.preset_list().iter().map(Preset::to_dbus).collect()
+    }
+
+    /// The EQ preset on each output device: `(node_id, preset id or "")`.
+    #[zbus(property)]
+    async fn eq(&self) -> Vec<EqTuple> {
+        self.snapshot().eq_dbus()
     }
 
     /// `node.name` of the notification sink; empty means "follow the default output".
@@ -199,8 +272,52 @@ impl Daemon {
         .await
     }
 
+    /// Apply an EQ preset to an output device; an empty preset turns EQ off.
+    async fn set_eq(
+        &self,
+        node_id: u32,
+        preset: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<()> {
+        // SPEC §7.3: the preset list is rescanned on SetEq, so a file dropped
+        // in a moment ago can be selected without a Refresh first.
+        self.rescan_presets();
+        let (sink_name, preset) = self.validate_set_eq(node_id, preset)?;
+
+        let mut guard = self.config.lock().await;
+        let previous = guard.eq_preset(&sink_name).map(str::to_owned);
+        if previous.as_deref().unwrap_or_default() == preset {
+            let _ = self.eq_presets_changed(&emitter).await;
+            return Ok(());
+        }
+        guard.set_eq_preset(&sink_name, &preset);
+        let config = guard.clone();
+
+        if let Some(path) = self.config_path.as_ref() {
+            if let Err(e) = config.save_to(path) {
+                guard.set_eq_preset(&sink_name, previous.as_deref().unwrap_or_default());
+                return Err(Error::from(e));
+            }
+        }
+        drop(guard);
+
+        let result = self
+            .dispatch(move |reply| Command::SetConfig {
+                config: Box::new(config),
+                reply,
+            })
+            .await;
+        if result.is_ok() {
+            let _ = self.eq_presets_changed(&emitter).await;
+            let _ = self.eq_changed(&emitter).await;
+        }
+        result
+    }
+
     /// Re-read every node's params and re-publish the snapshot.
     async fn refresh(&self) -> Result<()> {
+        // SPEC §7.3: `EqPresets` is rescanned on Refresh.
+        self.rescan_presets();
         self.dispatch(|reply| Command::Refresh { reply }).await
     }
 
@@ -239,6 +356,9 @@ pub async fn run_change_notifier(
         if let Err(e) = guard.ports_changed(emitter).await {
             warn!("could not emit PropertiesChanged for Ports: {e}");
         }
+        if let Err(e) = guard.eq_changed(emitter).await {
+            warn!("could not emit PropertiesChanged for Eq: {e}");
+        }
         drop(guard);
         if let Err(e) = Daemon::changed(emitter).await {
             warn!("could not emit Changed: {e}");
@@ -256,6 +376,53 @@ mod tests {
             Arc::new(RwLock::new(State::default())),
             PwHandle::disconnected(),
             Config::default(),
+            None,
+            Arc::new(RwLock::new(Vec::new())),
+            None,
+        )
+    }
+
+    fn sink(id: u32, name: &str) -> crate::state::Device {
+        crate::state::Device {
+            id,
+            name: name.to_owned(),
+            description: "Analog".to_owned(),
+            kind: DeviceKind::Sink,
+            is_default: true,
+            virtual_: false,
+            volume: 0.5,
+            mute: false,
+            nick: "ALC892 Analog".to_owned(),
+        }
+    }
+
+    fn preset(id: &str, name: &str) -> Preset {
+        Preset {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            preamp_db: 0.0,
+            bands: Vec::new(),
+        }
+    }
+
+    /// A daemon with one sink, one source and one preset, and no PipeWire
+    /// thread — enough to exercise every `SetEq` validation path.
+    fn eq_daemon() -> Daemon {
+        let state = Arc::new(RwLock::new(State::default()));
+        {
+            let mut guard = state.write().expect("lock");
+            guard.devices.insert(39, sink(39, "sink-a"));
+            let mut source = sink(41, "source-a");
+            source.kind = DeviceKind::Source;
+            guard.devices.insert(41, source);
+            guard.eq = vec![(39, String::new())];
+        }
+        Daemon::new(
+            state,
+            PwHandle::disconnected(),
+            Config::default(),
+            None,
+            Arc::new(RwLock::new(vec![preset("hd650", "Sennheiser HD 650")])),
             None,
         )
     }
@@ -289,6 +456,8 @@ mod tests {
         assert!(xml.contains(r#"<property name="NotificationSink" type="s" access="read"/>"#));
         assert!(xml.contains(r#"<property name="Version" type="s" access="read"/>"#));
         assert!(xml.contains(r#"<signal name="Changed">"#));
+        assert!(xml.contains(r#"<property name="EqPresets" type="a(ss)" access="read"/>"#));
+        assert!(xml.contains(r#"<property name="Eq" type="a(us)" access="read"/>"#));
         for method in [
             "SetDefault",
             "SetNotificationSink",
@@ -296,6 +465,7 @@ mod tests {
             "SetMute",
             "SetStreamTarget",
             "SetPort",
+            "SetEq",
             "Refresh",
         ] {
             assert!(
@@ -391,6 +561,8 @@ mod tests {
                 ..Config::default()
             },
             None,
+            Arc::new(RwLock::new(Vec::new())),
+            None,
         );
         let devices = daemon.devices().await;
         assert_eq!(devices.len(), 1);
@@ -412,6 +584,52 @@ mod tests {
         assert_eq!(daemon.notification_sink().await, "sink-a");
         assert_eq!(daemon.version().await, crate::VERSION);
         assert!(daemon.streams().await.is_empty());
+    }
+
+    /// SPEC §7.3: `EqPresets` projects the library, `Eq` projects the snapshot.
+    #[tokio::test]
+    async fn eq_properties_project_the_library_and_the_snapshot() {
+        let daemon = eq_daemon();
+        assert_eq!(
+            daemon.eq_presets().await,
+            vec![("hd650".to_owned(), "Sennheiser HD 650".to_owned())]
+        );
+        assert_eq!(daemon.eq().await, vec![(39, String::new())]);
+        // With no presets dir configured, a rescan must not wipe the library.
+        daemon.rescan_presets();
+        assert_eq!(daemon.eq_presets().await.len(), 1);
+    }
+
+    /// SPEC §7.3: NotFound for an unknown node or preset, InvalidArgument for a
+    /// node that is not an output device.
+    #[test]
+    fn set_eq_validates_before_touching_the_graph() {
+        let daemon = eq_daemon();
+
+        assert!(matches!(
+            daemon.validate_set_eq(99, "hd650"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            daemon.validate_set_eq(41, "hd650"),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            daemon.validate_set_eq(39, "nope"),
+            Err(Error::NotFound(_))
+        ));
+
+        assert_eq!(
+            daemon.validate_set_eq(39, "hd650").expect("valid"),
+            ("sink-a".to_owned(), "hd650".to_owned())
+        );
+        // "" is off, and needs no preset to exist.
+        assert_eq!(
+            daemon
+                .validate_set_eq(39, "  ")
+                .expect("off is always valid"),
+            ("sink-a".to_owned(), String::new())
+        );
     }
 
     /// The coalescing floor is what keeps `Changed` at or under 10/s.

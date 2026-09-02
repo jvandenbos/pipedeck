@@ -52,6 +52,21 @@ function unpackPort([nodeId, routeIndex, name, description, available, active]) 
   return {nodeId, routeIndex, name, description, available, active};
 }
 
+/**
+ * EqPresets tuple -> object. Wire type a(ss), per SPEC §7.3: (id, name)
+ */
+function unpackEqPreset([id, name]) {
+  return {id, name};
+}
+
+/**
+ * Eq tuple -> object. Wire type a(us), per SPEC §7.3:
+ * (node_id, preset id or "") -- one row per output device.
+ */
+function unpackEq([nodeId, preset]) {
+  return {nodeId, preset};
+}
+
 /** Map<nodeId, port[]> from a flat Ports array. `ports` may be null (v0.1 daemon, no Ports
  * property) — callers get an empty Map back, which makes every device render as v0.1 did. */
 function groupPortsByNode(ports) {
@@ -280,6 +295,14 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
     this.menu.addMenuItem(this._notifHeader);
     this.menu.addMenuItem(this._notifSection);
 
+    // SPEC §7.4: Equalizer section, after Notifications, before the
+    // per-app rows. Hidden entirely (header included) when the daemon has
+    // no presets or there's no default output -- see _rebuildEqSection.
+    this._eqHeader = new PopupMenu.PopupSeparatorMenuItem('Equalizer');
+    this._eqSection = new PopupMenu.PopupMenuSection();
+    this.menu.addMenuItem(this._eqHeader);
+    this.menu.addMenuItem(this._eqSection);
+
     this._appsHeader = new PopupMenu.PopupSeparatorMenuItem();
     this._appsSection = new PopupMenu.PopupMenuSection();
     this.menu.addMenuItem(this._appsHeader);
@@ -293,6 +316,7 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
       this._outputHeader, this._outputSection,
       this._inputHeader, this._inputSection,
       this._notifHeader, this._notifSection,
+      this._eqHeader, this._eqSection,
       this._appsHeader, this._appsSection,
     ];
 
@@ -315,11 +339,14 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
 
   /**
    * @param {{devices: object[], streams: object[], notificationSink: string,
-   *   ports: (object[]|null)}} state `ports` is null on a v0.1 daemon (no Ports
-   *   property) and every device then renders exactly as v0.1 did.
+   *   ports: (object[]|null), eqPresets: (object[]|null), eq: (object[]|null)}} state
+   *   `ports` is null on a v0.1 daemon (no Ports property) and every device
+   *   then renders exactly as v0.1 did. `eqPresets`/`eq` are null on a
+   *   pre-§7.3 daemon (no EqPresets/Eq properties) and the Equalizer
+   *   section is hidden entirely.
    */
   rebuild(state) {
-    const {devices, streams, notificationSink, ports} = state;
+    const {devices, streams, notificationSink, ports, eqPresets, eq} = state;
     const sinks = devices.filter(d => d.kind === 'sink');
     const sources = devices.filter(d => d.kind === 'source');
     const portsByNode = groupPortsByNode(ports);
@@ -327,9 +354,12 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
     this._rebuildDeviceSection(this._outputSection, sinks, portsByNode);
     this._rebuildDeviceSection(this._inputSection, sources, portsByNode);
     this._rebuildNotificationSection(sinks, notificationSink);
-    this._rebuildAppSection(streams);
 
     const defaultOut = sinks.find(d => d.isDefault);
+    this._rebuildEqSection(defaultOut, eqPresets, eq);
+
+    this._rebuildAppSection(streams);
+
     this.subtitle = this._describeOutput(defaultOut, portsByNode);
   }
 
@@ -414,6 +444,50 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
     }
   }
 
+  /**
+   * SPEC §7.4: "Off" row + one row per preset, applied to the current
+   * default output. Hides the whole section (header included) when there
+   * are no presets or no default output -- covers both a pre-§7.3 daemon
+   * (eqPresets is null) and a §7.3 daemon with an empty presets dir.
+   * @param {object|undefined} defaultOut the sink with isDefault === true
+   * @param {object[]|null} eqPresets [{id, name}]
+   * @param {object[]|null} eq [{nodeId, preset}], one row per output device
+   */
+  _rebuildEqSection(defaultOut, eqPresets, eq) {
+    this._eqSection.removeAll();
+
+    if (!defaultOut || !eqPresets || eqPresets.length === 0) {
+      this._eqHeader.visible = false;
+      this._eqSection.visible = false;
+      return;
+    }
+    this._eqHeader.visible = true;
+    this._eqSection.visible = true;
+
+    const activeEntry = (eq ?? []).find(e => e.nodeId === defaultOut.id);
+    const activePreset = activeEntry ? activeEntry.preset : '';
+
+    const offItem = new PopupMenu.PopupMenuItem('Off');
+    offItem.setOrnament(activePreset === '' ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
+    offItem.connect('activate', () => this._activateEq(defaultOut.id, ''));
+    this._eqSection.addMenuItem(offItem);
+
+    for (const preset of eqPresets) {
+      const item = new PopupMenu.PopupMenuItem(preset.name);
+      item.setOrnament(activePreset === preset.id ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
+      item.connect('activate', () => this._activateEq(defaultOut.id, preset.id));
+      this._eqSection.addMenuItem(item);
+    }
+  }
+
+  _activateEq(nodeId, presetId) {
+    try {
+      this._proxyOps.setEq(nodeId, presetId).catch(() => {});
+    } catch (e) {
+      console.error(`PipeDeck: EQ selection failed: ${e.message}`);
+    }
+  }
+
   _rebuildAppSection(streams) {
     const seen = new Set();
     for (const stream of streams) {
@@ -465,6 +539,7 @@ class PipeDeckIndicator extends QuickSettings.SystemIndicator {
       setVolume: (id, volume) => this._callRemote('SetVolumeRemote', id, volume),
       setMute: (id, mute) => this._callRemote('SetMuteRemote', id, mute),
       setPort: (nodeId, routeIndex) => this._callRemote('SetPortRemote', nodeId, routeIndex),
+      setEq: (nodeId, preset) => this._callRemote('SetEqRemote', nodeId, preset),
     });
     this.quickSettingsItems.push(this._toggle);
 
@@ -584,15 +659,19 @@ class PipeDeckIndicator extends QuickSettings.SystemIndicator {
     if (!this._proxy)
       return;
     try {
-      // this._proxy.Ports is undefined when talking to a v0.1 daemon (no
-      // Ports property in its introspection/cached properties at all) --
-      // normalize that to null so `rebuild()` degrades gracefully rather
-      // than treating "unknown" the same as "no ports" (an empty array).
+      // this._proxy.Ports/EqPresets/Eq are undefined when talking to an
+      // older daemon (no such property in its introspection/cached
+      // properties at all) -- normalize that to null so `rebuild()`
+      // degrades gracefully rather than treating "unknown" the same as
+      // "empty" (an empty array, which for EqPresets specifically must
+      // also hide the section -- see SPEC §7.4).
       const state = {
         devices: (this._proxy.Devices ?? []).map(unpackDevice),
         streams: (this._proxy.Streams ?? []).map(unpackStream),
         notificationSink: this._proxy.NotificationSink ?? '',
         ports: this._proxy.Ports ? this._proxy.Ports.map(unpackPort) : null,
+        eqPresets: this._proxy.EqPresets ? this._proxy.EqPresets.map(unpackEqPreset) : null,
+        eq: this._proxy.Eq ? this._proxy.Eq.map(unpackEq) : null,
       };
       this._toggle.rebuild(state);
     } catch (e) {

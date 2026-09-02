@@ -5,14 +5,15 @@
 //! `pipedeck` CLI and any future front end are all thin D-Bus clients.
 //!
 //! Module layout follows one rule: [`pw`] is the *only* module that links
-//! against libpipewire. Everything else — [`config`], [`matching`], [`meta`],
-//! [`route`], [`state`], [`volume`] — is pure data and is unit-tested without a
-//! graph.
+//! against libpipewire. Everything else — [`config`], [`eq`], [`matching`],
+//! [`meta`], [`route`], [`state`], [`volume`] — is pure data and is unit-tested
+//! without a graph.
 
 #![warn(missing_docs)]
 
 pub mod command;
 pub mod config;
+pub mod eq;
 pub mod error;
 pub mod matching;
 pub mod meta;

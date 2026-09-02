@@ -4,7 +4,7 @@
 //! `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`.
 
 use pipedeckd::route::PortTuple;
-use pipedeckd::state::{DeviceTuple, StreamTuple};
+use pipedeckd::state::{DeviceTuple, EqPresetTuple, EqTuple, StreamTuple};
 
 #[zbus::proxy(
     interface = "dev.pipedeck.Daemon1",
@@ -23,6 +23,14 @@ pub trait Daemon {
     /// `(id, app_name, binary, media_name, target_name, volume, mute)`.
     #[zbus(property)]
     fn streams(&self) -> zbus::Result<Vec<StreamTuple>>;
+
+    /// Available EQ presets: `(id, name)`.
+    #[zbus(property)]
+    fn eq_presets(&self) -> zbus::Result<Vec<EqPresetTuple>>;
+
+    /// The EQ preset on each output device: `(node_id, preset id or "")`.
+    #[zbus(property)]
+    fn eq(&self) -> zbus::Result<Vec<EqTuple>>;
 
     /// `node.name` of the notification sink, or "" to follow the default output.
     #[zbus(property)]
@@ -49,6 +57,9 @@ pub trait Daemon {
 
     /// Select a card route (port) for a sink or source node.
     fn set_port(&self, node_id: u32, route_index: u32) -> zbus::Result<()>;
+
+    /// Apply an EQ preset to an output device; "" turns EQ off.
+    fn set_eq(&self, node_id: u32, preset: &str) -> zbus::Result<()>;
 
     /// Re-read the graph.
     fn refresh(&self) -> zbus::Result<()>;

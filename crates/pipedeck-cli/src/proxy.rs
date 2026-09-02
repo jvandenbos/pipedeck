@@ -33,7 +33,7 @@ pub trait Daemon {
     /// Set the notification sink; "" follows the default output.
     fn set_notification_sink(&self, name: &str) -> zbus::Result<()>;
 
-    /// Set the linear volume (0.0-1.5) of a device or stream node.
+    /// Set the linear volume (0.0-3.375, i.e. 0-150 % cubic) of a device or stream node.
     fn set_volume(&self, id: u32, volume: f64) -> zbus::Result<()>;
 
     /// Mute or unmute a device or stream node.

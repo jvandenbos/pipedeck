@@ -9,10 +9,12 @@
 //! which is perceptually closer to linear loudness. The helpers here do that
 //! mapping so the CLI and the Shell extension can share one implementation.
 
-/// Highest volume the daemon will accept (150 %, matching `wpctl`'s ceiling).
-pub const MAX_VOLUME: f64 = 1.5;
+/// Highest *linear* volume the daemon will accept: `1.5^3`, i.e. 150 % on the
+/// cubic scale that `wpctl` and GNOME display (their "1.50" is a `channelVolumes`
+/// entry of 3.375).
+pub const MAX_VOLUME: f64 = 3.375;
 
-/// Clamp a linear volume into the accepted `0.0 ..= 1.5` range.
+/// Clamp a linear volume into the accepted `0.0 ..= 3.375` range.
 ///
 /// NaN is treated as `0.0` rather than propagating into the graph.
 #[must_use]
@@ -42,16 +44,17 @@ pub fn cubic_to_linear(position: f64) -> f64 {
     clamp_volume(p * p * p)
 }
 
-/// Percentage (0–150, as the CLI takes it) -> linear volume. 100 % == 1.0.
+/// Percentage on the cubic scale (0–150, as the CLI takes it and as `wpctl`
+/// shows it) -> linear volume. 100 % == 1.0, 50 % == 0.125.
 #[must_use]
 pub fn percent_to_linear(percent: f64) -> f64 {
-    clamp_volume(percent / 100.0)
+    cubic_to_linear(percent / 100.0)
 }
 
-/// Linear volume -> percentage. 1.0 == 100 %.
+/// Linear volume -> percentage on the cubic scale. 1.0 == 100 %, 0.125 == 50 %.
 #[must_use]
 pub fn linear_to_percent(volume: f64) -> f64 {
-    clamp_volume(volume) * 100.0
+    linear_to_cubic(volume) * 100.0
 }
 
 #[cfg(test)]
@@ -94,12 +97,13 @@ mod tests {
     }
 
     #[test]
-    fn percent_maps_linearly() {
+    fn percent_matches_wpctl_cubic_scale() {
         assert!(close(percent_to_linear(0.0), 0.0));
         assert!(close(percent_to_linear(100.0), 1.0));
-        assert!(close(percent_to_linear(50.0), 0.5));
-        assert!(close(percent_to_linear(150.0), 1.5));
+        assert!(close(percent_to_linear(50.0), 0.125));
+        assert!(close(percent_to_linear(150.0), 3.375));
         assert!(close(percent_to_linear(400.0), MAX_VOLUME));
-        assert!(close(linear_to_percent(0.25), 25.0));
+        assert!(close(linear_to_percent(0.125), 50.0));
+        assert!(close(linear_to_percent(MAX_VOLUME), 150.0));
     }
 }

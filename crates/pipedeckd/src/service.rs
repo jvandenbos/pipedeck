@@ -153,7 +153,7 @@ impl Daemon {
         result
     }
 
-    /// Set the linear volume (0.0–1.5) of a device or stream node.
+    /// Set the linear volume (0.0–3.375, i.e. 0–150 % cubic) of a device or stream node.
     async fn set_volume(&self, id: u32, volume: f64) -> Result<()> {
         if volume.is_nan() {
             return Err(Error::invalid("volume must be a number"));
@@ -313,7 +313,7 @@ mod tests {
             Err(Error::InvalidArgument(_))
         ));
         assert!(matches!(
-            daemon.set_volume(1, 2.0).await,
+            daemon.set_volume(1, 4.0).await,
             Err(Error::InvalidArgument(_))
         ));
         assert!(matches!(

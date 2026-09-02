@@ -31,9 +31,19 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
   `~/.local/share/gnome-shell/extensions/<uuid>`, enables extension via gsettings if absent),
   `uninstall.sh`, `Makefile` wrapping the docker commands from CLAUDE.md, `README.md`, `.gitignore`.
 
-## Phase 4 — integration on chronos  — main session only
-- ☐ rsync repo → chronos, `cargo build --release`, run daemon under systemd user unit.
-- ☐ Acceptance tests SPEC §5 (1–3, 5) via CLI. (4 waits for Jan at the desk.)
+## Phase 4 — integration on chronos  — main session only — **done 2026-09-01 (virtual sinks)**
+- ☑ rsync repo → chronos, `./install.sh` (release build 41 s), daemon live under the systemd user unit.
+- ☑ Acceptance SPEC §5 1/2/3/5 passed against two `support.null-audio-sink` nodes (hardware is
+  ACL'd to gdm-greeter until Jan logs in at the desk): set-output flips the WirePlumber default;
+  set-notify routes a `media.role=event` stream to the notification sink while a Music stream
+  stays on the default; volume/mute agree with `wpctl get-volume` (percent = cubic scale, fixed
+  post-agent: MAX_VOLUME is now 1.5³ = 3.375 linear); daemon restart re-applies routing from
+  config; unplug → stream falls back, replug → re-routed. Zero warnings in the journal.
+- ☐ §5.4 (extension UI) — needs Jan logged into GNOME on chronos. Extension installed + enabled.
+- Gotcha: janv has `Linger=no`, so every ssh session that ends tears down the user manager
+  (PipeWire, WirePlumber, pipedeckd all restart with the next login). Test inside ONE ssh session.
+- Gotcha: `pactl load-module module-null-sink` sinks die with the pactl session; use
+  `pw-cli create-node adapter { factory.name=support.null-audio-sink … object.linger=true }`.
 
 ## v1.1 (later)
 - ☐ EQ via filter-chain (SPEC §2.5), preset picker in panel, AutoEq importer.

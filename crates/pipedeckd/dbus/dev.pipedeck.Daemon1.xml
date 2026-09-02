@@ -21,7 +21,7 @@
     <arg name="name" type="s" direction="in"/>
   </method>
   <!--
-   Set the linear volume (0.0–1.5) of a device or stream node.
+   Set the linear volume (0.0–3.375, i.e. 0–150 % cubic) of a device or stream node.
    -->
   <method name="SetVolume">
     <arg name="id" type="u" direction="in"/>

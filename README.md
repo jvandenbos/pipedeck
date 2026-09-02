@@ -212,7 +212,7 @@ The daemon exposes itself on the session bus with well-known name `dev.pipedeck.
 **Methods:**
 - `SetDefault(kind: String, name: String)` — Set default sink/source (`kind` = "sink" or "source")
 - `SetNotificationSink(name: String)` — Route notifications to a specific sink (empty = follow default)
-- `SetVolume(id: UInt32, volume: Double)` — Set volume 0.0–1.5 (linear)
+- `SetVolume(id: UInt32, volume: Double)` — Set volume 0.0–3.375 linear (= 0–150 % on the cubic scale wpctl/GNOME show)
 - `SetMute(id: UInt32, mute: Boolean)` — Mute/unmute a device or stream
 - `SetStreamTarget(id: UInt32, name: String)` — Route a stream to a specific sink (advanced)
 - `Refresh()` — Force a state refresh

@@ -59,7 +59,7 @@ pub struct Device {
     pub is_default: bool,
     /// True for null sinks, filter chains and other non-hardware nodes.
     pub virtual_: bool,
-    /// Linear volume, 0.0–1.5.
+    /// Linear volume, 0.0–3.375 (150 % cubic).
     pub volume: f64,
     /// Mute flag.
     pub mute: bool,
@@ -97,7 +97,7 @@ pub struct Stream {
     pub role: String,
     /// `node.name` of the sink this stream is routed to, or "" when unknown.
     pub target_name: String,
-    /// Linear volume, 0.0–1.5.
+    /// Linear volume, 0.0–3.375 (150 % cubic).
     pub volume: f64,
     /// Mute flag.
     pub mute: bool,

@@ -104,8 +104,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Vol { id, percent } => {
-            if !(0.0..=MAX_VOLUME * 100.0).contains(&percent) {
-                bail!("volume must be between 0 and {}", MAX_VOLUME * 100.0);
+            let max_percent = linear_to_percent(MAX_VOLUME);
+            if !(0.0..=max_percent).contains(&percent) {
+                bail!("volume must be between 0 and {max_percent:.0}");
             }
             let volume = percent_to_linear(percent);
             daemon.set_volume(id, volume).await?;
@@ -306,7 +307,7 @@ mod tests {
             Cmd::Vol { id, percent } => {
                 assert_eq!(id, 7);
                 assert!((percent - 62.5).abs() < f64::EPSILON);
-                assert!((percent_to_linear(percent) - 0.625).abs() < 1e-9);
+                assert!((percent_to_linear(percent) - 0.244_140_625).abs() < 1e-9);
             }
             other => panic!("wrong subcommand: {other:?}"),
         }
@@ -321,7 +322,7 @@ mod tests {
             "sink".to_owned(),
             true,
             true,
-            0.5,
+            0.125, // 50 % on the cubic scale wpctl shows
             true,
         ));
         assert!(line.starts_with('*'));

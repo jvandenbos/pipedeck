@@ -12,10 +12,10 @@ import {Slider} from 'resource:///org/gnome/shell/ui/slider.js';
 
 import {DaemonProxy, BUS_NAME, OBJECT_PATH} from './dbus.js';
 
-// Volume convention, per SPEC §2.1/§2.4: linear 0.0-1.5 (daemon clamps),
+// Volume convention, per SPEC §2.1/§2.4: linear 0.0-3.375 = 150 % cubic (daemon clamps),
 // slider position is the cube root so the perceptual step size is even and
 // matches GNOME's own overdrive-region slider feel.
-const MAX_VOLUME = 1.5;
+const MAX_VOLUME = 3.375;
 const MAX_SLIDER_VALUE = Math.cbrt(MAX_VOLUME);
 const OVERDRIVE_START = 1.0;
 

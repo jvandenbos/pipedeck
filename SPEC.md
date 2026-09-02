@@ -44,7 +44,7 @@ The panel is a thin D-Bus client, so a KDE/Sway/CLI front end later is just anot
   (ignore `Audio/Sink/Virtual`? — no: include virtual/null sinks, flag `virtual: true`; they are
   how EQ chains and the notification sink appear). Fields: `id` (u32 node id), `name`
   (`node.name`, stable across sessions), `description` (`node.description`, human label),
-  `kind` (`sink`|`source`), `volume` (0.0–1.5 linear, cubic in UI — same convention as wpctl),
+  `kind` (`sink`|`source`), `volume` (linear `channelVolumes`, 0.0–3.375; the UI, CLI and wpctl show the cube root, so 3.375 = 150 %),
   `mute`, `is_default`, `virtual`.
 - **Stream** = node with `media.class` `Stream/Output/Audio` (playback) — v1 shows playback only,
   capture streams are listed but not rendered. Fields: `id`, `app_name` (`application.name`),
@@ -94,7 +94,7 @@ Properties (read-only, emit PropertiesChanged):
 Methods:
   SetDefault(kind s, name s)            kind = "sink"|"source"
   SetNotificationSink(name s)           "" = follow default
-  SetVolume(id u, volume d)             device or stream, 0.0–1.5 linear
+  SetVolume(id u, volume d)             device or stream, 0.0–3.375 linear (150 % cubic)
   SetMute(id u, mute b)
   SetStreamTarget(id u, name s)         "" = default (kept in the API even though the panel
                                         doesn't expose it in v1 — it's free)

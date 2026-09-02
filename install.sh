@@ -68,8 +68,8 @@ if [[ "$NO_SERVICE" != "true" ]]; then
 
   # Enable and start the service
   echo "Enabling and starting pipedeckd..."
-  systemctl --user enable pipedeckd.service
-  systemctl --user start pipedeckd.service
+  systemctl --user restart pipedeckd.service   # restart, not start: pick up a rebuilt binary
+  echo "  ✓ pipedeckd enabled and (re)started"
   echo "  ✓ pipedeckd enabled and started"
 else
   echo "Skipping systemd installation (--no-service)"

@@ -42,6 +42,13 @@
     <arg name="name" type="s" direction="in"/>
   </method>
   <!--
+   Select a card route (port) for a sink or source node.
+   -->
+  <method name="SetPort">
+    <arg name="node_id" type="u" direction="in"/>
+    <arg name="route_index" type="u" direction="in"/>
+  </method>
+  <!--
    Re-read every node's params and re-publish the snapshot.
    -->
   <method name="Refresh">
@@ -52,13 +59,17 @@
   <signal name="Changed">
   </signal>
   <!--
-   Sinks and sources: `(id, name, description, kind, is_default, virtual, volume, mute)`.
+   Sinks and sources: `(id, name, description, kind, is_default, virtual, volume, mute, nick)`.
    -->
-  <property name="Devices" type="a(usssbbdb)" access="read"/>
+  <property name="Devices" type="a(usssbbdbs)" access="read"/>
   <!--
    `node.name` of the notification sink; empty means "follow the default output".
    -->
   <property name="NotificationSink" type="s" access="read"/>
+  <!--
+   Selectable ports: `(node_id, route_index, name, description, available, active)`.
+   -->
+  <property name="Ports" type="a(uussbb)" access="read"/>
   <!--
    Playback streams: `(id, app_name, binary, media_name, target_name, volume, mute)`.
    -->

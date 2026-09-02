@@ -45,11 +45,104 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
 - Gotcha: `pactl load-module module-null-sink` sinks die with the pactl session; use
   `pw-cli create-node adapter { factory.name=support.null-audio-sink … object.linger=true }`.
 
+## Phase 5 — ports (routes) UI, SPEC §6  — agent: Sonnet (extension) + daemon agent (crates/)
+- ☑ Extension side complete against SPEC §6.1/§6.2 (see Handoffs below).
+- ☑ Daemon side complete: `Audio/Device` tracking, `EnumRoute`/`Route` parsing, device-`Route`
+  volume/mute, `Ports` property, `SetPort` method, `pipedeck ports` / `set-port`, `nick` on
+  `Devices`. 76 unit tests; build/test/clippy/fmt clean in `pipedeck-dev`.
+- ☐ Live verification on chronos once both sides are deployed together (see Handoffs).
+
 ## v1.1 (later)
 - ☐ EQ via filter-chain (SPEC §2.5), preset picker in panel, AutoEq importer.
 - ☐ Optional null sink `pipedeck.notifications`.
 
 ## Handoffs / notes between agents
+
+**Phase 5 (extension side) completed (2026-09-01):** SPEC §6.2 implemented in `extension/`, plus
+two live-testing fixes folded in mid-task from the main session's chronos run against v0.1
+(v0.1 itself was verified working — Audio item + subtitle + Output/Input/Notifications sections
+rendered correctly).
+
+- `extension/dbus.js`: added property `Ports` (`a(uussbb)` = node_id, route_index, name,
+  description, available, active) and method `SetPort(node_id u, route_index u)` to the
+  introspection XML. Also widened `Devices` from `a(usssbbdb)` to `a(usssbbdbs)` — a 9th trailing
+  `nick` field, added per the main session's live-testing note (see below), came in *after* the
+  v0.1 property signature was already fixed, not from SPEC §6.1 itself.
+- `extension/extension.js`:
+  - `unpackDevice` destructures the new `nick` field positionally; an 8-field tuple (older daemon)
+    or an empty string both fall back to `.description` (`nick: nick || description`). Every
+    device *label* (`_buildDeviceItem`, `_buildPortItem`, `_describeOutput` for the toggle
+    subtitle) now reads `.nick`, never `.description`, directly. Notifications section is the one
+    deliberate exception (SPEC §6.2: "stays sink-level"; kept `sink.description` there,
+    unchanged) — worth a second look if Jan wants nick consistency there too.
+  - `unpackPort` + `groupPortsByNode(ports)` (Map<nodeId, port[]>; `ports === null` → empty Map).
+  - `_rebuildDeviceSection` groups by node id, filters `available === true`; ≥2 available ports
+    renders one row per port (`"<port description> · <device nick>"`, checked when
+    `device.isDefault && port.active`); ≤1 renders the v0.1 single row. Both paths coexist inside
+    the same loop, so Output/Input sections can mix multi-port and single-port devices.
+  - `_activatePort(device, port)`: `await setDefault` (only if not already default), then
+    `await setPort` (only if not already active), one try/catch around both, `console.error` on
+    failure — matches SPEC §6.2's activation rule exactly.
+  - Degrade path: `_queueRebuild` reads `this._proxy.Ports` and maps it to `null` (not `[]`) when
+    the property is absent from the proxy's cached properties (v0.1 daemon) — `groupPortsByNode`
+    treats `null` the same as "no ports for any device", so every device renders exactly as v0.1
+    did, no special-casing needed elsewhere.
+  - `_callRemote` now returns a Promise (still logs every failure via `console.error` itself, same
+    as before) so `_activatePort` can sequence two calls. Every other, still-fire-and-forget call
+    site (`setDefault`/`setNotificationSink`/`setVolume`/`setMute`) got `.catch(() => {})` appended
+    so GJS doesn't log an "Unhandled promise rejection" on top of the error `_callRemote` already
+    printed.
+  - `Ports` refresh: confirmed `_queueRebuild` (triggered by both `g-properties-changed` and
+    `Changed`, unconditionally, same as v0.1) reads `Ports` fresh every time — no extra wiring
+    needed.
+- `extension/stylesheet.css`: `.pipedeck-menu { min-width: 22em; }` (applied via
+  `this.menu.box.add_style_class_name('pipedeck-menu')` in `PipeDeckToggle._init`) plus
+  `.pipedeck-device-label { text-overflow: ellipsis; }` (applied to `item.label` in
+  `_buildDeviceItem`/`_buildPortItem`) so labels like "Headphones · ALC892 Analog" ellipsize at
+  the end instead of clipping mid-word in the default-width popup menu. Per-app rows already had
+  `min-width`/`max-width`/`text-overflow: ellipsis` on `.pipedeck-app-label` and `min-width` on
+  `.pipedeck-app-slider` from Phase 2, so the wider menu just gives them more breathing room —
+  nothing else needed changing there.
+- `extension/metadata.json`: `"version": 2` added (no prior `version` key existed, only
+  `version-name`).
+- Verified: `python3 -m json.tool extension/metadata.json` clean; in `pipedeck-dev`, both
+  `dbus.js` and `extension.js` `gjs -c "import(...)"` produce no syntax errors, and a
+  `gjs -m` dynamic-import probe (written to a temp file, since `gjs -m -c "..."` itself fails to
+  resolve the `<command line>` pseudo-path as a module in this image — that's a harness quirk, not
+  a signal about the code) confirms `extension.js`'s only failure is
+  `Unable to load file from: resource:///org/gnome/shell/extensions/extension.js` — i.e. missing
+  Shell runtime, not a `SyntaxError`; `dbus.js` imports clean standalone (prints `dbus ok`).
+- **`crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml` exists but is still the pre-§6.1 v0.1 shape**
+  (`Devices` = `a(usssbbdb)`, no `Ports`, no `SetPort`, mtime predates this session's edits) — the
+  daemon agent's §6.1/nick work had not landed as of this handoff. **Next agent/session: diff this
+  file against `extension/dbus.js`'s `DaemonInterfaceXml` before shipping** — specifically confirm
+  the `Ports` tuple field order (`node_id, route_index, name, description, available, active`),
+  the `SetPort` arg names/order (`node_id`, `route_index`), and that `Devices` really does end in
+  a 9th `s` field, at the position this extension assumes (immediately after `mute`).
+- **What can only be checked live on chronos (needs the daemon's §6.1 side deployed too):**
+  1. A real multi-port node (chronos's ALC892 "Line Out"/"Headphones") actually renders as two
+     rows and single-port nodes (Dell AW3423DW HDMI) still render as one — the ≥2/≤1
+     `available`-count branch was only exercised by reading code, never against real `Ports` data.
+  2. Port-row activation end-to-end: clicking "Headphones · ALC892 Analog" while "Line Out" is
+     active calls `SetDefault` (if needed) then `SetPort`, and `pactl list sinks | grep "Active
+     Port"` follows, per SPEC §6.3 item 6.
+  3. Toggle subtitle showing `"<active port> · <nick>"` for a live default output with ≥2 ports.
+  4. The `nick` field's actual live values/formatting ("ALC892 Analog", "Dell AW3423DW") in
+     context — confirm they read well combined with port descriptions and don't duplicate info
+     already in the port description.
+  5. Menu width/ellipsis: whether `min-width: 22em` and `text-overflow: ellipsis` on
+     `.pipedeck-device-label` actually fix the clipping the main session photographed, and whether
+     22em is the right number once real (possibly longer) `nick`/port-description strings are on
+     screen together.
+  6. Whether `this.menu.box.add_style_class_name(...)` is even the right actor to style for
+     `QuickMenuToggle`'s menu in Shell 50 — confirmed `this.menu.box` exists and is the item
+     container by the same reasoning as Phase 2's other menu-API assumptions (read from GNOME
+     Shell 50 source, never rendered), not by opening the menu.
+  7. Whether a v0.1-vs-v0.1.1(ports) daemon *version skew* during a live upgrade (extension
+     reloaded before/after the daemon restarts) ever shows a half-migrated state — e.g. `Ports`
+     present but `Devices` still 8-field, or vice versa. Both fields are read defensively
+     (`nick || description`, `Ports ?? null`) so this should degrade rather than throw, but it was
+     never forced.
 
 **Phase 3 completed (2026-09-01):**
 - `packaging/pipedeckd.service` — systemd USER unit, installs to `~/.config/systemd/user/pipedeckd.service`
@@ -244,3 +337,169 @@ Notes for the panel:
   `dev.pipedeck.Error.NotFound`. The absent-sink path from SPEC §2.1 is still exercised on
   hot-unplug: the config keeps the name, matching streams are left alone, and routing re-applies
   when the sink comes back.
+
+
+### Phase 5 → everyone (daemon agent, 2026-09-01) — ports, hardware volume, `nick`
+
+**What changed in `crates/` (only lane touched: `crates/**`, plus one line of SPEC §2.2 and this
+file). Nothing was committed.**
+
+- **New module `crates/pipedeckd/src/route.rs`** — the pure half of SPEC §6.1: `RouteDirection`
+  (`SPA_DIRECTION_*`), `Availability` (`SPA_PARAM_AVAILABILITY_*`), `Route` (one `EnumRoute`
+  entry), `RouteProps`, `ActiveRoute`, `DeviceRoutes` (route table for one card), `Port` +
+  `PortTuple`, and `validate_set_port`. No PipeWire types, so all of it is unit-tested without a
+  graph. `pw.rs` is still the only module linking libpipewire.
+- **`pw.rs`** now binds `PipeWire:Interface:Device` globals whose `media.class` is `Audio/Device`,
+  `subscribe_params([EnumRoute, Route])` + an initial `enum_params` for both, and parses both from
+  the `param` listener with a single generic pod parser (`parse_route`) keyed on
+  `libspa_sys::SPA_PARAM_ROUTE_*` — **libspa 0.10.1 ships no typed route helpers** (`param/` has
+  only `audio`, `format`, `format_utils`, `video`), so generic `Object` iteration is the only way.
+  The nested `props` sub-object is parsed by the *same* `Props` parser the node path uses
+  (`parse_props` was split into `parse_props`/`parse_props_object`).
+- **Node→device link** via node props `device.id` (u32) and `card.profile.device` (i32), both read
+  at bind time and refreshed from `info` events.
+- **Routed nodes take the device `Route` param for volume/mute** — `Object(Route){ index, device,
+  props: Object(Props){ channelVolumes:[v; channels], mute }, save: true }`. `channels` is the
+  length of the active route's `channelVolumes`, falling back to the node's learned channel count.
+  Non-routed nodes (streams, null/virtual sinks, EQ sinks) keep the v0.1 node-`Props` path
+  untouched. Read-back for routed nodes comes from the Route props, so `Devices.volume` now
+  matches what `wpctl` shows.
+- **`SetPort(node_id u, route_index u)`** → `Object(Route){ index, device, save: true }`, no props.
+- **`Ports a(uussbb)`** = `(node_id, route_index, name, description, available, active)`, one row
+  per applicable route per node, unavailable rows included, sorted by `(node_id, route_index)`.
+  Emitted with `PropertiesChanged` in the same tick as `Devices`/`Streams`, then `Changed` —
+  identical coalescing to the others (≤10/s).
+- **`Devices` is now `a(usssbbdbs)`** — trailing `nick` (`node.nick`, falling back to
+  `description`), per the main session's live-testing note. SPEC §2.2's property block was edited
+  (one line) to match; every other signature is unchanged.
+- **CLI**: `pipedeck ports`, `pipedeck set-port <node id> <route name|description|index>`, and
+  `outputs`/`inputs`/`status` print the nick as the primary label with the active port in brackets
+  when a node has more than one port, then the description and `node.name` on continuation lines.
+- **Checks**: `cargo build --workspace`, `cargo test --workspace` (**76 tests**, up from 52),
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` — all clean in the
+  `pipedeck-dev` image.
+
+**→ extension agent: the D-Bus XML is regenerated** at
+`crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml` (the
+`introspection_xml_matches_the_checked_in_copy` test pins it to the live interface). The two new
+pieces, and the widened `Devices`, are exactly what `extension/dbus.js` already assumed — diff
+confirmed, no changes needed on your side:
+
+```xml
+<method name="SetPort">
+  <arg name="node_id" type="u" direction="in"/>
+  <arg name="route_index" type="u" direction="in"/>
+</method>
+<property name="Devices" type="a(usssbbdbs)" access="read"/>
+<property name="Ports" type="a(uussbb)" access="read"/>
+```
+
+Full interface, in the order zbus emits it (methods in declaration order, properties alphabetical):
+`SetDefault(ss)`, `SetNotificationSink(s)`, `SetVolume(ud)`, `SetMute(ub)`,
+`SetStreamTarget(us)`, `SetPort(uu)`, `Refresh()`; signal `Changed()`; properties
+`Devices a(usssbbdbs)`, `NotificationSink s`, `Ports a(uussbb)`, `Streams a(ussssdb)`,
+`Version s` — all read-only.
+
+Two behaviours worth knowing in the panel:
+- `available` is `false` **only** when the card says `SPA_PARAM_AVAILABILITY_no`. `unknown` (what a
+  codec without jack-detection reports, and what most HDMI outputs report) maps to `true`. Filtering
+  on `available === true`, as `_rebuildDeviceSection` does, is therefore correct and will not hide
+  HDMI.
+- A node's `volume`/`mute` in `Devices` now come from its active route when it has one, so the
+  slider and GNOME's own slider should finally agree on ALSA sinks.
+
+**→ main session, live verification on chronos (exact commands).** Node ids change every session —
+take them from `pipedeck outputs` first.
+
+```bash
+# 0. deploy + restart, then confirm the new surface is on the bus
+./install.sh && systemctl --user restart pipedeckd && sleep 2
+gdbus introspect --session --dest dev.pipedeck.Daemon --object-path /dev/pipedeck/Daemon \
+  | grep -E "Ports|SetPort|Devices"
+
+# 1. ports show up at all — expect Line Out (3) and Headphones (4) on the ALC892 sink,
+#    the mic routes on the source, and HDMI's single port. `*` marks the active one.
+pipedeck ports
+pipedeck outputs          # nick first, "[Headphones]" bracket on the multi-port node
+
+# 2. SPEC §6.3 acceptance 6 — port switching, both directions
+pipedeck set-port <analog sink id> analog-output-lineout
+pactl list sinks | grep -A1 "Active Port"        # follows to analog-output-lineout
+pipedeck set-port <analog sink id> analog-output-headphones
+pactl list sinks | grep -A1 "Active Port"
+
+# 3. SPEC §6.3 acceptance 7 — hardware volume, which v0.1 silently dropped
+pipedeck vol <analog sink id> 45
+wpctl get-volume <analog sink id>                # expect 0.45
+pipedeck vol <analog sink id> 100 && wpctl get-volume <analog sink id>
+pipedeck mute <analog sink id> on  && wpctl get-volume <analog sink id>   # [MUTED]
+pipedeck mute <analog sink id> off
+
+# 4. the other direction: change it in GNOME / wpctl and watch pipedeck follow
+wpctl set-volume <analog sink id> 0.30 && pipedeck outputs
+wpctl set-default <hdmi sink id>       && pipedeck status
+
+# 5. non-routed nodes must be unaffected (this is the regression risk)
+pipedeck vol <a stream id> 60 && pipedeck streams
+#   ... and on a null sink, if one is still around from Phase 4:
+pipedeck vol <null sink id> 60 && wpctl get-volume <null sink id>
+
+# 6. input side
+pipedeck inputs
+pipedeck set-port <analog source id> analog-input-rear-mic   # then check `pipedeck ports`
+
+# 7. error paths (all should print a dev.pipedeck.Error.InvalidArgument message, not hang)
+pipedeck set-port <analog sink id> 99                    # unknown route
+pipedeck set-port <analog sink id> analog-input-front-mic # wrong direction
+pipedeck set-port <hdmi sink id> analog-output-lineout    # different card
+pipedeck set-port <a stream id> 3                         # a stream has no ports
+
+# 8. profile change must re-enumerate, not accumulate stale rows
+wpctl status | head -30       # note the card profile
+#   switch the card profile in gnome-control-center Sound, then:
+pipedeck ports                # row set should change, not grow
+
+# 9. nothing noisy in the journal through all of the above
+journalctl --user -u pipedeckd -f
+```
+
+**Things that could only be checked in the container, and are worth an eye on chronos:**
+1. **The nested `props` object id.** `pulse-server` builds it as
+   `SPA_TYPE_OBJECT_Props` with object id **`SPA_PARAM_Route`** (not `SPA_PARAM_Props`), and that
+   is what `route_pod` emits. The ALSA device parses `props` with a NULL id filter, so it should
+   not matter — but if hardware volume writes are accepted-and-ignored, this is the first line to
+   change (`crates/pipedeckd/src/pw.rs`, `route_pod`).
+2. **Re-enumeration on `index == 0`.** The route table is cleared whenever a `param` event arrives
+   with `index == 0`, on the assumption that PipeWire re-emits a whole enumeration from 0. If a
+   card-profile change leaves stale ports in `pipedeck ports` (step 8), that assumption is wrong
+   and the fix is to key the clear off a `seq`/`info`-driven re-enum instead.
+3. **`devices` array pod shape.** Parsed as `SPA_TYPE_Array` of `Int`, with `Id` arrays and a bare
+   scalar tolerated. If `pipedeck ports` is empty while `pw-dump <device id>` clearly shows
+   `EnumRoute` entries, dump the raw pod in `parse_route` — the array spelling is the suspect.
+4. **Multi-profile-device cards.** SPEC §6's chronos card has route 3 on devices `[4,5]`; the
+   active-route map is keyed by `card.profile.device`, so a card exposing two sinks off one device
+   global (e.g. HDMI with several outputs) is the untested case. `pipedeck ports` listing the same
+   route index under two node ids is *correct*, not a bug.
+5. **Channel count on a routed node.** Taken from the active route's `channelVolumes` length, so a
+   5.1 HDMI output should get 6 floats — worth confirming `pipedeck vol` on HDMI does not collapse
+   it to stereo.
+
+**Deliberate choices / deviations from §6.1, all small:**
+- **`available` maps `unknown` → `true`.** SPEC §6.1 gives the field as a bool without saying what
+  to do with `SPA_PARAM_AVAILABILITY_unknown`. Only an explicit `no` is reported unavailable;
+  treating `unknown` as unavailable would hide most HDMI outputs and any codec without jack
+  detection. `Availability::is_selectable` in `route.rs` is the single place to flip this.
+- **Error kinds.** SPEC §6.1 says unknown/unavailable/mismatched-direction routes are
+  `InvalidArgument`, and they are. An unknown *node id* is `NotFound` (consistent with
+  `SetVolume`/`SetMute`); a node that exists but has no card route — a stream, a null sink — is
+  `InvalidArgument("node N has no ports")`, since the id is real and it is the request that is
+  meaningless.
+- **`SetVolume` on a routed node always writes both `channelVolumes` and `mute`** (the unchanged
+  one carried over from the active route's current props), matching the shape SPEC §6.1 spells
+  out, rather than sending a partial props object.
+- **`pipedeck set-port` resolves its argument index-first, then route name, then description**
+  (both case-insensitive), so a numeric argument that is a valid index for that node always wins.
+  Resolution happens client-side against the `Ports` property; the daemon validates again.
+- **`status`, not just `outputs`/`inputs`, shows the active-port bracket.** They share one
+  `device_line` renderer; SPEC §6.1 only asked for `outputs`, and splitting them to honour that
+  literally would have been worse.

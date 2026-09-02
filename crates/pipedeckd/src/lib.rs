@@ -6,7 +6,8 @@
 //!
 //! Module layout follows one rule: [`pw`] is the *only* module that links
 //! against libpipewire. Everything else — [`config`], [`matching`], [`meta`],
-//! [`state`], [`volume`] — is pure data and is unit-tested without a graph.
+//! [`route`], [`state`], [`volume`] — is pure data and is unit-tested without a
+//! graph.
 
 #![warn(missing_docs)]
 
@@ -16,6 +17,7 @@ pub mod error;
 pub mod matching;
 pub mod meta;
 pub mod pw;
+pub mod route;
 pub mod service;
 pub mod state;
 pub mod volume;

@@ -41,6 +41,15 @@ pub enum Command {
         /// Where to report success or failure.
         reply: Reply,
     },
+    /// Select a card route (port) for a node, via the device's `Route` param.
+    SetPort {
+        /// Node id of the sink or source the port belongs to.
+        id: u32,
+        /// Route index, from the `Ports` property.
+        index: u32,
+        /// Where to report success or failure.
+        reply: Reply,
+    },
     /// Route one stream at a named sink; an empty name clears the override.
     SetStreamTarget {
         /// Stream node id.
@@ -73,6 +82,7 @@ impl Command {
             Command::SetDefault { reply, .. }
             | Command::SetVolume { reply, .. }
             | Command::SetMute { reply, .. }
+            | Command::SetPort { reply, .. }
             | Command::SetStreamTarget { reply, .. }
             | Command::SetConfig { reply, .. }
             | Command::Refresh { reply } => Some(reply),

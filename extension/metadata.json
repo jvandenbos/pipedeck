@@ -4,5 +4,6 @@
   "description": "SoundSource-style audio control for PipeWire. Output, input and notification-sink pickers plus per-application volume sliders in GNOME Quick Settings, backed by the pipedeckd D-Bus daemon.",
   "shell-version": ["50"],
   "url": "https://github.com/jvandenbos/pipedeck",
-  "version-name": "1.0.0"
+  "version-name": "1.0.0",
+  "version": 2
 }

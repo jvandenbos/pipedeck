@@ -16,6 +16,7 @@ use crate::command::{await_reply, Command};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::pw::PwHandle;
+use crate::route::PortTuple;
 use crate::state::{DeviceKind, DeviceTuple, State, StreamTuple};
 use crate::volume::clamp_volume;
 
@@ -73,10 +74,16 @@ impl Daemon {
 
 #[zbus::interface(name = "dev.pipedeck.Daemon1")]
 impl Daemon {
-    /// Sinks and sources: `(id, name, description, kind, is_default, virtual, volume, mute)`.
+    /// Sinks and sources: `(id, name, description, kind, is_default, virtual, volume, mute, nick)`.
     #[zbus(property)]
     async fn devices(&self) -> Vec<DeviceTuple> {
         self.snapshot().devices_dbus()
+    }
+
+    /// Selectable ports: `(node_id, route_index, name, description, available, active)`.
+    #[zbus(property)]
+    async fn ports(&self) -> Vec<PortTuple> {
+        self.snapshot().ports_dbus()
     }
 
     /// Playback streams: `(id, app_name, binary, media_name, target_name, volume, mute)`.
@@ -182,6 +189,16 @@ impl Daemon {
             .await
     }
 
+    /// Select a card route (port) for a sink or source node.
+    async fn set_port(&self, node_id: u32, route_index: u32) -> Result<()> {
+        self.dispatch(move |reply| Command::SetPort {
+            id: node_id,
+            index: route_index,
+            reply,
+        })
+        .await
+    }
+
     /// Re-read every node's params and re-publish the snapshot.
     async fn refresh(&self) -> Result<()> {
         self.dispatch(|reply| Command::Refresh { reply }).await
@@ -218,6 +235,9 @@ pub async fn run_change_notifier(
         }
         if let Err(e) = guard.streams_changed(emitter).await {
             warn!("could not emit PropertiesChanged for Streams: {e}");
+        }
+        if let Err(e) = guard.ports_changed(emitter).await {
+            warn!("could not emit PropertiesChanged for Ports: {e}");
         }
         drop(guard);
         if let Err(e) = Daemon::changed(emitter).await {
@@ -263,7 +283,8 @@ mod tests {
     fn property_signatures_match_the_spec() {
         let mut xml = String::new();
         daemon().introspect_to_writer(&mut xml, 0);
-        assert!(xml.contains(r#"<property name="Devices" type="a(usssbbdb)" access="read"/>"#));
+        assert!(xml.contains(r#"<property name="Devices" type="a(usssbbdbs)" access="read"/>"#));
+        assert!(xml.contains(r#"<property name="Ports" type="a(uussbb)" access="read"/>"#));
         assert!(xml.contains(r#"<property name="Streams" type="a(ussssdb)" access="read"/>"#));
         assert!(xml.contains(r#"<property name="NotificationSink" type="s" access="read"/>"#));
         assert!(xml.contains(r#"<property name="Version" type="s" access="read"/>"#));
@@ -274,6 +295,7 @@ mod tests {
             "SetVolume",
             "SetMute",
             "SetStreamTarget",
+            "SetPort",
             "Refresh",
         ] {
             assert!(
@@ -297,6 +319,10 @@ mod tests {
             Err(Error::PipeWire(_))
         ));
         assert!(matches!(daemon.refresh().await, Err(Error::PipeWire(_))));
+        assert!(matches!(
+            daemon.set_port(3, 4).await,
+            Err(Error::PipeWire(_))
+        ));
     }
 
     /// Argument validation happens before anything is queued, so these must be
@@ -345,8 +371,17 @@ mod tests {
                     virtual_: false,
                     volume: 0.5,
                     mute: false,
+                    nick: "ALC892 Analog".to_owned(),
                 },
             );
+            guard.ports = vec![crate::route::Port {
+                node_id: 11,
+                index: 4,
+                name: "analog-output-headphones".to_owned(),
+                description: "Headphones".to_owned(),
+                available: true,
+                active: true,
+            }];
         }
         let daemon = Daemon::new(
             state,
@@ -360,6 +395,20 @@ mod tests {
         let devices = daemon.devices().await;
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].1, "sink-a");
+        assert_eq!(devices[0].8, "ALC892 Analog");
+        let ports = daemon.ports().await;
+        assert_eq!(ports.len(), 1);
+        assert_eq!(
+            ports[0],
+            (
+                11,
+                4,
+                "analog-output-headphones".to_owned(),
+                "Headphones".to_owned(),
+                true,
+                true
+            )
+        );
         assert_eq!(daemon.notification_sink().await, "sink-a");
         assert_eq!(daemon.version().await, crate::VERSION);
         assert!(daemon.streams().await.is_empty());

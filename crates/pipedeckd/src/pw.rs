@@ -17,10 +17,11 @@ use pw::spa;
 use spa::param::ParamType;
 use spa::pod::deserialize::PodDeserializer;
 use spa::pod::serialize::PodSerializer;
-use spa::pod::{Object, Pod, Property, Value, ValueArray};
-use spa::utils::SpaTypes;
+use spa::pod::{ChoiceValue, Object, Pod, Property, Value, ValueArray};
+use spa::utils::{Choice, ChoiceEnum, SpaTypes};
 
 use pw::context::ContextRc;
+use pw::device::{Device as PwDevice, DeviceListener};
 use pw::main_loop::MainLoopRc;
 use pw::metadata::{Metadata, MetadataListener};
 use pw::node::{Node, NodeListener};
@@ -37,6 +38,10 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::matching::is_notification_stream;
 use crate::meta;
+use crate::route::{
+    self, ActiveRoute, Availability, DeviceRoutes, Port, Route as CardRoute, RouteDirection,
+    RouteProps,
+};
 use crate::state::{Device, DeviceKind, State, Stream};
 use crate::volume::clamp_volume;
 
@@ -54,9 +59,14 @@ mod keys {
     pub const FACTORY_NAME: &str = "factory.name";
     pub const OBJECT_SERIAL: &str = "object.serial";
     pub const METADATA_NAME: &str = "metadata.name";
+    pub const DEVICE_ID: &str = "device.id";
+    pub const CARD_PROFILE_DEVICE: &str = "card.profile.device";
     pub const LINK_OUTPUT_NODE: &str = "link.output.node";
     pub const LINK_INPUT_NODE: &str = "link.input.node";
 }
+
+/// `media.class` of the card objects that own routes (SPEC §6.1).
+const MEDIA_CLASS_AUDIO_DEVICE: &str = "Audio/Device";
 
 /// What kind of audio node a global turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +116,11 @@ struct NodeEntry {
     role: NodeRole,
     name: String,
     description: String,
+    nick: String,
+    /// `device.id` — the `Audio/Device` global this node belongs to.
+    device_id: Option<u32>,
+    /// `card.profile.device` — which profile-device of that card it is.
+    card_profile_device: Option<i32>,
     app_name: String,
     binary: String,
     media_name: String,
@@ -115,6 +130,22 @@ struct NodeEntry {
     channels: usize,
     volume: f64,
     mute: bool,
+}
+
+/// A bound `Audio/Device` global plus the routes it has told us about.
+struct DeviceEntry {
+    // Same declaration order rule as `NodeEntry`: proxy before listener.
+    proxy: PwDevice,
+    _listener: DeviceListener,
+    routes: DeviceRoutes,
+}
+
+/// Where a routed node's volume/mute has to be written (SPEC §6.1).
+struct RouteTarget {
+    device_id: u32,
+    card_profile_device: i32,
+    index: u32,
+    props: RouteProps,
 }
 
 /// The bound `default` metadata object.
@@ -129,6 +160,8 @@ struct Inner {
     notify: watch::Sender<u64>,
     config: Config,
     nodes: HashMap<u32, NodeEntry>,
+    /// `Audio/Device` globals by id, holding their route tables.
+    devices: HashMap<u32, DeviceEntry>,
     /// Link id -> (output node id, input node id), used to resolve stream targets.
     links: HashMap<u32, (u32, u32)>,
     /// Raw `target.object` metadata values by subject node id.
@@ -162,6 +195,31 @@ impl Inner {
         raw.clone()
     }
 
+    /// The card, profile-device and route table behind a node, when it has one.
+    ///
+    /// A node is "routed" when it carries both `device.id` and
+    /// `card.profile.device` and that device global is bound (SPEC §6.1).
+    fn node_device(&self, entry: &NodeEntry) -> Option<(u32, i32, &DeviceRoutes)> {
+        let device_id = entry.device_id?;
+        let card_profile_device = entry.card_profile_device?;
+        let device = self.devices.get(&device_id)?;
+        Some((device_id, card_profile_device, &device.routes))
+    }
+
+    /// Where a node's volume/mute must be written: `Some` only when the card
+    /// has an *active* route for it, which is exactly when the node's own
+    /// `Props` writes are ignored.
+    fn route_target(&self, entry: &NodeEntry) -> Option<RouteTarget> {
+        let (device_id, card_profile_device, routes) = self.node_device(entry)?;
+        let active = routes.active_for(card_profile_device)?;
+        Some(RouteTarget {
+            device_id,
+            card_profile_device,
+            index: active.index,
+            props: active.props.clone(),
+        })
+    }
+
     fn sink_exists(&self, name: &str) -> bool {
         self.nodes
             .values()
@@ -187,8 +245,26 @@ impl Inner {
             ..State::default()
         };
 
+        let mut ports: Vec<Port> = Vec::new();
+
         for (id, entry) in &self.nodes {
             if let Some(kind) = entry.role.device_kind() {
+                // On ALSA cards WirePlumber owns volume through the device
+                // `Route` param, so that is what the panel must be shown
+                // (SPEC §6.1); nodes without a route keep their own `Props`.
+                let mut volume = entry.volume;
+                let mut mute = entry.mute;
+                if let Some((_, card_profile_device, routes)) = self.node_device(entry) {
+                    ports.extend(routes.ports_for(*id, kind, card_profile_device));
+                    if let Some(active) = routes.active_for(card_profile_device) {
+                        if let Some(v) = active.props.volume {
+                            volume = v;
+                        }
+                        if let Some(m) = active.props.mute {
+                            mute = m;
+                        }
+                    }
+                }
                 state.devices.insert(
                     *id,
                     Device {
@@ -198,8 +274,9 @@ impl Inner {
                         kind,
                         is_default: false,
                         virtual_: entry.virtual_,
-                        volume: entry.volume,
-                        mute: entry.mute,
+                        volume,
+                        mute,
+                        nick: entry.nick.clone(),
                     },
                 );
             } else if entry.role.is_stream() {
@@ -219,6 +296,8 @@ impl Inner {
                 );
             }
         }
+        ports.sort_by_key(|p| (p.node_id, p.index));
+        state.ports = ports;
         state.refresh_defaults();
 
         match self.state.write() {
@@ -419,6 +498,7 @@ fn run(
         notify,
         config,
         nodes: HashMap::new(),
+        devices: HashMap::new(),
         links: HashMap::new(),
         targets: HashMap::new(),
         metadata: None,
@@ -489,6 +569,7 @@ fn on_global(
 ) {
     match global.type_ {
         ObjectType::Node => on_node_global(inner, registry, global),
+        ObjectType::Device => on_device_global(inner, registry, global),
         ObjectType::Metadata => on_metadata_global(inner, registry, global),
         ObjectType::Link => on_link_global(inner, global),
         _ => {}
@@ -523,6 +604,11 @@ fn on_node_global(
         .or_else(|| props.get(keys::NODE_NICK))
         .filter(|s| !s.is_empty())
         .unwrap_or(&name)
+        .to_owned();
+    let nick = props
+        .get(keys::NODE_NICK)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(description.as_str())
         .to_owned();
     let virtual_ = props.get(keys::NODE_VIRTUAL) == Some("true")
         || media_class.ends_with("/Virtual")
@@ -560,6 +646,11 @@ fn on_node_global(
         role,
         name,
         description,
+        nick,
+        device_id: props.get(keys::DEVICE_ID).and_then(|s| s.parse().ok()),
+        card_profile_device: props
+            .get(keys::CARD_PROFILE_DEVICE)
+            .and_then(|s| s.parse().ok()),
         app_name: props
             .get(keys::APPLICATION_NAME)
             .unwrap_or_default()
@@ -581,6 +672,131 @@ fn on_node_global(
     guard.nodes.insert(id, entry);
     guard.apply_notification_routing();
     guard.publish();
+}
+
+/// An `Audio/Device` global appeared: bind it and start tracking its routes.
+///
+/// SPEC §6.1 — this is the object that owns port switching *and*, on ALSA
+/// cards, the volume the node's own `Props` param refuses to accept.
+fn on_device_global(
+    inner: &Rc<RefCell<Inner>>,
+    registry: &pw::registry::RegistryRc,
+    global: &GlobalObject<&spa::utils::dict::DictRef>,
+) {
+    let Some(props) = global.props else { return };
+    if props.get(keys::MEDIA_CLASS) != Some(MEDIA_CLASS_AUDIO_DEVICE) {
+        return;
+    }
+
+    let device: PwDevice = match registry.bind(global) {
+        Ok(device) => device,
+        Err(e) => {
+            warn!(id = global.id, "could not bind audio device: {e}");
+            return;
+        }
+    };
+
+    let id = global.id;
+    let listener = {
+        let inner = inner.clone();
+        device
+            .add_listener_local()
+            .param(move |_seq, param_type, index, _next, param| {
+                let Some(param) = param else { return };
+                on_device_param(&inner, id, param_type, index, param);
+            })
+            .register()
+    };
+
+    device.subscribe_params(&[ParamType::EnumRoute, ParamType::Route]);
+    device.enum_params(0, Some(ParamType::EnumRoute), 0, u32::MAX);
+    device.enum_params(0, Some(ParamType::Route), 0, u32::MAX);
+
+    let mut guard = inner.borrow_mut();
+    guard.devices.insert(
+        id,
+        DeviceEntry {
+            proxy: device,
+            _listener: listener,
+            routes: DeviceRoutes::default(),
+        },
+    );
+    drop(guard);
+    debug!(id, "tracking an Audio/Device global");
+}
+
+/// An `EnumRoute` or `Route` param arrived for a bound device.
+///
+/// PipeWire re-emits a whole enumeration starting at index 0, so index 0 is the
+/// signal to drop the previous table — that is what keeps the route list honest
+/// across a card-profile change.
+fn on_device_param(
+    inner: &Rc<RefCell<Inner>>,
+    id: u32,
+    param_type: ParamType,
+    index: u32,
+    param: &Pod,
+) {
+    let is_enum = param_type == ParamType::EnumRoute;
+    if !is_enum && param_type != ParamType::Route {
+        return;
+    }
+    let Some(raw) = parse_route(param) else {
+        debug!(id, ?param_type, index, "device param did not parse as a route");
+        return;
+    };
+    debug!(
+        id,
+        ?param_type,
+        index,
+        route = ?raw.index,
+        device = ?raw.device,
+        name = ?raw.name,
+        "device route param"
+    );
+
+    {
+        let mut guard = inner.borrow_mut();
+        let Some(entry) = guard.devices.get_mut(&id) else {
+            return;
+        };
+        if is_enum {
+            if index == 0 {
+                entry.routes.enum_routes.clear();
+            }
+            if let (Some(route_index), Some(direction)) = (raw.index, raw.direction) {
+                entry.routes.enum_routes.insert(
+                    route_index,
+                    CardRoute {
+                        index: route_index,
+                        direction,
+                        name: raw.name,
+                        description: raw.description,
+                        priority: raw.priority,
+                        available: raw.available,
+                        devices: raw.devices,
+                        profiles: raw.profiles,
+                    },
+                );
+            }
+        } else {
+            if index == 0 {
+                entry.routes.active.clear();
+            }
+            if let (Some(route_index), Some(device)) = (raw.index, raw.device) {
+                entry.routes.active.insert(
+                    device,
+                    ActiveRoute {
+                        index: route_index,
+                        device,
+                        props: raw.props.unwrap_or_default(),
+                    },
+                );
+            }
+        }
+    }
+
+    inner.borrow_mut().publish();
 }
 
 fn on_metadata_global(
@@ -640,6 +856,7 @@ fn on_link_global(inner: &Rc<RefCell<Inner>>, global: &GlobalObject<&spa::utils:
 fn on_global_remove(inner: &Rc<RefCell<Inner>>, id: u32) {
     let mut guard = inner.borrow_mut();
     let mut changed = guard.nodes.remove(&id).is_some();
+    changed |= guard.devices.remove(&id).is_some();
     changed |= guard.links.remove(&id).is_some();
     guard.routed.remove(&id);
     guard.targets.remove(&id);
@@ -679,6 +896,30 @@ fn on_node_info(inner: &Rc<RefCell<Inner>>, id: u32, props: &spa::utils::dict::D
     if let Some(value) = props.get(keys::NODE_DESCRIPTION) {
         if !value.is_empty() && entry.description != value {
             entry.description = value.to_owned();
+            if entry.nick.is_empty() {
+                entry.nick = value.to_owned();
+            }
+            changed = true;
+        }
+    }
+    if let Some(value) = props.get(keys::NODE_NICK) {
+        if !value.is_empty() && entry.nick != value {
+            entry.nick = value.to_owned();
+            changed = true;
+        }
+    }
+    if let Some(value) = props.get(keys::DEVICE_ID).and_then(|s| s.parse().ok()) {
+        if entry.device_id != Some(value) {
+            entry.device_id = Some(value);
+            changed = true;
+        }
+    }
+    if let Some(value) = props
+        .get(keys::CARD_PROFILE_DEVICE)
+        .and_then(|s| s.parse().ok())
+    {
+        if entry.card_profile_device != Some(value) {
+            entry.card_profile_device = Some(value);
             changed = true;
         }
     }
@@ -761,6 +1002,7 @@ fn handle_command(inner: &Rc<RefCell<Inner>>, command: Command) {
         Command::SetDefault { kind, name, .. } => set_default(inner, *kind, name),
         Command::SetVolume { id, volume, .. } => set_volume(inner, *id, *volume),
         Command::SetMute { id, mute, .. } => set_mute(inner, *id, *mute),
+        Command::SetPort { id, index, .. } => set_port(inner, *id, *index),
         Command::SetStreamTarget { id, name, .. } => set_stream_target(inner, *id, name),
         Command::SetConfig { config, .. } => {
             let mut guard = inner.borrow_mut();
@@ -775,6 +1017,14 @@ fn handle_command(inner: &Rc<RefCell<Inner>>, command: Command) {
                 entry
                     .proxy
                     .enum_params(0, Some(ParamType::Props), 0, u32::MAX);
+            }
+            for entry in guard.devices.values() {
+                entry
+                    .proxy
+                    .enum_params(0, Some(ParamType::EnumRoute), 0, u32::MAX);
+                entry
+                    .proxy
+                    .enum_params(0, Some(ParamType::Route), 0, u32::MAX);
             }
             guard.apply_notification_routing();
             guard.publish();
@@ -821,6 +1071,15 @@ fn set_volume(inner: &Rc<RefCell<Inner>>, id: u32, volume: f64) -> Result<()> {
         .get(&id)
         .ok_or_else(|| Error::not_found(format!("no node with id {id}")))?;
     let volume = clamp_volume(volume);
+
+    // SPEC §6.1: on a routed (ALSA) node the node's own `Props` write is
+    // silently dropped — the card's `Route` param is the only thing that takes.
+    if let Some(target) = guard.route_target(entry) {
+        let channels = target.props.channels.unwrap_or(entry.channels).max(1);
+        let mute = target.props.mute.unwrap_or(entry.mute);
+        return write_route_props(&guard, &target, vec![volume as f32; channels], mute);
+    }
+
     let channels = entry.channels.max(1);
     let values = vec![volume as f32; channels];
     let pod = props_pod(vec![Property::new(
@@ -840,6 +1099,13 @@ fn set_mute(inner: &Rc<RefCell<Inner>>, id: u32, mute: bool) -> Result<()> {
         .nodes
         .get(&id)
         .ok_or_else(|| Error::not_found(format!("no node with id {id}")))?;
+
+    if let Some(target) = guard.route_target(entry) {
+        let channels = target.props.channels.unwrap_or(entry.channels).max(1);
+        let volume = target.props.volume.unwrap_or(entry.volume);
+        return write_route_props(&guard, &target, vec![volume as f32; channels], mute);
+    }
+
     let pod = props_pod(vec![Property::new(
         spa::sys::SPA_PROP_mute,
         Value::Bool(mute),
@@ -848,6 +1114,61 @@ fn set_mute(inner: &Rc<RefCell<Inner>>, id: u32, mute: bool) -> Result<()> {
     let param =
         Pod::from_bytes(&pod).ok_or_else(|| Error::pipewire("built an invalid mute pod"))?;
     entry.proxy.set_param(ParamType::Props, 0, param);
+    Ok(())
+}
+
+/// SPEC §6.1's `SetPort`: select a card route for a node.
+fn set_port(inner: &Rc<RefCell<Inner>>, id: u32, index: u32) -> Result<()> {
+    let guard = inner.borrow();
+    let entry = guard
+        .nodes
+        .get(&id)
+        .ok_or_else(|| Error::not_found(format!("no node with id {id}")))?;
+    let kind = entry
+        .role
+        .device_kind()
+        .ok_or_else(|| Error::invalid(format!("node {id} is not a sink or source")))?;
+    let (device_id, card_profile_device, routes) = guard
+        .node_device(entry)
+        .ok_or_else(|| Error::invalid(route::SetPortError::NoPorts.message(id, index)))?;
+
+    route::validate_set_port(routes, kind, card_profile_device, index)
+        .map_err(|e| Error::invalid(e.message(id, index)))?;
+
+    let device = guard
+        .devices
+        .get(&device_id)
+        .ok_or_else(|| Error::pipewire(format!("device {device_id} is no longer bound")))?;
+    let bytes = route_pod(index, card_profile_device, None)
+        .ok_or_else(|| Error::pipewire("could not build the Route pod"))?;
+    let param =
+        Pod::from_bytes(&bytes).ok_or_else(|| Error::pipewire("built an invalid Route pod"))?;
+    device.proxy.set_param(ParamType::Route, 0, param);
+    Ok(())
+}
+
+/// Write `channelVolumes` + `mute` through a card's active `Route`.
+fn write_route_props(
+    inner: &Inner,
+    target: &RouteTarget,
+    channel_volumes: Vec<f32>,
+    mute: bool,
+) -> Result<()> {
+    let device = inner.devices.get(&target.device_id).ok_or_else(|| {
+        Error::pipewire(format!("device {} is no longer bound", target.device_id))
+    })?;
+    let props = vec![
+        Property::new(
+            spa::sys::SPA_PROP_channelVolumes,
+            Value::ValueArray(ValueArray::Float(channel_volumes)),
+        ),
+        Property::new(spa::sys::SPA_PROP_mute, Value::Bool(mute)),
+    ];
+    let bytes = route_pod(target.index, target.card_profile_device, Some(props))
+        .ok_or_else(|| Error::pipewire("could not build the Route pod"))?;
+    let param =
+        Pod::from_bytes(&bytes).ok_or_else(|| Error::pipewire("built an invalid Route pod"))?;
+    device.proxy.set_param(ParamType::Route, 0, param);
     Ok(())
 }
 
@@ -896,6 +1217,178 @@ fn props_pod(properties: Vec<Property>) -> Option<Vec<u8>> {
     Some(cursor.into_inner())
 }
 
+/// Build a `SPA_TYPE_OBJECT_ParamRoute` pod for `Device::set_param(Route)`.
+///
+/// SPEC §6.1: `{ index, device, [props], save: true }`. `pulse-server` builds
+/// the nested props object as `SPA_TYPE_OBJECT_Props` with object id
+/// `SPA_PARAM_Route`, and so do we.
+fn route_pod(index: u32, device: i32, props: Option<Vec<Property>>) -> Option<Vec<u8>> {
+    let mut properties = vec![
+        Property::new(
+            spa::sys::SPA_PARAM_ROUTE_index,
+            Value::Int(i32::try_from(index).ok()?),
+        ),
+        Property::new(spa::sys::SPA_PARAM_ROUTE_device, Value::Int(device)),
+    ];
+    if let Some(props) = props {
+        properties.push(Property::new(
+            spa::sys::SPA_PARAM_ROUTE_props,
+            Value::Object(Object {
+                type_: SpaTypes::ObjectParamProps.as_raw(),
+                id: ParamType::Route.as_raw(),
+                properties: props,
+            }),
+        ));
+    }
+    properties.push(Property::new(
+        spa::sys::SPA_PARAM_ROUTE_save,
+        Value::Bool(true),
+    ));
+    route_object_pod(properties)
+}
+
+/// Serialise route properties into a `SPA_TYPE_OBJECT_ParamRoute` pod.
+fn route_object_pod(properties: Vec<Property>) -> Option<Vec<u8>> {
+    let value = Value::Object(Object {
+        type_: SpaTypes::ObjectParamRoute.as_raw(),
+        id: ParamType::Route.as_raw(),
+        properties,
+    });
+    let (cursor, _len) =
+        PodSerializer::serialize(std::io::Cursor::new(Vec::<u8>::new()), &value).ok()?;
+    Some(cursor.into_inner())
+}
+
+/// A `SPA_TYPE_OBJECT_ParamRoute` object as it arrives from either `EnumRoute`
+/// (the catalogue) or `Route` (the active selection). Both share one shape;
+/// which fields are present is what tells them apart.
+struct RawRoute {
+    index: Option<u32>,
+    direction: Option<RouteDirection>,
+    device: Option<i32>,
+    name: String,
+    description: String,
+    priority: u32,
+    available: Availability,
+    devices: Vec<i32>,
+    profiles: Vec<i32>,
+    props: Option<RouteProps>,
+}
+
+/// Parse a route object pod. `None` when the pod is not an object at all.
+fn parse_route(param: &Pod) -> Option<RawRoute> {
+    let (_rest, value) = PodDeserializer::deserialize_any_from(param.as_bytes()).ok()?;
+    let Value::Object(object) = value else {
+        return None;
+    };
+
+    let mut raw = RawRoute {
+        index: None,
+        direction: None,
+        device: None,
+        name: String::new(),
+        description: String::new(),
+        priority: 0,
+        available: Availability::Unknown,
+        devices: Vec::new(),
+        profiles: Vec::new(),
+        props: None,
+    };
+
+    for property in &object.properties {
+        match property.key {
+            spa::sys::SPA_PARAM_ROUTE_index => {
+                raw.index = value_int(&property.value).and_then(|v| u32::try_from(v).ok());
+            }
+            spa::sys::SPA_PARAM_ROUTE_direction => {
+                raw.direction = value_id(&property.value).and_then(RouteDirection::from_raw);
+            }
+            spa::sys::SPA_PARAM_ROUTE_device => raw.device = value_int(&property.value),
+            spa::sys::SPA_PARAM_ROUTE_name => {
+                if let Some(v) = value_str(&property.value) {
+                    raw.name = v.to_owned();
+                }
+            }
+            spa::sys::SPA_PARAM_ROUTE_description => {
+                if let Some(v) = value_str(&property.value) {
+                    raw.description = v.to_owned();
+                }
+            }
+            spa::sys::SPA_PARAM_ROUTE_priority => {
+                raw.priority = value_int(&property.value)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0);
+            }
+            spa::sys::SPA_PARAM_ROUTE_available => {
+                raw.available = value_id(&property.value)
+                    .map(Availability::from_raw)
+                    .unwrap_or(Availability::Unknown);
+            }
+            spa::sys::SPA_PARAM_ROUTE_devices => raw.devices = value_int_array(&property.value),
+            spa::sys::SPA_PARAM_ROUTE_profiles => raw.profiles = value_int_array(&property.value),
+            spa::sys::SPA_PARAM_ROUTE_props => {
+                if let Value::Object(props) = &property.value {
+                    let (volume, mute, channels) = parse_props_object(props);
+                    raw.props = Some(RouteProps {
+                        volume,
+                        mute,
+                        channels,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A route with no description still deserves a label in the panel.
+    if raw.description.is_empty() {
+        raw.description = raw.name.clone();
+    }
+    Some(raw)
+}
+
+/// An enumerated value, tolerating the `Int` and `Choice` spellings PipeWire is
+/// free to use for any property.
+fn value_id(value: &Value) -> Option<u32> {
+    match value {
+        Value::Id(id) => Some(id.0),
+        Value::Int(v) => u32::try_from(*v).ok(),
+        Value::Choice(ChoiceValue::Id(Choice(_, ChoiceEnum::None(id)))) => Some(id.0),
+        _ => None,
+    }
+}
+
+/// A 32-bit integer, tolerating `Id` and `Choice` spellings.
+fn value_int(value: &Value) -> Option<i32> {
+    match value {
+        Value::Int(v) => Some(*v),
+        Value::Id(id) => i32::try_from(id.0).ok(),
+        Value::Choice(ChoiceValue::Int(Choice(_, ChoiceEnum::None(v)))) => Some(*v),
+        _ => None,
+    }
+}
+
+/// A string property.
+fn value_str(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(s) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// An array of 32-bit integers; a bare scalar counts as a one-element array.
+fn value_int_array(value: &Value) -> Vec<i32> {
+    match value {
+        Value::ValueArray(ValueArray::Int(values)) => values.clone(),
+        Value::ValueArray(ValueArray::Id(values)) => values
+            .iter()
+            .filter_map(|id| i32::try_from(id.0).ok())
+            .collect(),
+        Value::Int(v) => vec![*v],
+        _ => Vec::new(),
+    }
+}
+
 /// Pull volume, mute and channel count out of a `Props` param pod.
 ///
 /// Returns `None` when the pod is not a `Props` object at all.
@@ -904,7 +1397,12 @@ fn parse_props(param: &Pod) -> Option<(Option<f64>, Option<bool>, Option<usize>)
     let Value::Object(object) = value else {
         return None;
     };
+    Some(parse_props_object(&object))
+}
 
+/// The `Props` object body, shared by the node `Props` param and the `props`
+/// sub-object of a device `Route` (SPEC §6.1 — same shape, two carriers).
+fn parse_props_object(object: &Object) -> (Option<f64>, Option<bool>, Option<usize>) {
     let mut volume = None;
     let mut mute = None;
     let mut channels = None;
@@ -934,7 +1432,7 @@ fn parse_props(param: &Pod) -> Option<(Option<f64>, Option<bool>, Option<usize>)
         }
     }
 
-    Some((volume.map(clamp_volume), mute, channels))
+    (volume.map(clamp_volume), mute, channels)
 }
 
 #[cfg(test)]
@@ -1011,6 +1509,158 @@ mod tests {
         assert!((volume.expect("volume") - 0.75).abs() < 1e-6);
         assert_eq!(mute, None);
         assert_eq!(channels, None);
+    }
+
+    /// The `Route` write of SPEC §6.1, round-tripped through libspa without a
+    /// server — same style as the `Props` pod test above.
+    #[test]
+    fn route_pod_round_trips_index_device_props_and_save() {
+        let bytes = route_pod(
+            4,
+            4,
+            Some(vec![
+                Property::new(
+                    spa::sys::SPA_PROP_channelVolumes,
+                    Value::ValueArray(ValueArray::Float(vec![0.064, 0.064])),
+                ),
+                Property::new(spa::sys::SPA_PROP_mute, Value::Bool(false)),
+            ]),
+        )
+        .expect("pod builds");
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+
+        let raw = parse_route(pod).expect("parses");
+        assert_eq!(raw.index, Some(4));
+        assert_eq!(raw.device, Some(4));
+        let props = raw.props.expect("props survived the nesting");
+        assert_eq!(props.channels, Some(2));
+        assert_eq!(props.mute, Some(false));
+        assert!((props.volume.expect("volume") - 0.064).abs() < 1e-6);
+
+        // `save: true` must be on the wire, or WirePlumber forgets the choice.
+        let (_rest, value) =
+            PodDeserializer::deserialize_any_from(pod.as_bytes()).expect("deserialises");
+        let Value::Object(object) = value else {
+            panic!("not an object");
+        };
+        assert_eq!(object.type_, SpaTypes::ObjectParamRoute.as_raw());
+        assert_eq!(object.id, ParamType::Route.as_raw());
+        let save = object
+            .properties
+            .iter()
+            .find(|p| p.key == spa::sys::SPA_PARAM_ROUTE_save)
+            .expect("save property");
+        assert_eq!(save.value, Value::Bool(true));
+    }
+
+    /// `SetPort` sends no props at all (SPEC §6.1).
+    #[test]
+    fn route_pod_without_props_omits_the_props_field() {
+        let bytes = route_pod(3, 4, None).expect("pod builds");
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        let raw = parse_route(pod).expect("parses");
+        assert_eq!(raw.index, Some(3));
+        assert_eq!(raw.device, Some(4));
+        assert!(raw.props.is_none());
+    }
+
+    /// The `EnumRoute` catalogue shape, as `pw-dump 53` shows it on chronos.
+    #[test]
+    fn enum_route_pod_round_trips_the_catalogue_fields() {
+        use spa::utils::Id;
+
+        let bytes = route_object_pod(vec![
+            Property::new(spa::sys::SPA_PARAM_ROUTE_index, Value::Int(4)),
+            Property::new(
+                spa::sys::SPA_PARAM_ROUTE_direction,
+                Value::Id(Id(RouteDirection::OUTPUT_RAW)),
+            ),
+            Property::new(
+                spa::sys::SPA_PARAM_ROUTE_name,
+                Value::String("analog-output-headphones".to_owned()),
+            ),
+            Property::new(
+                spa::sys::SPA_PARAM_ROUTE_description,
+                Value::String("Headphones".to_owned()),
+            ),
+            Property::new(spa::sys::SPA_PARAM_ROUTE_priority, Value::Int(9900)),
+            Property::new(
+                spa::sys::SPA_PARAM_ROUTE_available,
+                Value::Id(Id(Availability::Yes.as_raw())),
+            ),
+            Property::new(
+                spa::sys::SPA_PARAM_ROUTE_devices,
+                Value::ValueArray(ValueArray::Int(vec![4, 5])),
+            ),
+            Property::new(
+                spa::sys::SPA_PARAM_ROUTE_profiles,
+                Value::ValueArray(ValueArray::Int(vec![1, 2])),
+            ),
+        ])
+        .expect("pod builds");
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+
+        let raw = parse_route(pod).expect("parses");
+        assert_eq!(raw.index, Some(4));
+        assert_eq!(raw.direction, Some(RouteDirection::Output));
+        assert_eq!(raw.name, "analog-output-headphones");
+        assert_eq!(raw.description, "Headphones");
+        assert_eq!(raw.priority, 9900);
+        assert_eq!(raw.available, Availability::Yes);
+        assert_eq!(raw.devices, vec![4, 5]);
+        assert_eq!(raw.profiles, vec![1, 2]);
+        assert!(raw.props.is_none());
+        assert!(raw.device.is_none());
+    }
+
+    /// A route with no `description` still gets a usable label.
+    #[test]
+    fn route_description_falls_back_to_the_name() {
+        use spa::utils::Id;
+
+        let bytes = route_object_pod(vec![
+            Property::new(spa::sys::SPA_PARAM_ROUTE_index, Value::Int(0)),
+            Property::new(
+                spa::sys::SPA_PARAM_ROUTE_direction,
+                Value::Id(Id(RouteDirection::INPUT_RAW)),
+            ),
+            Property::new(
+                spa::sys::SPA_PARAM_ROUTE_name,
+                Value::String("analog-input-front-mic".to_owned()),
+            ),
+        ])
+        .expect("pod builds");
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        let raw = parse_route(pod).expect("parses");
+        assert_eq!(raw.description, "analog-input-front-mic");
+        assert_eq!(raw.available, Availability::Unknown);
+        assert!(raw.devices.is_empty());
+    }
+
+    /// A scalar where an array is expected still yields one element.
+    #[test]
+    fn value_helpers_tolerate_scalar_and_choice_spellings() {
+        use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
+
+        assert_eq!(value_int_array(&Value::Int(4)), vec![4]);
+        assert_eq!(value_int_array(&Value::Bool(true)), Vec::<i32>::new());
+        assert_eq!(value_int(&Value::Id(Id(7))), Some(7));
+        assert_eq!(value_id(&Value::Int(2)), Some(2));
+        assert_eq!(value_str(&Value::Int(1)), None);
+        assert_eq!(
+            value_int(&Value::Choice(ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::None(9)
+            )))),
+            Some(9)
+        );
+        assert_eq!(
+            value_id(&Value::Choice(ChoiceValue::Id(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::None(Id(2))
+            )))),
+            Some(2)
+        );
     }
 
     #[test]

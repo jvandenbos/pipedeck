@@ -25,11 +25,15 @@ const SLIDER_DEBOUNCE_MS = 50;
 const FALLBACK_APP_ICON = 'audio-x-generic-symbolic';
 
 /**
- * Devices tuple -> object. Wire type a(usssbbdb):
- * (id, name, description, kind, is_default, virtual, volume, mute)
+ * Devices tuple -> object. Wire type a(usssbbdbs):
+ * (id, name, description, kind, is_default, virtual, volume, mute, nick)
+ * `nick` is a trailing field added on chronos after live testing (2026-09-01);
+ * an older 9th-field-less daemon leaves it `undefined` here, so it falls
+ * back to `description` -- callers should always read `.nick`, never
+ * `.description`, when building a device label.
  */
-function unpackDevice([id, name, description, kind, isDefault, isVirtual, volume, mute]) {
-  return {id, name, description, kind, isDefault, isVirtual, volume, mute};
+function unpackDevice([id, name, description, kind, isDefault, isVirtual, volume, mute, nick]) {
+  return {id, name, description, kind, isDefault, isVirtual, volume, mute, nick: nick || description};
 }
 
 /**
@@ -38,6 +42,31 @@ function unpackDevice([id, name, description, kind, isDefault, isVirtual, volume
  */
 function unpackStream([id, appName, binary, mediaName, targetName, volume, mute]) {
   return {id, appName, binary, mediaName, targetName, volume, mute};
+}
+
+/**
+ * Ports tuple -> object. Wire type a(uussbb), per SPEC §6.1:
+ * (node_id, route_index, name, description, available, active)
+ */
+function unpackPort([nodeId, routeIndex, name, description, available, active]) {
+  return {nodeId, routeIndex, name, description, available, active};
+}
+
+/** Map<nodeId, port[]> from a flat Ports array. `ports` may be null (v0.1 daemon, no Ports
+ * property) — callers get an empty Map back, which makes every device render as v0.1 did. */
+function groupPortsByNode(ports) {
+  const map = new Map();
+  if (!ports)
+    return map;
+  for (const port of ports) {
+    let list = map.get(port.nodeId);
+    if (!list) {
+      list = [];
+      map.set(port.nodeId, list);
+    }
+    list.push(port);
+  }
+  return map;
 }
 
 /** Best-effort app icon lookup; never throws, always returns a Gio.Icon or null. */
@@ -166,13 +195,13 @@ class AppVolumeRow {
       return;
     const volume = this._pendingVolume;
     this._pendingVolume = null;
-    this._proxyOps.setVolume(this.id, volume);
+    this._proxyOps.setVolume(this.id, volume).catch(() => {});
   }
 
   _onMuteClicked() {
     if (this.id === null)
       return;
-    this._proxyOps.setMute(this.id, !this._muted);
+    this._proxyOps.setMute(this.id, !this._muted).catch(() => {});
   }
 
   /** Disconnects everything and destroys the row's actor. Idempotent. */
@@ -227,6 +256,9 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
     this.connect('destroy', () => this._clearAppRows());
 
     this.menu.setHeader('audio-speakers-symbolic', 'Audio');
+    // Live testing on chronos (2026-09-01): the default popup-menu width
+    // clips long "<port> · <device nick>" labels -- widen it (stylesheet.css).
+    this.menu.box.add_style_class_name('pipedeck-menu');
 
     this._unavailableItem = new PopupMenu.PopupMenuItem('PipeDeck daemon not running', {activate: false});
     this._unavailableItem.setSensitive(false);
@@ -282,23 +314,39 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
   }
 
   /**
-   * @param {{devices: object[], streams: object[], notificationSink: string}} state
+   * @param {{devices: object[], streams: object[], notificationSink: string,
+   *   ports: (object[]|null)}} state `ports` is null on a v0.1 daemon (no Ports
+   *   property) and every device then renders exactly as v0.1 did.
    */
   rebuild(state) {
-    const {devices, streams, notificationSink} = state;
+    const {devices, streams, notificationSink, ports} = state;
     const sinks = devices.filter(d => d.kind === 'sink');
     const sources = devices.filter(d => d.kind === 'source');
+    const portsByNode = groupPortsByNode(ports);
 
-    this._rebuildDeviceSection(this._outputSection, sinks);
-    this._rebuildDeviceSection(this._inputSection, sources);
+    this._rebuildDeviceSection(this._outputSection, sinks, portsByNode);
+    this._rebuildDeviceSection(this._inputSection, sources, portsByNode);
     this._rebuildNotificationSection(sinks, notificationSink);
     this._rebuildAppSection(streams);
 
     const defaultOut = sinks.find(d => d.isDefault);
-    this.subtitle = defaultOut ? defaultOut.description : '';
+    this.subtitle = this._describeOutput(defaultOut, portsByNode);
   }
 
-  _rebuildDeviceSection(section, devices) {
+  /** Toggle subtitle: "<active port> · <nick>" when the default output has
+   * >=2 available ports, else just the device's nick (SPEC §6.2). */
+  _describeOutput(device, portsByNode) {
+    if (!device)
+      return '';
+    const label = device.nick;
+    const availablePorts = (portsByNode.get(device.id) ?? []).filter(p => p.available === true);
+    if (availablePorts.length < 2)
+      return label;
+    const activePort = availablePorts.find(p => p.active);
+    return activePort ? `${activePort.description} · ${label}` : label;
+  }
+
+  _rebuildDeviceSection(section, devices, portsByNode) {
     section.removeAll();
     if (devices.length === 0) {
       const empty = new PopupMenu.PopupMenuItem('No devices', {activate: false});
@@ -307,10 +355,46 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
       return;
     }
     for (const device of devices) {
-      const item = new PopupMenu.PopupMenuItem(device.description || device.name);
-      item.setOrnament(device.isDefault ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
-      item.connect('activate', () => this._proxyOps.setDefault(device.kind, device.name));
-      section.addMenuItem(item);
+      const availablePorts = (portsByNode.get(device.id) ?? []).filter(p => p.available === true);
+      if (availablePorts.length >= 2) {
+        for (const port of availablePorts)
+          section.addMenuItem(this._buildPortItem(device, port));
+      } else {
+        section.addMenuItem(this._buildDeviceItem(device));
+      }
+    }
+  }
+
+  _buildDeviceItem(device) {
+    const item = new PopupMenu.PopupMenuItem(device.nick || device.name);
+    item.label.add_style_class_name('pipedeck-device-label');
+    item.setOrnament(device.isDefault ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
+    item.connect('activate', () => {
+      this._proxyOps.setDefault(device.kind, device.name).catch(() => {});
+    });
+    return item;
+  }
+
+  _buildPortItem(device, port) {
+    const item = new PopupMenu.PopupMenuItem(`${port.description} · ${device.nick}`);
+    item.label.add_style_class_name('pipedeck-device-label');
+    item.setOrnament(
+      device.isDefault && port.active ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
+    item.connect('activate', () => this._activatePort(device, port));
+    return item;
+  }
+
+  /** Selecting a port row: SetDefault first if the device isn't already
+   * default, then SetPort if that port isn't already active. Sequential,
+   * both awaited, per SPEC §6.2. */
+  async _activatePort(device, port) {
+    try {
+      if (!device.isDefault)
+        await this._proxyOps.setDefault(device.kind, device.name);
+      if (!port.active)
+        await this._proxyOps.setPort(device.id, port.routeIndex);
+    } catch (e) {
+      console.error(`PipeDeck: port selection failed: ${e.message}`);
     }
   }
 
@@ -319,13 +403,13 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
 
     const followItem = new PopupMenu.PopupMenuItem('Follow output');
     followItem.setOrnament(notificationSink === '' ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
-    followItem.connect('activate', () => this._proxyOps.setNotificationSink(''));
+    followItem.connect('activate', () => this._proxyOps.setNotificationSink('').catch(() => {}));
     this._notifSection.addMenuItem(followItem);
 
     for (const sink of sinks) {
       const item = new PopupMenu.PopupMenuItem(sink.description || sink.name);
       item.setOrnament(notificationSink === sink.name ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
-      item.connect('activate', () => this._proxyOps.setNotificationSink(sink.name));
+      item.connect('activate', () => this._proxyOps.setNotificationSink(sink.name).catch(() => {}));
       this._notifSection.addMenuItem(item);
     }
   }
@@ -380,6 +464,7 @@ class PipeDeckIndicator extends QuickSettings.SystemIndicator {
       setNotificationSink: name => this._callRemote('SetNotificationSinkRemote', name),
       setVolume: (id, volume) => this._callRemote('SetVolumeRemote', id, volume),
       setMute: (id, mute) => this._callRemote('SetMuteRemote', id, mute),
+      setPort: (nodeId, routeIndex) => this._callRemote('SetPortRemote', nodeId, routeIndex),
     });
     this.quickSettingsItems.push(this._toggle);
 
@@ -393,19 +478,32 @@ class PipeDeckIndicator extends QuickSettings.SystemIndicator {
     this.connect('destroy', () => this._onDestroy());
   }
 
+  /** Returns a Promise so callers that need a sequence (e.g. SetDefault then
+   * SetPort, SPEC §6.2) can await it. Every failure is logged here, so
+   * fire-and-forget call sites just need `.catch(() => {})` to avoid an
+   * unhandled-rejection log line without losing the error message. */
   _callRemote(methodName, ...args) {
-    if (!this._proxy) {
-      console.error(`PipeDeck: ${methodName} called with no daemon proxy`);
-      return;
-    }
-    try {
-      this._proxy[methodName](...args, (result, error) => {
-        if (error)
-          console.error(`PipeDeck: ${methodName} failed: ${error.message}`);
-      });
-    } catch (e) {
-      console.error(`PipeDeck: ${methodName} threw: ${e.message}`);
-    }
+    return new Promise((resolve, reject) => {
+      if (!this._proxy) {
+        const error = new Error(`${methodName} called with no daemon proxy`);
+        console.error(`PipeDeck: ${error.message}`);
+        reject(error);
+        return;
+      }
+      try {
+        this._proxy[methodName](...args, (result, error) => {
+          if (error) {
+            console.error(`PipeDeck: ${methodName} failed: ${error.message}`);
+            reject(error);
+          } else {
+            resolve(result);
+          }
+        });
+      } catch (e) {
+        console.error(`PipeDeck: ${methodName} threw: ${e.message}`);
+        reject(e);
+      }
+    });
   }
 
   _onNameAppeared() {
@@ -486,10 +584,15 @@ class PipeDeckIndicator extends QuickSettings.SystemIndicator {
     if (!this._proxy)
       return;
     try {
+      // this._proxy.Ports is undefined when talking to a v0.1 daemon (no
+      // Ports property in its introspection/cached properties at all) --
+      // normalize that to null so `rebuild()` degrades gracefully rather
+      // than treating "unknown" the same as "no ports" (an empty array).
       const state = {
         devices: (this._proxy.Devices ?? []).map(unpackDevice),
         streams: (this._proxy.Streams ?? []).map(unpackStream),
         notificationSink: this._proxy.NotificationSink ?? '',
+        ports: this._proxy.Ports ? this._proxy.Ports.map(unpackPort) : null,
       };
       this._toggle.rebuild(state);
     } catch (e) {

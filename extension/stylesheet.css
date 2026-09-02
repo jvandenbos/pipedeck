@@ -1,5 +1,16 @@
 /* PipeDeck Quick Settings menu styling. */
 
+/* Live testing on chronos (2026-09-01): the default popup-menu width lets
+ * long device/port labels ("Headphones · ALC892 Analog") get clipped
+ * without ellipsis. Give the menu box some breathing room. */
+.pipedeck-menu {
+  min-width: 22em;
+}
+
+.pipedeck-device-label {
+  text-overflow: ellipsis;
+}
+
 .pipedeck-app-row {
   spacing: 8px;
   padding: 4px 0;

@@ -9,6 +9,7 @@ use anyhow::{bail, Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt as _;
 
+use pipedeckd::route::PortTuple;
 use pipedeckd::state::{DeviceKind, DeviceTuple, StreamTuple};
 use pipedeckd::volume::{linear_to_percent, percent_to_linear, MAX_VOLUME};
 
@@ -32,6 +33,8 @@ enum Cmd {
     Inputs,
     /// List playback streams.
     Streams,
+    /// List the selectable ports of every device.
+    Ports,
     /// Make a sink the default output.
     SetOutput(NameArg),
     /// Make a source the default input.
@@ -51,6 +54,13 @@ enum Cmd {
         id: u32,
         /// `on`, `off`, or omitted to toggle.
         state: Option<String>,
+    },
+    /// Switch a device to one of its ports.
+    SetPort {
+        /// Node id, from `pipedeck outputs`.
+        id: u32,
+        /// Route name (`analog-output-lineout`), description, or index.
+        port: String,
     },
     /// Ask the daemon to re-read the graph.
     Refresh,
@@ -79,6 +89,7 @@ async fn main() -> Result<()> {
         Cmd::Outputs => list_devices(&daemon, DeviceKind::Sink).await,
         Cmd::Inputs => list_devices(&daemon, DeviceKind::Source).await,
         Cmd::Streams => list_streams(&daemon).await,
+        Cmd::Ports => list_ports(&daemon).await,
         Cmd::SetOutput(arg) => {
             daemon.set_default("sink", &arg.name).await?;
             println!("default output -> {}", arg.name);
@@ -124,6 +135,17 @@ async fn main() -> Result<()> {
             println!("{id} mute -> {}", if mute { "on" } else { "off" });
             Ok(())
         }
+        Cmd::SetPort { id, port } => {
+            let ports = daemon.ports().await?;
+            let index = resolve_port(&ports, id, &port)?;
+            daemon.set_port(id, index).await?;
+            let label = ports
+                .iter()
+                .find(|p| p.0 == id && p.1 == index)
+                .map_or_else(|| index.to_string(), |p| p.3.clone());
+            println!("{id} port -> {label}");
+            Ok(())
+        }
         Cmd::Refresh => {
             daemon.refresh().await?;
             println!("refreshed");
@@ -143,9 +165,24 @@ async fn current_mute(daemon: &DaemonProxy<'_>, id: u32) -> Result<bool> {
     bail!("no device or stream with id {id}")
 }
 
-fn device_line(device: &DeviceTuple) -> String {
-    let (id, name, description, _kind, is_default, virtual_, volume, mute) = device;
+/// One device row: nick first (ALSA descriptions truncate), then the active
+/// port in brackets when the node has more than one (SPEC §6.1), then the full
+/// description and `node.name` on continuation lines.
+fn device_line(device: &DeviceTuple, ports: &[PortTuple]) -> String {
+    let (id, name, description, _kind, is_default, virtual_, volume, mute, nick) = device;
     let marker = if *is_default { '*' } else { ' ' };
+    let label = if nick.is_empty() { description } else { nick };
+
+    let mine: Vec<&PortTuple> = ports.iter().filter(|p| p.0 == *id).collect();
+    let port = if mine.len() > 1 {
+        mine.iter()
+            .find(|p| p.5)
+            .map(|p| format!(" [{}]", p.3))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     let mut flags = String::new();
     if *mute {
         flags.push_str(" [muted]");
@@ -153,9 +190,50 @@ fn device_line(device: &DeviceTuple) -> String {
     if *virtual_ {
         flags.push_str(" [virtual]");
     }
-    format!(
-        "{marker} {id:>5}  {:>4.0}%  {description}{flags}\n            {name}",
+
+    let mut line = format!(
+        "{marker} {id:>5}  {:>4.0}%  {label}{port}{flags}",
         linear_to_percent(*volume)
+    );
+    if description != label && !description.is_empty() {
+        line.push_str(&format!("\n            {description}"));
+    }
+    line.push_str(&format!("\n            {name}"));
+    line
+}
+
+/// One port row for `pipedeck ports`.
+fn port_line(port: &PortTuple) -> String {
+    let (node_id, index, name, description, available, active) = port;
+    let marker = if *active { '*' } else { ' ' };
+    let flag = if *available { "" } else { "  [unavailable]" };
+    format!("{marker} {node_id:>5}  {index:>3}  {description}{flag}\n            {name}")
+}
+
+/// Resolve `pipedeck set-port <id> <name|description|index>` to a route index.
+///
+/// Index first (so a numeric argument that *is* a route index always wins),
+/// then the route name, then its description — both case-insensitively.
+fn resolve_port(ports: &[PortTuple], id: u32, wanted: &str) -> Result<u32> {
+    let mine: Vec<&PortTuple> = ports.iter().filter(|p| p.0 == id).collect();
+    if mine.is_empty() {
+        bail!("node {id} has no ports (see `pipedeck ports`)");
+    }
+    if let Ok(index) = wanted.parse::<u32>() {
+        if mine.iter().any(|p| p.1 == index) {
+            return Ok(index);
+        }
+    }
+    if let Some(port) = mine.iter().find(|p| p.2.eq_ignore_ascii_case(wanted)) {
+        return Ok(port.1);
+    }
+    if let Some(port) = mine.iter().find(|p| p.3.eq_ignore_ascii_case(wanted)) {
+        return Ok(port.1);
+    }
+    let known: Vec<String> = mine.iter().map(|p| p.2.clone()).collect();
+    bail!(
+        "node {id} has no port `{wanted}`; it has: {}",
+        known.join(", ")
     )
 }
 
@@ -180,6 +258,7 @@ fn stream_line(stream: &StreamTuple) -> String {
 
 async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
     let devices = daemon.devices().await?;
+    let ports = daemon.ports().await.unwrap_or_default();
     let streams = daemon.streams().await?;
     let notify = daemon.notification_sink().await?;
     let version = daemon.version().await.unwrap_or_default();
@@ -201,7 +280,7 @@ async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
         println!("\n{title}:");
         let mut any = false;
         for device in devices.iter().filter(|d| d.3 == kind.as_str()) {
-            println!("{}", device_line(device));
+            println!("{}", device_line(device, &ports));
             any = true;
         }
         if !any {
@@ -221,13 +300,25 @@ async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
 
 async fn list_devices(daemon: &DaemonProxy<'_>, kind: DeviceKind) -> Result<()> {
     let devices = daemon.devices().await?;
+    let ports = daemon.ports().await.unwrap_or_default();
     let mut any = false;
     for device in devices.iter().filter(|d| d.3 == kind.as_str()) {
-        println!("{}", device_line(device));
+        println!("{}", device_line(device, &ports));
         any = true;
     }
     if !any {
         println!("(no {kind}s)");
+    }
+    Ok(())
+}
+
+async fn list_ports(daemon: &DaemonProxy<'_>) -> Result<()> {
+    let ports = daemon.ports().await?;
+    if ports.is_empty() {
+        println!("(no ports; only cards with ALSA routes have them)");
+    }
+    for port in &ports {
+        println!("{}", port_line(port));
     }
     Ok(())
 }
@@ -278,6 +369,8 @@ mod tests {
             "set-output",
             "set-input",
             "set-notify",
+            "ports",
+            "set-port",
             "vol",
             "mute",
             "watch",
@@ -313,36 +406,171 @@ mod tests {
         }
     }
 
+    fn device(id: u32, name: &str, description: &str, nick: &str) -> DeviceTuple {
+        (
+            id,
+            name.to_owned(),
+            description.to_owned(),
+            "sink".to_owned(),
+            false,
+            false,
+            1.0,
+            false,
+            nick.to_owned(),
+        )
+    }
+
+    /// The chronos card: two ports on node 39, one on node 43.
+    fn ports() -> Vec<PortTuple> {
+        vec![
+            (
+                39,
+                3,
+                "analog-output-lineout".to_owned(),
+                "Line Out".to_owned(),
+                true,
+                false,
+            ),
+            (
+                39,
+                4,
+                "analog-output-headphones".to_owned(),
+                "Headphones".to_owned(),
+                true,
+                true,
+            ),
+            (
+                41,
+                1,
+                "analog-input-linein".to_owned(),
+                "Line In".to_owned(),
+                false,
+                false,
+            ),
+            (
+                43,
+                2,
+                "hdmi-output-0".to_owned(),
+                "HDMI / DisplayPort".to_owned(),
+                true,
+                true,
+            ),
+        ]
+    }
+
     #[test]
     fn device_line_marks_the_default_and_flags() {
-        let line = device_line(&(
-            11,
-            "sink-a".to_owned(),
-            "Analog".to_owned(),
-            "sink".to_owned(),
-            true,
-            true,
-            0.125, // 50 % on the cubic scale wpctl shows
-            true,
-        ));
+        let mut d = device(11, "sink-a", "Analog", "ALC892 Analog");
+        d.4 = true;
+        d.5 = true;
+        d.6 = 0.125; // 50 % on the cubic scale wpctl shows
+        d.7 = true;
+        let line = device_line(&d, &[]);
         assert!(line.starts_with('*'));
         assert!(line.contains("50%"));
         assert!(line.contains("[muted]"));
         assert!(line.contains("[virtual]"));
         assert!(line.contains("sink-a"));
 
-        let plain = device_line(&(
-            12,
-            "sink-b".to_owned(),
-            "HDMI".to_owned(),
-            "sink".to_owned(),
-            false,
-            false,
-            1.0,
-            false,
-        ));
+        let plain = device_line(&device(12, "sink-b", "HDMI", "Dell AW3423DW"), &[]);
         assert!(plain.starts_with(' '));
         assert!(!plain.contains("[muted]"));
+    }
+
+    #[test]
+    fn device_line_leads_with_the_nick_and_keeps_the_description() {
+        let line = device_line(
+            &device(
+                39,
+                "alsa_output.pci-0000_28_00.4.analog-stereo",
+                "Starship/Matisse HD Audio Controller Analog Stereo",
+                "ALC892 Analog",
+            ),
+            &[],
+        );
+        let first = line.lines().next().expect("a first line");
+        assert!(first.contains("ALC892 Analog"));
+        assert!(!first.contains("Starship"));
+        assert!(line.contains("Starship/Matisse HD Audio Controller Analog Stereo"));
+        assert!(line.contains("alsa_output.pci-0000_28_00.4.analog-stereo"));
+
+        // No nick: fall back to the description, and do not print it twice.
+        let bare = device_line(&device(12, "sink-b", "HDMI", ""), &[]);
+        assert_eq!(bare.matches("HDMI").count(), 1);
+    }
+
+    #[test]
+    fn device_line_shows_the_active_port_only_when_there_is_a_choice() {
+        let multi = device_line(&device(39, "sink-a", "Analog", "ALC892 Analog"), &ports());
+        assert!(multi.contains("[Headphones]"));
+
+        // One port is not a choice: no bracket.
+        let single = device_line(&device(43, "sink-hdmi", "HDMI", "Dell AW3423DW"), &ports());
+        assert!(!single.contains("[HDMI / DisplayPort]"));
+
+        // No ports at all (virtual sink).
+        let none = device_line(&device(60, "null", "Null", "Null"), &ports());
+        assert!(!none.contains('['));
+    }
+
+    #[test]
+    fn port_line_marks_the_active_and_dims_the_unavailable() {
+        let all = ports();
+        let active = port_line(&all[1]);
+        assert!(active.starts_with('*'));
+        assert!(active.contains("Headphones"));
+        assert!(active.contains("analog-output-headphones"));
+        assert!(!active.contains("[unavailable]"));
+
+        let inactive = port_line(&all[0]);
+        assert!(inactive.starts_with(' '));
+
+        let unavailable = port_line(&all[2]);
+        assert!(unavailable.contains("[unavailable]"));
+    }
+
+    #[test]
+    fn resolve_port_takes_an_index_a_name_or_a_description() {
+        let all = ports();
+        assert_eq!(resolve_port(&all, 39, "3").expect("index"), 3);
+        assert_eq!(
+            resolve_port(&all, 39, "analog-output-lineout").expect("name"),
+            3
+        );
+        assert_eq!(
+            resolve_port(&all, 39, "ANALOG-OUTPUT-HEADPHONES").expect("name, any case"),
+            4
+        );
+        assert_eq!(resolve_port(&all, 39, "Line Out").expect("description"), 3);
+        // An unavailable port still resolves; the daemon is what rejects it.
+        assert_eq!(
+            resolve_port(&all, 41, "analog-input-linein").expect("name"),
+            1
+        );
+    }
+
+    #[test]
+    fn resolve_port_reports_unknown_nodes_and_ports() {
+        let all = ports();
+        let err = resolve_port(&all, 99, "3").expect_err("no such node");
+        assert!(err.to_string().contains("no ports"));
+        let err = resolve_port(&all, 39, "nonsense").expect_err("no such port");
+        assert!(err.to_string().contains("analog-output-lineout"));
+        // An index that belongs to a different node is not accepted either.
+        assert!(resolve_port(&all, 39, "2").is_err());
+    }
+
+    #[test]
+    fn set_port_parses_an_id_and_a_port() {
+        let cli = Cli::try_parse_from(["pipedeck", "set-port", "39", "analog-output-lineout"])
+            .expect("parses");
+        match cli.command {
+            Cmd::SetPort { id, port } => {
+                assert_eq!(id, 39);
+                assert_eq!(port, "analog-output-lineout");
+            }
+            other => panic!("wrong subcommand: {other:?}"),
+        }
     }
 
     #[test]

@@ -13,15 +13,22 @@ export const BUS_NAME = 'dev.pipedeck.Daemon';
 export const OBJECT_PATH = '/dev/pipedeck/Daemon';
 export const INTERFACE_NAME = 'dev.pipedeck.Daemon1';
 
-// Wire types, per SPEC §2.2:
-//   Devices   a(usssbbdb)  (id, name, description, kind, is_default, virtual, volume, mute)
+// Wire types, per SPEC §2.2, the §6.1 ports addendum, and a live-testing fix
+// on chronos (2026-09-01) that added a trailing `nick` field to Devices:
+//   Devices   a(usssbbdbs) (id, name, description, kind, is_default, virtual, volume, mute, nick)
 //   Streams   a(ussssdb)   (id, app_name, binary, media_name, target_name, volume, mute)
+//   Ports     a(uussbb)    (node_id, route_index, name, description, available, active)
+// `unpackDevice` in extension.js destructures `nick` positionally and falls
+// back to `description` when it's absent (an 8-field tuple from an older
+// daemon build, or an empty string), so this is safe against either wire
+// shape.
 export const DaemonInterfaceXml = `
 <node>
   <interface name="dev.pipedeck.Daemon1">
-    <property name="Devices" type="a(usssbbdb)" access="read"/>
+    <property name="Devices" type="a(usssbbdbs)" access="read"/>
     <property name="Streams" type="a(ussssdb)" access="read"/>
     <property name="NotificationSink" type="s" access="read"/>
+    <property name="Ports" type="a(uussbb)" access="read"/>
     <property name="Version" type="s" access="read"/>
 
     <method name="SetDefault">
@@ -42,6 +49,10 @@ export const DaemonInterfaceXml = `
     <method name="SetStreamTarget">
       <arg type="u" name="id" direction="in"/>
       <arg type="s" name="name" direction="in"/>
+    </method>
+    <method name="SetPort">
+      <arg type="u" name="node_id" direction="in"/>
+      <arg type="u" name="route_index" direction="in"/>
     </method>
     <method name="Refresh"/>
 

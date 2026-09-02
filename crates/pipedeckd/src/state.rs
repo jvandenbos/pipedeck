@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::route::{Port, PortTuple};
+
 /// Which side of the graph a device sits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeviceKind {
@@ -39,8 +41,8 @@ impl fmt::Display for DeviceKind {
     }
 }
 
-/// D-Bus tuple for one entry of the `Devices` property: `(usssbbdb)`.
-pub type DeviceTuple = (u32, String, String, String, bool, bool, f64, bool);
+/// D-Bus tuple for one entry of the `Devices` property: `(usssbbdbs)`.
+pub type DeviceTuple = (u32, String, String, String, bool, bool, f64, bool, String);
 /// D-Bus tuple for one entry of the `Streams` property: `(ussssdb)`.
 pub type StreamTuple = (u32, String, String, String, String, f64, bool);
 
@@ -63,6 +65,10 @@ pub struct Device {
     pub volume: f64,
     /// Mute flag.
     pub mute: bool,
+    /// `node.nick` — the short label, falling back to `description`. ALSA
+    /// descriptions ("Starship/Matisse HD Audio Controller Analog Stereo")
+    /// truncate in the panel; the nick ("ALC892 Analog") does not.
+    pub nick: String,
 }
 
 impl Device {
@@ -78,6 +84,7 @@ impl Device {
             self.virtual_,
             self.volume,
             self.mute,
+            self.nick.clone(),
         )
     }
 }
@@ -128,6 +135,8 @@ pub struct State {
     pub devices: BTreeMap<u32, Device>,
     /// Streams by node id.
     pub streams: BTreeMap<u32, Stream>,
+    /// Selectable ports, ordered by `(node id, route index)` (SPEC §6.1).
+    pub ports: Vec<Port>,
     /// Effective default sink `node.name`.
     pub default_sink: Option<String>,
     /// Effective default source `node.name`.
@@ -153,6 +162,23 @@ impl State {
             .filter(|s| s.playback)
             .map(Stream::to_dbus)
             .collect()
+    }
+
+    /// `Ports` property payload, ordered by node id then route index.
+    #[must_use]
+    pub fn ports_dbus(&self) -> Vec<PortTuple> {
+        self.ports.iter().map(Port::to_dbus).collect()
+    }
+
+    /// Ports belonging to one node, in listing order.
+    pub fn ports_of(&self, node_id: u32) -> impl Iterator<Item = &Port> {
+        self.ports.iter().filter(move |p| p.node_id == node_id)
+    }
+
+    /// The active port of a node, when it has one.
+    #[must_use]
+    pub fn active_port(&self, node_id: u32) -> Option<&Port> {
+        self.ports_of(node_id).find(|p| p.active)
     }
 
     /// Look up a device by `node.name`.
@@ -200,6 +226,7 @@ mod tests {
             virtual_: false,
             volume: 0.5,
             mute: false,
+            nick: format!("{name} nick"),
         }
     }
 
@@ -234,7 +261,7 @@ mod tests {
         d.virtual_ = true;
         d.mute = true;
         d.volume = 1.25;
-        let (id, name, description, kind, is_default, virtual_, volume, mute) = d.to_dbus();
+        let (id, name, description, kind, is_default, virtual_, volume, mute, nick) = d.to_dbus();
         assert_eq!(id, 42);
         assert_eq!(name, "sink-a");
         assert_eq!(description, "sink-a description");
@@ -243,6 +270,58 @@ mod tests {
         assert!(virtual_);
         assert!((volume - 1.25).abs() < f64::EPSILON);
         assert!(mute);
+        assert_eq!(nick, "sink-a nick");
+    }
+
+    #[test]
+    fn ports_project_and_index_by_node() {
+        use crate::route::Port;
+
+        let state = State {
+            ports: vec![
+                Port {
+                    node_id: 39,
+                    index: 3,
+                    name: "analog-output-lineout".to_owned(),
+                    description: "Line Out".to_owned(),
+                    available: true,
+                    active: false,
+                },
+                Port {
+                    node_id: 39,
+                    index: 4,
+                    name: "analog-output-headphones".to_owned(),
+                    description: "Headphones".to_owned(),
+                    available: true,
+                    active: true,
+                },
+                Port {
+                    node_id: 41,
+                    index: 0,
+                    name: "analog-input-front-mic".to_owned(),
+                    description: "Front Microphone".to_owned(),
+                    available: true,
+                    active: true,
+                },
+            ],
+            ..State::default()
+        };
+        let tuples = state.ports_dbus();
+        assert_eq!(tuples.len(), 3);
+        assert_eq!(
+            tuples[0],
+            (
+                39,
+                3,
+                "analog-output-lineout".to_owned(),
+                "Line Out".to_owned(),
+                true,
+                false
+            )
+        );
+        assert_eq!(state.ports_of(39).count(), 2);
+        assert_eq!(state.active_port(39).map(|p| p.index), Some(4));
+        assert_eq!(state.active_port(99), None);
     }
 
     #[test]

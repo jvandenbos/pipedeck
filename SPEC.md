@@ -86,7 +86,8 @@ Well-known name `dev.pipedeck.Daemon`, object `/dev/pipedeck/Daemon`, interface
 
 ```
 Properties (read-only, emit PropertiesChanged):
-  Devices        a(usssbbdb)   (id, name, description, kind, is_default, virtual, volume, mute)
+  Devices        a(usssbbdbs)  (id, name, description, kind, is_default, virtual, volume, mute, nick)
+                               nick = node.nick, falling back to description (ALSA descriptions truncate)
   Streams        a(ussssdb)    (id, app_name, binary, media_name, target_name, volume, mute)
   NotificationSink  s          node.name or ""
   Version        s

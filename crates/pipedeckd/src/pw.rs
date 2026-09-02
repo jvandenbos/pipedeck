@@ -1415,6 +1415,26 @@ fn on_node_info(inner: &Rc<RefCell<Inner>>, id: u32, props: &spa::utils::dict::D
             changed = true;
         }
     }
+    // `pipedeck.eq` / `node.link-group` are NOT in the registry global's
+    // property whitelist — they only show up here, in the node's own info.
+    // This is where our filter-chain nodes are recognised (bit us live
+    // 2026-09-02: the chain loaded but its main node was never adopted, so no
+    // preset was ever written).
+    let mut became_hidden = false;
+    if !entry.hidden
+        && eq::is_eq_node(
+            props.get(eq::PROP_PIPEDECK_EQ),
+            props.get(keys::NODE_LINK_GROUP),
+        )
+    {
+        entry.hidden = true;
+        became_hidden = true;
+        changed = true;
+    }
+    if became_hidden {
+        guard.attach_eq_node(id);
+        guard.apply_eq();
+    }
     if changed {
         guard.apply_notification_routing();
         guard.publish();

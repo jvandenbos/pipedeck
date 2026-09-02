@@ -76,6 +76,22 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
   No changes needed on the extension side.
 - ☐ Live verification on chronos once both sides are deployed together (see Handoffs).
 
+## Phase 6 — EQ presets (SPEC §7)  — **LIVE + MEASURED on chronos 2026-09-02**
+- ☑ Daemon: smart filter-chain per output (loaded in-process via pw_context_load_module),
+  live `params` Props writes, `filters`-metadata bypass for off, presets dir + AutoEq importer,
+  `EqPresets`/`Eq`/`SetEq`. Extension v3: Equalizer section. Bundled presets + installer copy.
+- ☑ Live: HD 650 AutoEq import; `eq set 39 hd650` inserts the filter transparently (real sink stays
+  default, ports/volume untouched); off re-links direct; restart re-applies from config.
+- ☑ **Measured** (5 kHz tone, sink monitor with manual links): flat −21.3 dBFS, bass-boost −26.3
+  (= its −5 dB preamp), treble-tame −22.5, off −21.3. pw-cli `pre:Mult 0.25` → −33.3 (−12 dB).
+- Bug found+fixed live: `pipedeck.eq`/`node.link-group` are not in the registry global's property
+  whitelist, so the main node was never adopted and no preset was ever written; detection moved
+  to the node `info` handler.
+- Measurement gotcha: `pw-record --target <sink> stream.capture.sink=true` gets re-routed by
+  WirePlumber to the smart filter's *monitor* (pre-EQ). Capture with `node.autoconnect=false` and
+  `pw-link` to `<sink>:monitor_*` by hand.
+- ☐ Panel §7.5.12 — Jan's logout/login pending (extension v3 installed + enabled).
+
 ## v1.1 (later)
 - ☑ EQ via filter-chain (SPEC §7) — both sides code-complete, untested on a live graph (Phase 6).
 - ☐ Optional null sink `pipedeck.notifications`.

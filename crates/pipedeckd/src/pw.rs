@@ -14,17 +14,17 @@ use std::sync::{Arc, RwLock};
 use pipewire as pw;
 use pw::spa;
 
-use spa::param::ParamType;
+use spa::param::{ParamInfo, ParamInfoFlags, ParamType};
 use spa::pod::deserialize::PodDeserializer;
 use spa::pod::serialize::PodSerializer;
 use spa::pod::{ChoiceValue, Object, Pod, Property, Value, ValueArray};
 use spa::utils::{Choice, ChoiceEnum, SpaTypes};
 
 use pw::context::ContextRc;
-use pw::device::{Device as PwDevice, DeviceListener};
+use pw::device::{Device as PwDevice, DeviceChangeMask, DeviceListener};
 use pw::main_loop::MainLoopRc;
 use pw::metadata::{Metadata, MetadataListener};
-use pw::node::{Node, NodeListener};
+use pw::node::{Node, NodeChangeMask, NodeListener};
 use pw::proxy::ProxyT;
 use pw::registry::GlobalObject;
 use pw::types::ObjectType;
@@ -625,6 +625,10 @@ fn on_node_global(
                     if let Some(props) = info.props() {
                         on_node_info(&inner, id, props);
                     }
+                    if info.change_mask().contains(NodeChangeMask::PARAMS) {
+                        let reported = reported_params(info.params());
+                        reenumerate_node_params(&inner, id, &reported);
+                    }
                 }
             })
             .param(move |_seq, param_type, _index, _next, param| {
@@ -701,6 +705,16 @@ fn on_device_global(
         let inner = inner.clone();
         device
             .add_listener_local()
+            .info({
+                let inner = inner.clone();
+                move |info| {
+                    if !info.change_mask().contains(DeviceChangeMask::PARAMS) {
+                        return;
+                    }
+                    let reported = reported_params(info.params());
+                    reenumerate_device_params(&inner, id, &reported);
+                }
+            })
             .param(move |_seq, param_type, index, _next, param| {
                 let Some(param) = param else { return };
                 on_device_param(&inner, id, param_type, index, param);
@@ -725,6 +739,84 @@ fn on_device_global(
     debug!(id, "tracking an Audio/Device global");
 }
 
+/// Flatten an info event's param list into `(raw param id, is readable)`.
+fn reported_params(params: &[ParamInfo]) -> Vec<(u32, bool)> {
+    params
+        .iter()
+        .map(|p| (p.id().as_raw(), p.flags().contains(ParamInfoFlags::READ)))
+        .collect()
+}
+
+/// Which of the params we track an `info` event tells us to re-read.
+///
+/// pipewire-pulse's `device_event_info` re-enumerates a param when its
+/// `user`/serial counter moved; pipewire-rs 0.10's [`ParamInfo`] exposes only
+/// `id` and `flags`, so we re-enumerate every param we track that the server
+/// lists as READ-able. An info event with no param list at all falls back to
+/// re-reading everything we track.
+fn params_to_reenumerate(reported: &[(u32, bool)], wanted: &[ParamType]) -> Vec<ParamType> {
+    if reported.is_empty() {
+        return wanted.to_vec();
+    }
+    wanted
+        .iter()
+        .copied()
+        .filter(|want| {
+            reported
+                .iter()
+                .any(|(id, readable)| *readable && *id == want.as_raw())
+        })
+        .collect()
+}
+
+/// Re-read the route params a device's `info` event says have changed.
+///
+/// **`subscribe_params` does not deliver device param changes on PipeWire
+/// 1.6.2** — verified live on chronos: the whole `EnumRoute` + `Route`
+/// enumeration arrives twice at startup and then never again, while registry
+/// events keep flowing. `wpctl` and pipewire-pulse do not rely on it either;
+/// `module-protocol-pulse/manager.c`'s `device_event_info` reacts to the
+/// **`info` event**, walking `info.params()` and re-enumerating the changed
+/// READ-able ids itself. This is that, and it is what makes `Devices`/`Ports`
+/// reflect a `SetPort` or a volume change instead of freezing at startup values.
+/// The `subscribe_params` call is kept as well, in case a future server does
+/// deliver them — a duplicate enumeration is idempotent.
+fn reenumerate_device_params(inner: &Rc<RefCell<Inner>>, id: u32, reported: &[(u32, bool)]) {
+    let wanted = params_to_reenumerate(reported, &[ParamType::EnumRoute, ParamType::Route]);
+    if wanted.is_empty() {
+        return;
+    }
+    let guard = inner.borrow();
+    let Some(entry) = guard.devices.get(&id) else {
+        return;
+    };
+    for param_type in wanted {
+        debug!(id, ?param_type, "re-enumerating device param after info");
+        entry.proxy.enum_params(0, Some(param_type), 0, u32::MAX);
+    }
+}
+
+/// The node-side twin of [`reenumerate_device_params`], for `Props`.
+///
+/// Node `subscribe_params` *does* work on this server (v0.1 read stream and
+/// null-sink volumes back live), and the node listener already had an `info`
+/// hook — but it only read the props dict, never the param list. Gating on the
+/// PARAMS change mask makes this free: a `media.name` change sets PROPS, not
+/// PARAMS, so the constant churn from a music player does not trigger it.
+fn reenumerate_node_params(inner: &Rc<RefCell<Inner>>, id: u32, reported: &[(u32, bool)]) {
+    let wanted = params_to_reenumerate(reported, &[ParamType::Props]);
+    if wanted.is_empty() {
+        return;
+    }
+    let guard = inner.borrow();
+    let Some(entry) = guard.nodes.get(&id) else {
+        return;
+    };
+    for param_type in wanted {
+        entry.proxy.enum_params(0, Some(param_type), 0, u32::MAX);
+    }
+}
+
 /// An `EnumRoute` or `Route` param arrived for a bound device.
 ///
 /// PipeWire re-emits a whole enumeration starting at index 0, so index 0 is the
@@ -742,7 +834,12 @@ fn on_device_param(
         return;
     }
     let Some(raw) = parse_route(param) else {
-        debug!(id, ?param_type, index, "device param did not parse as a route");
+        debug!(
+            id,
+            ?param_type,
+            index,
+            "device param did not parse as a route"
+        );
         return;
     };
     debug!(
@@ -1509,6 +1606,61 @@ mod tests {
         assert!((volume.expect("volume") - 0.75).abs() < 1e-6);
         assert_eq!(mute, None);
         assert_eq!(channels, None);
+    }
+
+    /// Devices: `subscribe_params` is dead on PipeWire 1.6.2, so the `info`
+    /// event's param list is what drives re-reads. Only READ-able params we
+    /// actually track may come back.
+    #[test]
+    fn info_param_list_selects_what_to_reenumerate() {
+        let device_wanted = [ParamType::EnumRoute, ParamType::Route];
+
+        // The real chronos shape: a card lists Profile/EnumProfile/Route/
+        // EnumRoute/... — we must pick out exactly our two.
+        let reported = [
+            (ParamType::EnumProfile.as_raw(), true),
+            (ParamType::Profile.as_raw(), true),
+            (ParamType::EnumRoute.as_raw(), true),
+            (ParamType::Route.as_raw(), true),
+        ];
+        assert_eq!(
+            params_to_reenumerate(&reported, &device_wanted),
+            vec![ParamType::EnumRoute, ParamType::Route]
+        );
+
+        // A param the server does not mark readable is not re-enumerated.
+        let write_only = [
+            (ParamType::EnumRoute.as_raw(), true),
+            (ParamType::Route.as_raw(), false),
+        ];
+        assert_eq!(
+            params_to_reenumerate(&write_only, &device_wanted),
+            vec![ParamType::EnumRoute]
+        );
+
+        // A card with no routes at all asks for nothing.
+        let no_routes = [(ParamType::EnumProfile.as_raw(), true)];
+        assert!(params_to_reenumerate(&no_routes, &device_wanted).is_empty());
+
+        // An info event carrying no param list falls back to everything.
+        assert_eq!(
+            params_to_reenumerate(&[], &device_wanted),
+            vec![ParamType::EnumRoute, ParamType::Route]
+        );
+
+        // The node side tracks only Props.
+        let node_reported = [
+            (ParamType::Props.as_raw(), true),
+            (ParamType::Format.as_raw(), true),
+        ];
+        assert_eq!(
+            params_to_reenumerate(&node_reported, &[ParamType::Props]),
+            vec![ParamType::Props]
+        );
+        assert!(
+            params_to_reenumerate(&[(ParamType::Format.as_raw(), true)], &[ParamType::Props])
+                .is_empty()
+        );
     }
 
     /// The `Route` write of SPEC §6.1, round-tripped through libspa without a

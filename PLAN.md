@@ -52,6 +52,17 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
   `Devices`. 76 unit tests; build/test/clippy/fmt clean in `pipedeck-dev`.
 - ☐ Live verification on chronos once both sides are deployed together (see Handoffs).
 
+## Phase 5 — ports/routes + hardware volume (SPEC §6)  — **LIVE on chronos 2026-09-01 late evening**
+- ☑ Daemon: Audio/Device tracking, Route-param volume/mute for ALSA nodes, `SetPort`, `Ports`
+  property, `nick` on Devices; read-back via device `info`-driven re-enumeration (device
+  `subscribe_params` never delivers change events on PipeWire 1.6.2 — pipewire-pulse's pattern).
+- ☑ Extension v2: port rows "Headphones · ALC892 Analog" / "Line Out · ALC892 Analog", nick labels,
+  22em menu. Installed; **needs Jan's logout/login to load** (Wayland can't hot-reload extensions).
+- ☑ Live acceptance §6.3 6+7 on the real ALC892: set-port both ways (pactl Active Port follows),
+  vol 45 → wpctl 0.45, external wpctl change → pipedeck follows, mute round-trip, no warnings.
+- Note: HDMI sink (Dell AW3423DW) vanished from PipeWire mid-session — its route reports
+  `available: no`, WirePlumber removed the node. Card/monitor side, not PipeDeck.
+
 ## v1.1 (later)
 - ☐ EQ via filter-chain (SPEC §2.5), preset picker in panel, AutoEq importer.
 - ☐ Optional null sink `pipedeck.notifications`.
@@ -503,3 +514,55 @@ journalctl --user -u pipedeckd -f
 - **`status`, not just `outputs`/`inputs`, shows the active-port bracket.** They share one
   `device_line` renderer; SPEC §6.1 only asked for `outputs`, and splitting them to honour that
   literally would have been worse.
+
+
+### Phase 5 fix (daemon agent, 2026-09-01) — stale read-back after v0.2 live test
+
+**Symptom from chronos:** `set-port` and `vol` really took effect (pactl `Active Port` followed,
+`wpctl get-volume` = 0.45), but `Devices`/`Ports` kept their startup values until a daemon
+restart. Main session's debug lines showed the full `EnumRoute` + `Route` enumeration arriving
+*twice* at startup and then no device param event ever again, while registry events kept flowing.
+
+**Cause:** on PipeWire 1.6.2, `Device::subscribe_params` does not deliver change notifications.
+`wpctl` and pipewire-pulse do not rely on it either — `module-protocol-pulse/manager.c`'s
+`device_event_info` reacts to the **`info` event**, walking `info.params()` and re-enumerating the
+changed READ-able ids itself.
+
+**Fix, in `crates/pipedeckd/src/pw.rs` only:**
+- `on_device_global` now registers an `.info(...)` listener alongside `.param(...)`. When
+  `change_mask` contains `DeviceChangeMask::PARAMS` it walks `info.params()` and re-issues
+  `enum_params(0, Some(EnumRoute|Route), 0, u32::MAX)` for the ids reported readable.
+  `subscribe_params` is deliberately **kept** — a duplicate enumeration is idempotent, so a future
+  server that does deliver them costs nothing.
+- pipewire-rs 0.10's `ParamInfo` exposes only `id()` and `flags()`, **not** the `user`/serial
+  counter pulse diffs against, so every tracked READ-able param is re-enumerated on a PARAMS-masked
+  info event (the coordinator's documented fallback). An info event carrying no param list at all
+  falls back to re-reading everything we track. The rule is the pure, unit-tested
+  `params_to_reenumerate`.
+- **Node side, checked by reading rather than assumed:** the node listener already had an `.info()`
+  hook, but it only read the props *dict* — `Props` read-back rested entirely on
+  `subscribe_params`, which demonstrably works for nodes (v0.1 read stream and null-sink volumes
+  back live). The same PARAMS-gated re-enum was added anyway as belt-and-braces; it is free
+  because a `media.name` change sets the PROPS mask, not PARAMS, so a music player's constant
+  churn does not trigger it.
+- `index == 0` clearing semantics are unchanged, and now do real work: each info-driven
+  re-enumeration restarts at index 0 and rebuilds the table rather than appending to it.
+- The main session's `debug!` lines in `on_device_param` are kept as-is; two more were added
+  (`"re-enumerating device param after info"`) so the next live run shows the loop closing.
+
+**Checks:** build / test (**77 tests**, +1 for `info_param_list_selects_what_to_reenumerate`) /
+`clippy --all-targets -D warnings` / `fmt --check` all clean in `pipedeck-dev`. No new
+dependencies; `Cargo.lock` untouched.
+
+**What to re-test live:** everything in the Phase 5 list above still applies, but the three that
+actually prove this fix are —
+```bash
+pipedeck ports                                     # note the active port
+pipedeck set-port <analog sink id> analog-output-lineout
+pipedeck ports                                     # `*` must MOVE, with no restart
+pipedeck vol <analog sink id> 45 && pipedeck outputs   # must read back 45%, not 40%
+wpctl set-volume <analog sink id> 0.30 && pipedeck outputs  # external change must land too
+```
+If read-back is still stale, `RUST_LOG=debug` and look for `re-enumerating device param after
+info`: no such line means the device `info` event itself is not firing with the PARAMS mask, and
+the next fallback is a timer-free re-enum on every info event regardless of `change_mask`.

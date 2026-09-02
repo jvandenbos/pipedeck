@@ -220,3 +220,102 @@ when `route.devices` contains the node's `card.profile.device` and `route.direct
    `pactl list sinks | grep "Active Port"` follows; back again with `analog-output-headphones`.
 7. `pipedeck vol 39 45` changes `wpctl get-volume 39` to 0.45 on the real card (was ignored in v0.1).
 8. Panel shows "Headphones · …", "Line Out · …", "Dell AW3423DW (HDMI)" as three output rows.
+
+## 7. v1.1 — EQ presets (2026-09-02) — supersedes §2.5
+
+**Verified on chronos:** WirePlumber 0.5.13 implements **smart filters**
+(`/usr/share/wireplumber/scripts/lib/filter-utils.lua`; docs: wireplumber → Policies → Smart
+Filters), and `libpipewire-module-filter-chain` is present. Design:
+
+### 7.1 Mechanism — one smart filter-chain per EQ'd output, controls updated live
+- The daemon loads `libpipewire-module-filter-chain` **into its own PipeWire context**
+  (`pipewire_sys::pw_context_load_module(context.as_raw_ptr(), "libpipewire-module-filter-chain",
+  <args JSON>, null)` — pipewire-rs 0.10 has no safe wrapper; keep the `unsafe` in `pw.rs`, hold the
+  returned `*mut pw_impl_module` and `pw_impl_module_destroy` it on EQ removal/shutdown). The DSP
+  runs in the daemon process like EasyEffects does; client.conf loads module-rt for us.
+- Module args (one instance per target sink, `<sink>` = target `node.name`):
+  ```
+  { node.description = "PipeDeck EQ: <nick>"   media.name = "PipeDeck EQ"
+    filter.graph = {
+      nodes = [
+        { type = builtin label = linear      name = pre  control = { "Mult" = 1.0 "Add" = 0.0 } }
+        { type = builtin label = bq_lowshelf  name = ls   control = { "Freq" = 100 "Q" = 0.707 "Gain" = 0 } }
+        { type = builtin label = bq_peaking   name = p1   control = { "Freq" = 1000 "Q" = 1.0 "Gain" = 0 } }
+        … p2 … p12 (same, Gain 0) …
+        { type = builtin label = bq_highshelf name = hs   control = { "Freq" = 10000 "Q" = 0.707 "Gain" = 0 } }
+      ]
+      links = [ pre:Out→ls:In, ls:Out→p1:In, p1:Out→p2:In, … p12:Out→hs:In ]
+      inputs = [ "pre:In" ] outputs = [ "hs:Out" ]        # 1-in/1-out → duplicated per channel
+    }
+    audio.channels = <n>  audio.position = <target's audio.position>
+    capture.props  = { node.name = "pipedeck.eq.<sink>"  media.class = Audio/Sink
+                       node.link-group = "pipedeck-eq-<sink>"  pipedeck.eq = true
+                       filter.smart = true  filter.smart.name = "pipedeck-eq-<sink>"
+                       filter.smart.target = { node.name = "<sink>" } }
+    playback.props = { node.name = "pipedeck.eq.<sink>.out"  node.passive = true
+                       node.link-group = "pipedeck-eq-<sink>"  pipedeck.eq = true
+                       stream.dont-remix = true  target.object = "<sink>" }
+  }
+  ```
+  With `filter.smart = true`, WirePlumber links every stream that targets `<sink>` through the
+  filter **transparently** — the real sink stays the default, ports/volume/notifications all keep
+  working, nothing new to select. (Verify: `pw-link -l` shows stream→pipedeck.eq.<sink> and
+  pipedeck.eq.<sink>.out→<sink>.)
+- **Preset apply = one `Props` param write** on the filter's main node:
+  `Object(Props){ params: Struct[ "pre:Mult", <f>, "ls:Freq", <f>, "ls:Q", <f>, "ls:Gain", <f>, "p1:Freq", … ] }`
+  (filter-chain's documented runtime-control interface; the `params` prop is a Struct of
+  alternating string/float). Unused bands get `Gain = 0` (a 0 dB peaking biquad is flat).
+  Preamp: `pre:Mult = 10^(preamp_db/20)`.
+- **EQ off** for a sink = set `filter.smart.disabled = true` on the main node via the WirePlumber
+  **`filters` metadata** (`metadata name=filters`, subject = main node id, key
+  `filter.smart.disabled`, type `Spa:String:JSON`, value `true`) — instant re-link, no reload;
+  `false` re-enables. Unload the module only when the sink disappears or on shutdown.
+- The daemon **hides** nodes carrying `pipedeck.eq = true` (or `node.link-group` starting with
+  `pipedeck-eq-`) from `Devices`/`Streams`, and never lets them become the notification sink.
+- Persisted in config: `[eq]` table, `"<sink node.name>" = "<preset name>"`; re-applied on startup
+  and when the sink (re)appears. Unknown preset name → log warn, treat as off.
+
+### 7.2 Preset files — `~/.config/pipedeck/eq/<slug>.toml`
+```toml
+name = "Sennheiser HD 650 (AutoEq)"
+preamp_db = -6.4
+[[band]]
+type = "lowshelf"      # lowshelf | peaking | highshelf
+freq = 105.0
+q = 0.7
+gain_db = 5.1
+```
+Max 1 lowshelf + 12 peaking + 1 highshelf; the importer drops extras with a warning. Preset
+`name` is the display name; the file stem is the id used in config/D-Bus.
+
+**AutoEq importer** (pure Rust in the CLI): `pipedeck eq import <ParametricEQ.txt> [--name N]`
+parses `Preamp: -6.4 dB` and `Filter 1: ON PK Fc 105 Hz Gain 5.1 dB Q 0.70` lines
+(`PK`→peaking, `LSC`/`LS`→lowshelf, `HSC`/`HS`→highshelf; `OFF` filters skipped), writes the
+TOML, prints the id. Unit-tested against a real AutoEq sample embedded in the test.
+
+### 7.3 D-Bus additions (interface `dev.pipedeck.Daemon1`, existing signatures unchanged)
+```
+Properties:
+  EqPresets   a(ss)    (id, name) — scanned from the presets dir (rescanned on Refresh and on SetEq)
+  Eq          a(us)    (node_id, preset id or "") — one row per output device
+Methods:
+  SetEq(node_id u, preset s)     "" = off. NotFound for unknown node/preset; InvalidArgument for
+                                 non-sink / non-device nodes.
+```
+CLI: `pipedeck eq list`, `pipedeck eq show <id>`, `pipedeck eq set <node id> <preset id|off>`,
+`pipedeck eq import …`; `outputs` shows `{eq: <name>}` after the port bracket when active.
+
+### 7.4 Extension
+New section **Equalizer** after Notifications: "Off" + one row per preset (name), applied to the
+**current default output**; ornament on the active one; hidden entirely when `EqPresets` is
+empty. Subtitle unchanged.
+
+### 7.5 Acceptance
+9. `pipedeck eq import hd650.txt` → preset listed; `pipedeck eq set 39 hd650` → `pw-link -l` shows
+   the smart filter inserted for a playing stream, `pipedeck outputs` shows `{eq: …}`, and the
+   default sink is still the real sink (`wpctl status`). Audible difference with a strong test
+   preset (e.g. +12 dB lowshelf).
+10. `pipedeck eq set 39 off` → links go direct again, no stutter beyond the re-link.
+11. Restart daemon → EQ re-applied from config; remove the sink (or restart pipewire) → no crash,
+    re-applied when it returns.
+12. Panel: Equalizer section switches presets on the default output.

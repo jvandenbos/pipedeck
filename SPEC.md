@@ -162,3 +162,60 @@ Thin client for scripting and testing without the Shell: `pipedeck status`, `pip
 4. Extension shows the three pickers + per-app sliders in Quick Settings; switching in the panel
    changes the daemon state and vice-versa within 200 ms.
 5. Killing the daemon leaves the Shell healthy; restarting it re-applies notification routing.
+
+## 6. v1.0.1 addendum — ports (routes) and hardware volume (2026-09-01, from live chronos)
+
+**Finding:** chronos's motherboard codec (ALC892) exposes ONE sink
+`alsa_output.pci-0000_28_00.4.analog-stereo` with two output **ports**: `analog-output-lineout`
+"Line Out" (speakers) and `analog-output-headphones` "Headphones". Switching between them is a
+**device `Route` param** change on the ALSA card (`Audio/Device` object, id 53 today), not a
+different sink. Also: **on ALSA-backed sinks WirePlumber owns volume via the Route param** —
+writing the node's `Props` (v0.1) is ignored (`wpctl get-volume` stays put). Streams and virtual
+sinks still take node `Props`. Live data (`pw-dump 53`):
+```
+EnumRoute: index 3 Output analog-output-lineout "Line Out" priority 9000 available yes devices [4,5,…]
+           index 4 Output analog-output-headphones "Headphones" priority 9900 available yes devices [4]
+           index 0 Input  analog-input-front-mic "Front Microphone" … devices [0]   (+ rear-mic, linein: available no)
+Route (active): index 4 device 4 props {mute:false, channelVolumes:[0.064,0.064]}   ← 40 % cubic
+                index 0 device 0 …
+```
+The sink node carries `device.id = "53"` and `card.profile.device = "4"`; a route applies to a node
+when `route.devices` contains the node's `card.profile.device` and `route.direction` matches
+(Output ↔ sink, Input ↔ source).
+
+### 6.1 Daemon changes
+- Track `Audio/Device` globals: bind `Device`, `subscribe_params([EnumRoute, Route])`, keep per
+  device the route list + the active route per profile-device index. Link nodes → device by
+  `device.id`/`card.profile.device`.
+- **Volume/mute on a node that has a device route** → set the device `Route` param:
+  `Object(Route){ index: <active route index>, device: <card.profile.device>,
+  props: Object(Props){ channelVolumes: [v; channels], mute }, save: true }`. Nodes without a
+  route (streams, null/virtual sinks, EQ sinks) keep the v0.1 node-`Props` path. Read volume back
+  from the Route's `props` for routed nodes (that is what wpctl shows).
+- **SetPort(node_id u, route_index u)** → `Object(Route){ index, device: <card.profile.device>,
+  save: true }` on the device (no props). Reject unknown/unavailable/mismatched-direction routes
+  with `InvalidArgument`.
+- New property **`Ports a(uussbb)`** = `(node_id, route_index, name, description, available, active)`,
+  one row per applicable route per node (only nodes that have a device; include `available: false`
+  rows — the panel hides them, the CLI shows them dimmed). Emits `PropertiesChanged` + `Changed`
+  like the others.
+- Existing `Devices`/`Streams` signatures and all v1 methods are **unchanged**.
+- CLI: `pipedeck ports`, `pipedeck set-port <node id> <route name|index>`; `outputs` shows the
+  active port in brackets after the description when the node has >1 port.
+
+### 6.2 Extension changes
+- Output and Input sections render **one row per selectable port**: for a node with ≥2
+  `available` ports, rows are `"<port description> · <node description>"` (e.g.
+  "Headphones · Starship/Matisse HD Audio Controller"), each checked only when the node is default
+  AND that port is active; nodes with ≤1 available port render as today (node description).
+- Selecting a port row: `SetDefault(kind, name)` if not default, then `SetPort(id, index)` if not
+  active. Selecting a plain node row: `SetDefault` only.
+- Notifications section stays sink-level (ports are a property of the sink, and this card can
+  drive only one port at a time).
+- `dbus.js` gains `Ports` + `SetPort` exactly as in §6.1.
+
+### 6.3 Acceptance additions
+6. `pipedeck set-port 39 analog-output-lineout` moves sound from headphones to speakers and
+   `pactl list sinks | grep "Active Port"` follows; back again with `analog-output-headphones`.
+7. `pipedeck vol 39 45` changes `wpctl get-volume 39` to 0.45 on the real card (was ignored in v0.1).
+8. Panel shows "Headphones · …", "Line Out · …", "Dell AW3423DW (HDMI)" as three output rows.

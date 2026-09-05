@@ -1,14 +1,19 @@
 # PipeDeck
 
-SoundSource-style audio control for PipeWire desktops. A compact menu-bar panel for GNOME Shell that provides output/input/notification device selection and per-application volume control.
+SoundSource-style audio control for PipeWire desktops: a Quick Settings panel for GNOME Shell with output / input / **notification** device pickers, headphone-vs-speaker port switching, per-application volume, and a parametric equalizer with AutoEq import — built on nothing but libpipewire, WirePlumber and the GNOME Shell APIs.
+
+> **Status:** v1.1.0, first public release. Developed and tested on one machine (Ubuntu 26.04.1,
+> GNOME Shell 50.1, PipeWire 1.6.2, WirePlumber 0.5.13, Realtek ALC892 + NVIDIA HDMI). Reports from
+> other cards, Bluetooth devices and multi-channel outputs are welcome. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Features
 
 - **Output device picker** — Select the default audio output sink
 - **Input device picker** — Select the default audio input source  
 - **Notification device picker** — Route notification/event sounds independently (unique to PipeDeck)
+- **Ports** — Headphones, Line Out, HDMI… listed as separate rows even when they are ports of one card
 - **Per-application volume sliders** — Control volume and mute for every playback stream
-- **Equalizer presets** — Apply parametric EQ via PipeWire's filter-chain module (v1.1)
+- **Equalizer presets** — Parametric EQ per output via PipeWire's filter-chain, inserted transparently by WirePlumber as a smart filter; import headphone corrections straight from [AutoEq](https://github.com/jaakkopasanen/AutoEq)
 - **Menu-bar integration** — Built into GNOME Quick Settings for quick access
 
 Future (v1.2):
@@ -27,11 +32,9 @@ pipedeck CLI (Rust, same crate) ─────┘
 
 ## Requirements
 
-- **OS**: Ubuntu 26.04 LTS or compatible
-- **Desktop**: GNOME 50+ (Wayland or X11)
-- **PipeWire**: 1.0 or later
-- **WirePlumber**: 0.5 or later
-- **Rust**: 1.70+ (for building from source)
+- **PipeWire** 1.0 or later (1.6 tested) and **WirePlumber** 0.5 or later (smart filters are needed for the EQ)
+- **GNOME Shell 50** for the panel (the daemon and CLI work on any desktop)
+- **Rust** 1.85+ with `libpipewire-0.3-dev`, `libclang-dev`, `pkg-config` to build (Ubuntu 26.04: `sudo apt install cargo rustc libpipewire-0.3-dev libclang-dev clang pkg-config build-essential`)
 
 No dependency on EasyEffects, pavucontrol, or other external audio tools — PipeDeck uses only platform libraries (libpipewire, WirePlumber metadata, GNOME Shell APIs).
 
@@ -327,3 +330,16 @@ See LICENSE file for details.
 
 - [SPEC.md](SPEC.md) — Full specification
 - [CLAUDE.md](CLAUDE.md) — Developer notes
+
+## Documentation
+
+- [SPEC.md](SPEC.md) — the design contract: graph model, D-Bus interface, ports, EQ mechanism, acceptance tests
+- [PLAN.md](PLAN.md) — work log, live-test notes and the gotchas found on real hardware
+- [CHANGELOG.md](CHANGELOG.md) — release history
+
+## How it was built
+
+PipeDeck was specified and integration-tested by a person driving Claude Code, with the daemon,
+extension and packaging written by parallel agent sessions against `SPEC.md`. Every mechanism the
+agents could not verify without a live PipeWire graph was tested on real hardware afterwards; the
+bugs that only showed up there are recorded in `PLAN.md` and `CLAUDE.md`.

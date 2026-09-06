@@ -92,6 +92,13 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
   `pw-link` to `<sink>:monitor_*` by hand.
 - ☐ Panel §7.5.12 — Jan's logout/login pending (extension v3 installed + enabled).
 
+## v1.2 ideas (from first real use, 2026-09-05)
+- **ALSA Auto-Mute Mode.** On Realtek codecs, `Auto-Mute Mode = Enabled` hard-mutes Line Out while
+  a headphone plug is present, so selecting the Line Out port produces silence. Not fixable via
+  PipeWire routes; it is an ALSA mixer enum. Options: detect it (alsa-lib `snd_mixer` on the
+  card behind the sink) and (a) warn in the panel, or (b) offer "let both jacks play" that sets it
+  Disabled + persists. Workaround today: `amixer -c <card> sset "Auto-Mute Mode" Disabled; sudo alsactl store`.
+
 ## v1.1 (later)
 - ☑ EQ via filter-chain (SPEC §7) — both sides code-complete, untested on a live graph (Phase 6).
 - ☐ Optional null sink `pipedeck.notifications`.

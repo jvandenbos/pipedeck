@@ -369,3 +369,31 @@ the control is `amixer -c 1 cget name='Auto-Mute Mode'` (ENUMERATED, items Disab
     off) and speakers play. Selecting Headphones afterwards leaves it Disabled.
 15. Restart daemon → stored choice re-applied even after `amixer … Enabled` in between.
 16. Panel: the switch row appears under the ALC892 rows and follows/controls the state.
+
+## 9. v1.3 — loudness safety (2026-09-06)
+
+Two rules, both about never making an output louder than the user meant.
+
+### 9.1 Volume and mute writes are independent
+`SetVolume` on a routed (ALSA) node writes **only** `channelVolumes` into the Route props;
+`SetMute` writes **only** `mute`. Never carry the daemon's cached value of the other field —
+a stale cache could undo a mute made elsewhere (keyboard key, GNOME slider) a few ms earlier.
+Same rule for node `Props` writes on non-routed nodes and streams. PipeWire/ACP apply each Route
+property independently, so partial objects are valid. Unit test: the pod built for a volume write
+contains no `mute` key, and vice-versa.
+
+### 9.2 Port-switch level cap
+WirePlumber restores volume **per port**, so switching Headphones (40 %) → Line Out (82 %) jumps
+to 82 %. After a `SetPort` issued by PipeDeck, once the device re-enumerates and the requested
+route is active, if that route's level exceeds `safety.port_switch_max_percent` (cubic scale,
+default **60**, `0` = off), clamp it to the cap with a volume-only Route write and `info!` it.
+Only PipeDeck-initiated switches are capped (never fight GNOME/WirePlumber on external changes).
+Config: `[safety] port_switch_max_percent = 60`. CLI: `pipedeck cap` (show), `pipedeck cap <0-150|off>`
+(set + persist). No D-Bus surface needed in v1.3 (config-driven).
+
+### 9.3 Acceptance
+17. `wpctl set-volume <sink> 0.9`, port = Headphones; `pipedeck set-port <sink> analog-output-lineout`
+    with Line Out stored at 82 % → after the switch `wpctl get-volume` reads 0.60 and the journal
+    shows the clamp line. Switch back with Headphones stored at 0.40 → untouched (below cap).
+18. `pipedeck cap off`; repeat → 0.82 untouched. `pipedeck cap 60` restores.
+19. `pipedeck mute <id> on`, then `pipedeck vol <id> 45` → `wpctl get-volume` shows 0.45 **[MUTED]**.

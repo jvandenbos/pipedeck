@@ -3,6 +3,23 @@
 All notable changes to PipeDeck. Versions follow [Semantic Versioning](https://semver.org);
 milestones map to the numbered sections of `SPEC.md`.
 
+## [1.2.0] — 2026-09-06
+
+### Added
+- **ALSA auto-mute detection and switch** (SPEC §8). Realtek-style codecs have a mixer enum
+  `Auto-Mute Mode` that silences line-out whenever a headphone plug is present, so selecting the
+  speaker port produced silence. The daemon now reads it through alsa-lib, flips it off
+  automatically when a speaker port is selected while headphones are plugged in (policy `auto`),
+  persists the choice per card in `[alsa.auto_mute]` and re-applies it after reboots.
+  `AutoMute` property, `SetAutoMute`, `pipedeck automute [<id> on|off]`, `[auto-mute]` tag.
+- Panel: "Auto-mute speakers when headphones are plugged in" switch under the device's port rows.
+
+### Fixed
+- Extension: use `GioUnix.DesktopAppInfo` on GNOME 50 (silences a per-rebuild deprecation trace).
+
+### Build
+- `libasound2-dev` is now required to build (runtime needs only `libasound.so.2`).
+
 ## [1.1.0] — 2026-09-05
 
 First public release.
@@ -52,6 +69,7 @@ First public release.
   volume sliders.
 - Docker dev image mirroring the target (Ubuntu 26.04, PipeWire 1.6, Rust 1.93).
 
-[1.1.0]: https://github.com/jvandenbos/pipedeck/releases/tag/v1.1.0
+[1.2.0]: https://github.com/jvandenbos/pipedeck/releases/tag/v1.2.0
+[1.1.0]: https://github.com/jvandenbos/pipedeck/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/jvandenbos/pipedeck/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jvandenbos/pipedeck/commits/v1.0.0

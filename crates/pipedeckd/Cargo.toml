@@ -16,6 +16,7 @@ name = "pipedeckd"
 path = "src/main.rs"
 
 [dependencies]
+alsa = "0.12"
 anyhow.workspace = true
 futures-util.workspace = true
 libspa = "0.10"

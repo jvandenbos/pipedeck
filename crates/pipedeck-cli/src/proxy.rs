@@ -4,7 +4,7 @@
 //! `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`.
 
 use pipedeckd::route::PortTuple;
-use pipedeckd::state::{DeviceTuple, EqPresetTuple, EqTuple, StreamTuple};
+use pipedeckd::state::{AutoMuteTuple, DeviceTuple, EqPresetTuple, EqTuple, StreamTuple};
 
 #[zbus::proxy(
     interface = "dev.pipedeck.Daemon1",
@@ -31,6 +31,10 @@ pub trait Daemon {
     /// The EQ preset on each output device: `(node_id, preset id or "")`.
     #[zbus(property)]
     fn eq(&self) -> zbus::Result<Vec<EqTuple>>;
+
+    /// ALSA `Auto-Mute Mode`: `(node_id, enabled)`, one row per sink whose card has it.
+    #[zbus(property)]
+    fn auto_mute(&self) -> zbus::Result<Vec<AutoMuteTuple>>;
 
     /// `node.name` of the notification sink, or "" to follow the default output.
     #[zbus(property)]
@@ -60,6 +64,9 @@ pub trait Daemon {
 
     /// Apply an EQ preset to an output device; "" turns EQ off.
     fn set_eq(&self, node_id: u32, preset: &str) -> zbus::Result<()>;
+
+    /// Turn ALSA `Auto-Mute Mode` on or off for the card behind an output device.
+    fn set_auto_mute(&self, node_id: u32, enabled: bool) -> zbus::Result<()>;
 
     /// Re-read the graph.
     fn refresh(&self) -> zbus::Result<()>;

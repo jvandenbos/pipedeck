@@ -7,7 +7,7 @@
 //! called from the tokio side.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -44,7 +44,7 @@ use crate::route::{
     self, ActiveRoute, Availability, DeviceRoutes, Port, Route as CardRoute, RouteDirection,
     RouteProps,
 };
-use crate::state::{Device, DeviceKind, State, Stream};
+use crate::state::{AlsaCard, Device, DeviceKind, State, Stream};
 use crate::volume::clamp_volume;
 
 /// Node property keys we read off registry globals.
@@ -68,6 +68,29 @@ mod keys {
     pub const NODE_LINK_GROUP: &str = "node.link-group";
     pub const AUDIO_CHANNELS: &str = "audio.channels";
     pub const AUDIO_POSITION: &str = "audio.position";
+    /// ALSA card index behind a sink (SPEC §8.1). Node `info` only.
+    pub const ALSA_CARD: &str = "alsa.card";
+    /// Card name keys, best first. Node `info` only, like `alsa.card`.
+    pub const ALSA_CARD_NAMES: [&str; 4] = [
+        "alsa.card_name",
+        "api.alsa.card.name",
+        "alsa.long_card_name",
+        "api.alsa.card.longname",
+    ];
+}
+
+/// Pull the ALSA card index and name out of a node's props (SPEC §8.1).
+///
+/// None of these keys are in the registry global's property whitelist — they
+/// only arrive in the node `info` event, the same trap the EQ node detection
+/// fell into on 2026-09-02.
+fn alsa_card_from(props: &spa::utils::dict::DictRef) -> Option<AlsaCard> {
+    let index: u32 = props.get(keys::ALSA_CARD)?.trim().parse().ok()?;
+    let name = keys::ALSA_CARD_NAMES
+        .iter()
+        .find_map(|key| props.get(key).map(str::trim).filter(|s| !s.is_empty()))
+        .map_or_else(|| crate::alsa_mixer::card_device(index), str::to_owned);
+    Some(AlsaCard { index, name })
 }
 
 /// `media.class` of the card objects that own routes (SPEC §6.1).
@@ -139,6 +162,9 @@ struct NodeEntry {
     audio_channels: Option<usize>,
     /// `audio.position`, split into channel names.
     audio_position: Vec<String>,
+    /// The ALSA card behind this node, from `alsa.card` + a card-name key
+    /// (SPEC §8.1). Both only ever arrive in the node `info` event.
+    alsa_card: Option<AlsaCard>,
     volume: f64,
     mute: bool,
 }
@@ -318,6 +344,7 @@ impl Inner {
 
         let mut ports: Vec<Port> = Vec::new();
         let mut eq_rows: Vec<(u32, String)> = Vec::new();
+        let mut cards: BTreeMap<u32, AlsaCard> = BTreeMap::new();
 
         for (id, entry) in &self.nodes {
             // SPEC §7.1: our own filter-chain nodes are tracked (we write their
@@ -333,6 +360,14 @@ impl Inner {
                 let mut mute = entry.mute;
                 if let Some((_, card_profile_device, routes)) = self.node_device(entry) {
                     ports.extend(routes.ports_for(*id, kind, card_profile_device));
+                    // SPEC §8.1: only port-capable *sinks* get a card row —
+                    // auto-mute is an output-side control, and a node with no
+                    // routes has no port for the policy to react to.
+                    if kind == DeviceKind::Sink {
+                        if let Some(card) = entry.alsa_card.clone() {
+                            cards.insert(*id, card);
+                        }
+                    }
                     if let Some(active) = routes.active_for(card_profile_device) {
                         if let Some(v) = active.props.volume {
                             volume = v;
@@ -378,6 +413,7 @@ impl Inner {
         }
         ports.sort_by_key(|p| (p.node_id, p.index));
         state.ports = ports;
+        state.cards = cards;
         eq_rows.sort_by_key(|(id, _)| *id);
         state.eq = eq_rows;
         state.refresh_defaults();
@@ -1039,6 +1075,9 @@ fn on_node_global(
             .get(keys::AUDIO_POSITION)
             .map(eq::parse_positions)
             .unwrap_or_default(),
+        // Almost certainly `None` here — see `alsa_card_from`; `on_node_info`
+        // is where this actually gets filled in.
+        alsa_card: alsa_card_from(props),
         volume: 1.0,
         mute: false,
     };
@@ -1412,6 +1451,13 @@ fn on_node_info(inner: &Rc<RefCell<Inner>>, id: u32, props: &spa::utils::dict::D
     {
         if entry.card_profile_device != Some(value) {
             entry.card_profile_device = Some(value);
+            changed = true;
+        }
+    }
+    // SPEC §8.1: `alsa.card` and the card-name keys are node-`info`-only too.
+    if let Some(card) = alsa_card_from(props) {
+        if entry.alsa_card.as_ref() != Some(&card) {
+            entry.alsa_card = Some(card);
             changed = true;
         }
     }

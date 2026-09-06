@@ -14,20 +14,22 @@ export const OBJECT_PATH = '/dev/pipedeck/Daemon';
 export const INTERFACE_NAME = 'dev.pipedeck.Daemon1';
 
 // Wire types, per SPEC §2.2, the §6.1 ports addendum, the §7.3 EQ addendum,
-// and a live-testing fix on chronos (2026-09-01) that added a trailing
-// `nick` field to Devices:
+// the §8.1 auto-mute addendum, and a live-testing fix on chronos
+// (2026-09-01) that added a trailing `nick` field to Devices:
 //   Devices     a(usssbbdbs) (id, name, description, kind, is_default, virtual, volume, mute, nick)
 //   Streams     a(ussssdb)   (id, app_name, binary, media_name, target_name, volume, mute)
 //   Ports       a(uussbb)    (node_id, route_index, name, description, available, active)
 //   EqPresets   a(ss)        (id, name) -- scanned from the presets dir
 //   Eq          a(us)        (node_id, preset id or "") -- one row per output device
+//   AutoMute    a(ub)        (node_id, enabled) -- one row per sink whose card has an
+//                            Auto-Mute Mode ALSA control (SPEC §8.1)
 // `unpackDevice` in extension.js destructures `nick` positionally and falls
 // back to `description` when it's absent (an 8-field tuple from an older
 // daemon build, or an empty string), so this is safe against either wire
-// shape. `EqPresets`/`Eq` are absent entirely on a pre-§7.3 daemon; the
-// generated proxy just leaves those cached properties undefined, and
-// extension.js treats that the same as "no presets" (Equalizer section
-// hidden) rather than throwing.
+// shape. `EqPresets`/`Eq`/`AutoMute` are absent entirely on an older daemon
+// that predates them; the generated proxy just leaves those cached
+// properties undefined, and extension.js treats that the same as "nothing
+// to show" (relevant section/row hidden) rather than throwing.
 export const DaemonInterfaceXml = `
 <node>
   <interface name="dev.pipedeck.Daemon1">
@@ -37,6 +39,7 @@ export const DaemonInterfaceXml = `
     <property name="Ports" type="a(uussbb)" access="read"/>
     <property name="EqPresets" type="a(ss)" access="read"/>
     <property name="Eq" type="a(us)" access="read"/>
+    <property name="AutoMute" type="a(ub)" access="read"/>
     <property name="Version" type="s" access="read"/>
 
     <method name="SetDefault">
@@ -65,6 +68,10 @@ export const DaemonInterfaceXml = `
     <method name="SetEq">
       <arg type="u" name="node_id" direction="in"/>
       <arg type="s" name="preset" direction="in"/>
+    </method>
+    <method name="SetAutoMute">
+      <arg type="u" name="node_id" direction="in"/>
+      <arg type="b" name="enabled" direction="in"/>
     </method>
     <method name="Refresh"/>
 

@@ -6,20 +6,31 @@
 //! carries doc comments.
 #![allow(missing_docs)]
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::{oneshot, watch, Mutex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use zbus::object_server::SignalEmitter;
 
+use crate::alsa_mixer;
 use crate::command::{await_reply, Command};
 use crate::config::Config;
 use crate::eq::{self, Preset};
 use crate::error::{Error, Result};
 use crate::pw::PwHandle;
 use crate::route::PortTuple;
-use crate::state::{DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, State, StreamTuple};
+use crate::state::{
+    AlsaCard, AutoMuteTuple, DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, State, StreamTuple,
+};
 use crate::volume::clamp_volume;
+
+/// `Auto-Mute Mode` probe results, by ALSA card index (SPEC §8.1).
+///
+/// `Some(enabled)` is a card with the control; `None` is a card without one.
+/// The negative is cached deliberately: without it every graph change would
+/// re-open the mixer of every card that can never answer.
+pub type AutoMuteCache = BTreeMap<u32, Option<bool>>;
 
 /// Well-known bus name the daemon owns.
 pub const BUS_NAME: &str = "dev.pipedeck.Daemon";
@@ -41,6 +52,10 @@ pub struct Daemon {
     presets: Arc<RwLock<Vec<Preset>>>,
     /// Where presets are scanned from; `None` disables rescanning.
     presets_dir: Option<std::path::PathBuf>,
+    /// Cached `Auto-Mute Mode` state per ALSA card (SPEC §8.1). Only ever
+    /// touched from the tokio side; the mixer reads and writes behind it run on
+    /// `spawn_blocking`, never on the PipeWire thread.
+    auto_mute_cache: Arc<Mutex<AutoMuteCache>>,
 }
 
 impl Daemon {
@@ -61,6 +76,7 @@ impl Daemon {
             config_path,
             presets,
             presets_dir,
+            auto_mute_cache: Arc::new(Mutex::new(AutoMuteCache::new())),
         }
     }
 
@@ -123,6 +139,282 @@ impl Daemon {
         }
     }
 
+    // -----------------------------------------------------------------
+    // ALSA auto-mute (SPEC §8.1)
+    // -----------------------------------------------------------------
+
+    /// The `AutoMute` property payload: one row per sink whose card has the
+    /// control, ordered by node id.
+    ///
+    /// Pure, so the projection can be tested without a mixer.
+    #[must_use]
+    fn auto_mute_rows(
+        cards: &BTreeMap<u32, AlsaCard>,
+        cache: &AutoMuteCache,
+    ) -> Vec<AutoMuteTuple> {
+        cards
+            .iter()
+            .filter_map(|(node_id, card)| {
+                cache
+                    .get(&card.index)
+                    .copied()
+                    .flatten()
+                    .map(|enabled| (*node_id, enabled))
+            })
+            .collect()
+    }
+
+    /// The distinct ALSA cards behind the snapshot's sinks, index -> name.
+    ///
+    /// Two sinks on one card (rare, but real on split codecs) collapse to one
+    /// entry — the mixer control is per card, not per sink.
+    #[must_use]
+    fn snapshot_cards(state: &State) -> BTreeMap<u32, String> {
+        state
+            .cards
+            .values()
+            .map(|card| (card.index, card.name.clone()))
+            .collect()
+    }
+
+    /// Bring the auto-mute cache in step with the graph (SPEC §8.1).
+    ///
+    /// `force` re-probes every card the graph still has; otherwise only cards
+    /// that are not in the cache yet are probed — which is precisely "a routed
+    /// sink appeared", and, on the first run after startup, "startup".
+    ///
+    /// A **newly discovered** card also has its persisted choice re-applied,
+    /// because `alsa-restore` puts the boot-time value back on every login. A
+    /// forced re-probe deliberately does *not* re-apply: acceptance §8.3 14
+    /// turns the control back on with `amixer` and then expects `SetPort` to be
+    /// what turns it off again, so a re-probe must observe, never correct.
+    ///
+    /// Returns true when the published rows changed.
+    async fn sync_auto_mute(&self, force: bool) -> bool {
+        let wanted = Self::snapshot_cards(&self.snapshot());
+        let stored: BTreeMap<String, bool> = self
+            .config
+            .lock()
+            .await
+            .auto_mute_entries()
+            .into_iter()
+            .collect();
+
+        let mut cache = self.auto_mute_cache.lock().await;
+        let before = cache.clone();
+        // A card whose sink has gone stops being reported, and is probed
+        // afresh (and re-corrected) if it ever comes back.
+        cache.retain(|index, _| wanted.contains_key(index));
+
+        for (index, name) in wanted {
+            let fresh = !cache.contains_key(&index);
+            if !fresh && !force {
+                continue;
+            }
+            let mut probed = spawn_probe(index).await;
+            if fresh {
+                if let (Some(current), Some(&choice)) = (probed, stored.get(&name)) {
+                    if current != choice {
+                        match spawn_set(index, choice).await {
+                            Ok(()) => {
+                                info!(
+                                    card = index,
+                                    card_name = %name,
+                                    enabled = choice,
+                                    "re-applied the stored Auto-Mute Mode choice"
+                                );
+                                probed = Some(choice);
+                            }
+                            Err(e) => warn!(card = index, "could not re-apply Auto-Mute Mode: {e}"),
+                        }
+                    }
+                }
+            }
+            cache.insert(index, probed);
+        }
+        *cache != before
+    }
+
+    /// SPEC §8.1's automatic switch, run after a successful `SetPort`.
+    ///
+    /// `route_name` is the port that was *requested*: the snapshot's `active`
+    /// flag only catches up once the card re-enumerates its routes, so reading
+    /// it back here would race.
+    async fn maybe_disable_auto_mute(&self, node_id: u32, route_name: &str) {
+        let snapshot = self.snapshot();
+        let Some(card) = snapshot.card_of(node_id).cloned() else {
+            return;
+        };
+        let headphones_available = snapshot.headphones_available(node_id);
+
+        let policy = self.config.lock().await.auto_mute_policy();
+        let mut cache = self.auto_mute_cache.lock().await;
+        let current = match cache.get(&card.index).copied() {
+            Some(known) => known,
+            None => {
+                let probed = spawn_probe(card.index).await;
+                cache.insert(card.index, probed);
+                probed
+            }
+        };
+        let Some(enabled) = current else {
+            return;
+        };
+        if !alsa_mixer::should_disable_auto_mute(route_name, headphones_available, enabled, policy)
+        {
+            return;
+        }
+
+        if let Err(e) = spawn_set(card.index, false).await {
+            warn!(card = card.index, "could not turn Auto-Mute Mode off: {e}");
+            return;
+        }
+        cache.insert(card.index, Some(false));
+        drop(cache);
+        info!(
+            node = node_id,
+            card = card.index,
+            card_name = %card.name,
+            port = route_name,
+            "headphones are plugged in and a speaker port was selected; \
+             turned ALSA Auto-Mute Mode off"
+        );
+        self.persist_auto_mute(&card.name, false).await;
+    }
+
+    /// Remember a card's `Auto-Mute Mode` choice in the config file.
+    ///
+    /// A write failure is logged, not returned: the mixer change has already
+    /// happened, and refusing the whole call would leave the daemon reporting a
+    /// state it just moved away from.
+    async fn persist_auto_mute(&self, card_name: &str, enabled: bool) {
+        let mut guard = self.config.lock().await;
+        if guard.auto_mute(card_name) == Some(enabled) {
+            return;
+        }
+        guard.set_auto_mute(card_name, enabled);
+        let config = guard.clone();
+        drop(guard);
+
+        if let Some(path) = self.config_path.as_ref() {
+            if let Err(e) = config.save_to(path) {
+                warn!("could not persist the Auto-Mute Mode choice: {e}");
+                return;
+            }
+        }
+        let _ = self
+            .dispatch(move |reply| Command::SetConfig {
+                config: Box::new(config),
+                reply,
+            })
+            .await;
+    }
+
+    /// `SetPort` without the `PropertiesChanged` emission, so it can be tested
+    /// without a D-Bus connection (the interface method needs a
+    /// `SignalEmitter`).
+    async fn do_set_port(&self, node_id: u32, route_index: u32) -> Result<()> {
+        // Read the requested route's name *before* the write: the snapshot's
+        // `active` flag only catches up once the card re-enumerates.
+        let route_name = self
+            .snapshot()
+            .port_name(node_id, route_index)
+            .map(str::to_owned);
+
+        self.dispatch(move |reply| Command::SetPort {
+            id: node_id,
+            index: route_index,
+            reply,
+        })
+        .await?;
+
+        // SPEC §8.1: the automatic switch, then a re-probe so the property
+        // reflects whatever the card actually ended up at.
+        if let Some(route_name) = route_name {
+            self.maybe_disable_auto_mute(node_id, &route_name).await;
+        }
+        self.sync_auto_mute(true).await;
+        Ok(())
+    }
+
+    /// `SetAutoMute` without the `PropertiesChanged` emission (SPEC §8.1).
+    async fn do_set_auto_mute(&self, node_id: u32, enabled: bool) -> Result<()> {
+        let card = self.validate_set_auto_mute(node_id)?;
+
+        // A card we have never probed gets probed now, so "this card has no
+        // such control" is an `InvalidArgument` rather than a silent no-op.
+        {
+            let mut cache = self.auto_mute_cache.lock().await;
+            let known = match cache.get(&card.index).copied() {
+                Some(known) => known,
+                None => {
+                    let probed = spawn_probe(card.index).await;
+                    cache.insert(card.index, probed);
+                    probed
+                }
+            };
+            if known.is_none() {
+                return Err(Error::invalid(format!(
+                    "card {} behind node {node_id} has no `{}` control",
+                    card.index,
+                    alsa_mixer::AUTO_MUTE_CONTROL
+                )));
+            }
+        }
+
+        spawn_set(card.index, enabled)
+            .await
+            .map_err(Error::pipewire)?;
+        {
+            let mut cache = self.auto_mute_cache.lock().await;
+            cache.insert(card.index, Some(enabled));
+        }
+        info!(
+            node = node_id,
+            card = card.index,
+            card_name = %card.name,
+            enabled,
+            "Auto-Mute Mode set"
+        );
+        self.persist_auto_mute(&card.name, enabled).await;
+
+        // SPEC §8.1: re-probe after every SetAutoMute.
+        self.sync_auto_mute(true).await;
+        Ok(())
+    }
+
+    /// `Refresh` without the `PropertiesChanged` emission.
+    async fn do_refresh(&self) -> Result<()> {
+        // SPEC §7.3: `EqPresets` is rescanned on Refresh.
+        self.rescan_presets();
+        self.dispatch(|reply| Command::Refresh { reply }).await?;
+        // SPEC §8.1: auto-mute is re-probed on Refresh.
+        self.sync_auto_mute(true).await;
+        Ok(())
+    }
+
+    /// SPEC §8.1's `SetAutoMute` validation, split out so it can be tested
+    /// without a D-Bus connection or a mixer.
+    ///
+    /// `NotFound` for an unknown node, `InvalidArgument` for a node that is not
+    /// an output device or whose card PipeDeck has no ALSA card row for.
+    fn validate_set_auto_mute(&self, node_id: u32) -> Result<AlsaCard> {
+        let snapshot = self.snapshot();
+        let device = snapshot
+            .devices
+            .get(&node_id)
+            .ok_or_else(|| Error::not_found(format!("no device with id {node_id}")))?;
+        if device.kind != DeviceKind::Sink {
+            return Err(Error::invalid(format!(
+                "node {node_id} is an input; auto-mute is an output control"
+            )));
+        }
+        snapshot
+            .card_of(node_id)
+            .cloned()
+            .ok_or_else(|| Error::invalid(format!("node {node_id} is not backed by an ALSA card")))
+    }
+
     async fn dispatch(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<()>>) -> Command,
@@ -130,6 +422,28 @@ impl Daemon {
         let (tx, rx) = oneshot::channel();
         self.pw.send(make(tx))?;
         await_reply(rx).await
+    }
+}
+
+/// Read `Auto-Mute Mode` off a card without blocking the async runtime.
+///
+/// SPEC §8.1: "Mixer calls are quick but blocking; run them on the tokio side
+/// via `spawn_blocking`, never on the PipeWire thread."
+async fn spawn_probe(card: u32) -> Option<bool> {
+    match tokio::task::spawn_blocking(move || alsa_mixer::probe(card)).await {
+        Ok(result) => result,
+        Err(e) => {
+            warn!(card, "the auto-mute probe task failed: {e}");
+            None
+        }
+    }
+}
+
+/// Write `Auto-Mute Mode` on a card without blocking the async runtime.
+async fn spawn_set(card: u32, enabled: bool) -> std::result::Result<(), String> {
+    match tokio::task::spawn_blocking(move || alsa_mixer::set(card, enabled)).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("the auto-mute write task failed: {e}")),
     }
 }
 
@@ -163,6 +477,14 @@ impl Daemon {
     #[zbus(property)]
     async fn eq(&self) -> Vec<EqTuple> {
         self.snapshot().eq_dbus()
+    }
+
+    /// ALSA `Auto-Mute Mode`: `(node_id, enabled)`, one row per sink whose card has the control.
+    #[zbus(property)]
+    async fn auto_mute(&self) -> Vec<AutoMuteTuple> {
+        let cards = self.snapshot().cards;
+        let cache = self.auto_mute_cache.lock().await;
+        Self::auto_mute_rows(&cards, &cache)
     }
 
     /// `node.name` of the notification sink; empty means "follow the default output".
@@ -263,13 +585,27 @@ impl Daemon {
     }
 
     /// Select a card route (port) for a sink or source node.
-    async fn set_port(&self, node_id: u32, route_index: u32) -> Result<()> {
-        self.dispatch(move |reply| Command::SetPort {
-            id: node_id,
-            index: route_index,
-            reply,
-        })
-        .await
+    async fn set_port(
+        &self,
+        node_id: u32,
+        route_index: u32,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<()> {
+        self.do_set_port(node_id, route_index).await?;
+        let _ = self.auto_mute_changed(&emitter).await;
+        Ok(())
+    }
+
+    /// Turn ALSA `Auto-Mute Mode` on or off for the card behind an output device.
+    async fn set_auto_mute(
+        &self,
+        node_id: u32,
+        enabled: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<()> {
+        self.do_set_auto_mute(node_id, enabled).await?;
+        let _ = self.auto_mute_changed(&emitter).await;
+        Ok(())
     }
 
     /// Apply an EQ preset to an output device; an empty preset turns EQ off.
@@ -315,10 +651,10 @@ impl Daemon {
     }
 
     /// Re-read every node's params and re-publish the snapshot.
-    async fn refresh(&self) -> Result<()> {
-        // SPEC §7.3: `EqPresets` is rescanned on Refresh.
-        self.rescan_presets();
-        self.dispatch(|reply| Command::Refresh { reply }).await
+    async fn refresh(&self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> Result<()> {
+        self.do_refresh().await?;
+        let _ = self.auto_mute_changed(&emitter).await;
+        Ok(())
     }
 
     /// "Something changed, re-read the properties." Coalesced to <= 10/s.
@@ -347,6 +683,10 @@ pub async fn run_change_notifier(
 
         let emitter = iface.signal_emitter();
         let guard = iface.get().await;
+        // SPEC §8.1: probe (and correct) any card that has just appeared —
+        // this is both the "routed sink appeared" hook and, on the first
+        // revision after start, the startup one.
+        guard.sync_auto_mute(false).await;
         if let Err(e) = guard.devices_changed(emitter).await {
             warn!("could not emit PropertiesChanged for Devices: {e}");
         }
@@ -358,6 +698,9 @@ pub async fn run_change_notifier(
         }
         if let Err(e) = guard.eq_changed(emitter).await {
             warn!("could not emit PropertiesChanged for Eq: {e}");
+        }
+        if let Err(e) = guard.auto_mute_changed(emitter).await {
+            warn!("could not emit PropertiesChanged for AutoMute: {e}");
         }
         drop(guard);
         if let Err(e) = Daemon::changed(emitter).await {
@@ -458,6 +801,10 @@ mod tests {
         assert!(xml.contains(r#"<signal name="Changed">"#));
         assert!(xml.contains(r#"<property name="EqPresets" type="a(ss)" access="read"/>"#));
         assert!(xml.contains(r#"<property name="Eq" type="a(us)" access="read"/>"#));
+        // SPEC §8.1.
+        assert!(xml.contains(r#"<property name="AutoMute" type="a(ub)" access="read"/>"#));
+        assert!(xml.contains(r#"<arg name="node_id" type="u" direction="in"/>"#));
+        assert!(xml.contains(r#"<arg name="enabled" type="b" direction="in"/>"#));
         for method in [
             "SetDefault",
             "SetNotificationSink",
@@ -466,6 +813,7 @@ mod tests {
             "SetStreamTarget",
             "SetPort",
             "SetEq",
+            "SetAutoMute",
             "Refresh",
         ] {
             assert!(
@@ -488,9 +836,9 @@ mod tests {
             daemon.set_mute(3, true).await,
             Err(Error::PipeWire(_))
         ));
-        assert!(matches!(daemon.refresh().await, Err(Error::PipeWire(_))));
+        assert!(matches!(daemon.do_refresh().await, Err(Error::PipeWire(_))));
         assert!(matches!(
-            daemon.set_port(3, 4).await,
+            daemon.do_set_port(3, 4).await,
             Err(Error::PipeWire(_))
         ));
     }
@@ -630,6 +978,236 @@ mod tests {
                 .expect("off is always valid"),
             ("sink-a".to_owned(), String::new())
         );
+    }
+
+    /// A daemon with one card-backed sink, one HDMI-ish sink with no card, one
+    /// source and no PipeWire thread — enough for every `SetAutoMute`
+    /// validation path and the `AutoMute` projection (SPEC §8.1).
+    fn auto_mute_daemon() -> Daemon {
+        use crate::route::Port;
+
+        let state = Arc::new(RwLock::new(State::default()));
+        {
+            let mut guard = state.write().expect("lock");
+            guard.devices.insert(39, sink(39, "sink-a"));
+            guard.devices.insert(43, sink(43, "sink-hdmi"));
+            let mut source = sink(41, "source-a");
+            source.kind = DeviceKind::Source;
+            guard.devices.insert(41, source);
+            guard.cards.insert(
+                39,
+                AlsaCard {
+                    index: 1,
+                    name: "HDA Intel PCH".to_owned(),
+                },
+            );
+            guard.ports = vec![
+                Port {
+                    node_id: 39,
+                    index: 3,
+                    name: "analog-output-lineout".to_owned(),
+                    description: "Line Out".to_owned(),
+                    available: true,
+                    active: true,
+                },
+                Port {
+                    node_id: 39,
+                    index: 4,
+                    name: "analog-output-headphones".to_owned(),
+                    description: "Headphones".to_owned(),
+                    available: true,
+                    active: false,
+                },
+            ];
+        }
+        Daemon::new(
+            state,
+            PwHandle::disconnected(),
+            Config::default(),
+            None,
+            Arc::new(RwLock::new(Vec::new())),
+            None,
+        )
+    }
+
+    /// SPEC §8.1: `AutoMute a(ub)`, one row per sink whose card *has* the
+    /// control. Cards we probed and found nothing on contribute no row.
+    #[test]
+    fn auto_mute_rows_only_cover_cards_with_the_control() {
+        let cards = BTreeMap::from([
+            (
+                39,
+                AlsaCard {
+                    index: 1,
+                    name: "HDA Intel PCH".to_owned(),
+                },
+            ),
+            (
+                43,
+                AlsaCard {
+                    index: 2,
+                    name: "HDA NVidia".to_owned(),
+                },
+            ),
+            (
+                47,
+                AlsaCard {
+                    index: 3,
+                    name: "USB Audio".to_owned(),
+                },
+            ),
+        ]);
+        // Card 1 has it and it is on, card 2 has no such control, card 3 has
+        // not been probed yet.
+        let cache = AutoMuteCache::from([(1, Some(true)), (2, None)]);
+        assert_eq!(Daemon::auto_mute_rows(&cards, &cache), vec![(39, true)]);
+
+        let cache = AutoMuteCache::from([(1, Some(false)), (2, None), (3, Some(true))]);
+        assert_eq!(
+            Daemon::auto_mute_rows(&cards, &cache),
+            vec![(39, false), (47, true)]
+        );
+        assert!(Daemon::auto_mute_rows(&cards, &AutoMuteCache::new()).is_empty());
+        assert!(Daemon::auto_mute_rows(&BTreeMap::new(), &cache).is_empty());
+    }
+
+    /// Two sinks on one card collapse to one probe: the mixer control is per
+    /// card, not per node.
+    #[test]
+    fn snapshot_cards_dedupe_by_card_index() {
+        let state = State {
+            cards: BTreeMap::from([
+                (
+                    39,
+                    AlsaCard {
+                        index: 1,
+                        name: "HDA Intel PCH".to_owned(),
+                    },
+                ),
+                (
+                    40,
+                    AlsaCard {
+                        index: 1,
+                        name: "HDA Intel PCH".to_owned(),
+                    },
+                ),
+                (
+                    43,
+                    AlsaCard {
+                        index: 2,
+                        name: "HDA NVidia".to_owned(),
+                    },
+                ),
+            ]),
+            ..State::default()
+        };
+        assert_eq!(
+            Daemon::snapshot_cards(&state),
+            BTreeMap::from([
+                (1, "HDA Intel PCH".to_owned()),
+                (2, "HDA NVidia".to_owned())
+            ])
+        );
+        assert!(Daemon::snapshot_cards(&State::default()).is_empty());
+    }
+
+    /// SPEC §8.1: NotFound for an unknown node, InvalidArgument for an input
+    /// or for a node with no ALSA card behind it.
+    #[test]
+    fn set_auto_mute_validates_before_touching_the_mixer() {
+        let daemon = auto_mute_daemon();
+
+        assert!(matches!(
+            daemon.validate_set_auto_mute(99),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            daemon.validate_set_auto_mute(41),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            daemon.validate_set_auto_mute(43),
+            Err(Error::InvalidArgument(_))
+        ));
+
+        let card = daemon.validate_set_auto_mute(39).expect("valid");
+        assert_eq!(card.index, 1);
+        assert_eq!(card.name, "HDA Intel PCH");
+    }
+
+    /// Validation runs before anything blocking, so these fail even with no
+    /// graph and no mixer — the same guarantee `SetEq` gives.
+    #[tokio::test]
+    async fn set_auto_mute_fails_cleanly_without_a_mixer() {
+        let daemon = auto_mute_daemon();
+        assert!(matches!(
+            daemon.do_set_auto_mute(99, false).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            daemon.do_set_auto_mute(41, false).await,
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            daemon.do_set_auto_mute(43, false).await,
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    /// With no cards in the snapshot there is nothing to probe, so a sync is a
+    /// no-op that reports no change — the path every non-ALSA setup takes.
+    #[tokio::test]
+    async fn syncing_an_empty_graph_probes_nothing() {
+        let daemon = daemon();
+        assert!(!daemon.sync_auto_mute(false).await);
+        assert!(!daemon.sync_auto_mute(true).await);
+        assert!(daemon.auto_mute().await.is_empty());
+    }
+
+    /// The `AutoMute` property is the projection of the cache over the
+    /// snapshot's cards, so a card whose sink is gone stops being reported.
+    #[tokio::test]
+    async fn auto_mute_property_follows_the_cache_and_the_snapshot() {
+        let daemon = auto_mute_daemon();
+        {
+            let mut cache = daemon.auto_mute_cache.lock().await;
+            cache.insert(1, Some(true));
+        }
+        assert_eq!(daemon.auto_mute().await, vec![(39, true)]);
+
+        // The sink goes away: no card row, no `AutoMute` row.
+        {
+            let mut guard = daemon.state.write().expect("lock");
+            guard.cards.clear();
+        }
+        assert_eq!(daemon.auto_mute().await, Vec::<AutoMuteTuple>::new());
+    }
+
+    /// SPEC §8.1: the automatic switch is driven off the *requested* route
+    /// name, and reads the headphones jack out of the same snapshot.
+    #[test]
+    fn the_snapshot_supplies_both_inputs_of_the_automatic_switch() {
+        use crate::alsa_mixer::{should_disable_auto_mute, AutoMutePolicy};
+
+        let daemon = auto_mute_daemon();
+        let snapshot = daemon.snapshot();
+
+        let line_out = snapshot.port_name(39, 3).expect("line out");
+        let headphones = snapshot.port_name(39, 4).expect("headphones");
+        assert!(snapshot.headphones_available(39));
+
+        assert!(should_disable_auto_mute(
+            line_out,
+            snapshot.headphones_available(39),
+            true,
+            AutoMutePolicy::Auto
+        ));
+        assert!(!should_disable_auto_mute(
+            headphones,
+            snapshot.headphones_available(39),
+            true,
+            AutoMutePolicy::Auto
+        ));
     }
 
     /// The coalescing floor is what keeps `Changed` at or under 10/s.

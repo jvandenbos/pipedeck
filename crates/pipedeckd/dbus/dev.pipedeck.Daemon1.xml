@@ -49,6 +49,13 @@
     <arg name="route_index" type="u" direction="in"/>
   </method>
   <!--
+   Turn ALSA `Auto-Mute Mode` on or off for the card behind an output device.
+   -->
+  <method name="SetAutoMute">
+    <arg name="node_id" type="u" direction="in"/>
+    <arg name="enabled" type="b" direction="in"/>
+  </method>
+  <!--
    Apply an EQ preset to an output device; an empty preset turns EQ off.
    -->
   <method name="SetEq">
@@ -65,6 +72,10 @@
    -->
   <signal name="Changed">
   </signal>
+  <!--
+   ALSA `Auto-Mute Mode`: `(node_id, enabled)`, one row per sink whose card has the control.
+   -->
+  <property name="AutoMute" type="a(ub)" access="read"/>
   <!--
    Sinks and sources: `(id, name, description, kind, is_default, virtual, volume, mute, nick)`.
    -->

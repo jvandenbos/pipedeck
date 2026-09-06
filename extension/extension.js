@@ -67,6 +67,15 @@ function unpackEq([nodeId, preset]) {
   return {nodeId, preset};
 }
 
+/**
+ * AutoMute tuple -> object. Wire type a(ub), per SPEC §8.1:
+ * (node_id, enabled) -- one row per sink whose card has an Auto-Mute Mode
+ * ALSA control.
+ */
+function unpackAutoMute([nodeId, enabled]) {
+  return {nodeId, enabled};
+}
+
 /** Map<nodeId, port[]> from a flat Ports array. `ports` may be null (v0.1 daemon, no Ports
  * property) — callers get an empty Map back, which makes every device render as v0.1 did. */
 function groupPortsByNode(ports) {
@@ -84,14 +93,36 @@ function groupPortsByNode(ports) {
   return map;
 }
 
+/**
+ * GNOME Shell 46+ moved `Gio.DesktopAppInfo` to the platform-specific
+ * `GioUnix` module; the old spelling still works but logs "has been moved to
+ * a separate platform-specific library..." on every single call, which
+ * spammed the journal on every menu rebuild. Resolve `GioUnix.DesktopAppInfo`
+ * lazily via a dynamic import rather than a static one: a static
+ * `import ... from 'gi://GioUnix'` would hard-fail this whole module's load
+ * on a shell/build that lacks the GioUnix typelib (e.g. the syntax-check
+ * container), where this dynamic form just rejects and the catch below
+ * leaves the `Gio.DesktopAppInfo` fallback in place.
+ */
+let DesktopAppInfoCtor = Gio.DesktopAppInfo;
+import('gi://GioUnix')
+  .then(({default: GioUnix}) => {
+    if (GioUnix?.DesktopAppInfo)
+      DesktopAppInfoCtor = GioUnix.DesktopAppInfo;
+  })
+  .catch(() => {
+    // GioUnix typelib not available here -- keep the Gio.DesktopAppInfo
+    // fallback (functional, just noisier in the log).
+  });
+
 /** Best-effort app icon lookup; never throws, always returns a Gio.Icon or null. */
 function lookupAppIcon(stream) {
   try {
     let appInfo = null;
     if (stream.binary)
-      appInfo = Gio.DesktopAppInfo.new(`${stream.binary}.desktop`);
+      appInfo = DesktopAppInfoCtor.new(`${stream.binary}.desktop`);
     if (!appInfo && stream.appName)
-      appInfo = Gio.DesktopAppInfo.new(`${stream.appName}.desktop`);
+      appInfo = DesktopAppInfoCtor.new(`${stream.appName}.desktop`);
     if (!appInfo && stream.binary) {
       const binaryBase = stream.binary.split('/').pop();
       appInfo = Gio.AppInfo.get_all().find(ai => {
@@ -339,19 +370,24 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
 
   /**
    * @param {{devices: object[], streams: object[], notificationSink: string,
-   *   ports: (object[]|null), eqPresets: (object[]|null), eq: (object[]|null)}} state
+   *   ports: (object[]|null), eqPresets: (object[]|null), eq: (object[]|null),
+   *   autoMute: (object[]|null)}} state
    *   `ports` is null on a v0.1 daemon (no Ports property) and every device
    *   then renders exactly as v0.1 did. `eqPresets`/`eq` are null on a
    *   pre-§7.3 daemon (no EqPresets/Eq properties) and the Equalizer
-   *   section is hidden entirely.
+   *   section is hidden entirely. `autoMute` is null on a pre-§8.1 daemon
+   *   (no AutoMute property) and no auto-mute switch is ever rendered.
    */
   rebuild(state) {
-    const {devices, streams, notificationSink, ports, eqPresets, eq} = state;
+    const {devices, streams, notificationSink, ports, eqPresets, eq, autoMute} = state;
     const sinks = devices.filter(d => d.kind === 'sink');
     const sources = devices.filter(d => d.kind === 'source');
     const portsByNode = groupPortsByNode(ports);
+    // Map<nodeId, enabled> -- SPEC §8.2 only shows the switch in the Output
+    // section, so this is deliberately not passed to the Input call below.
+    const autoMuteByNode = autoMute ? new Map(autoMute.map(a => [a.nodeId, a.enabled])) : null;
 
-    this._rebuildDeviceSection(this._outputSection, sinks, portsByNode);
+    this._rebuildDeviceSection(this._outputSection, sinks, portsByNode, autoMuteByNode);
     this._rebuildDeviceSection(this._inputSection, sources, portsByNode);
     this._rebuildNotificationSection(sinks, notificationSink);
 
@@ -376,7 +412,12 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
     return activePort ? `${activePort.description} · ${label}` : label;
   }
 
-  _rebuildDeviceSection(section, devices, portsByNode) {
+  /**
+   * @param {Map<number, boolean>|null} [autoMuteByNode] present only for the
+   *   Output section (SPEC §8.2); omitted for Input so the switch never
+   *   renders there even if the daemon someday reports an input row.
+   */
+  _rebuildDeviceSection(section, devices, portsByNode, autoMuteByNode) {
     section.removeAll();
     if (devices.length === 0) {
       const empty = new PopupMenu.PopupMenuItem('No devices', {activate: false});
@@ -392,7 +433,32 @@ class PipeDeckToggle extends QuickSettings.QuickMenuToggle {
       } else {
         section.addMenuItem(this._buildDeviceItem(device));
       }
+      // SPEC §8.2: directly under a device's port rows (or its single row),
+      // when AutoMute has an entry for this device -- hidden otherwise, and
+      // hidden entirely on an older daemon (autoMuteByNode is null there).
+      const autoMuteEnabled = autoMuteByNode?.get(device.id);
+      if (autoMuteEnabled !== undefined)
+        section.addMenuItem(this._buildAutoMuteItem(device.id, autoMuteEnabled));
     }
+  }
+
+  /**
+   * SPEC §8.2 auto-mute switch. `PopupSwitchMenuItem` only emits `toggled`
+   * from an actual user activation (click/keyboard) -- never from the
+   * constructor's initial state, and this codebase never calls
+   * `setToggleState()` on a live item (every section is torn down and
+   * rebuilt fresh via `removeAll()` above), so a daemon-driven property
+   * update that lands here as a freshly-constructed item with the new
+   * `enabled` value can never loop back into `toggled` and re-issue the
+   * same `SetAutoMute` call.
+   */
+  _buildAutoMuteItem(deviceId, enabled) {
+    const item = new PopupMenu.PopupSwitchMenuItem(
+      'Auto-mute speakers when headphones are plugged in', enabled);
+    item.connect('toggled', (_item, state) => {
+      this._proxyOps.setAutoMute(deviceId, state).catch(() => {});
+    });
+    return item;
   }
 
   _buildDeviceItem(device) {
@@ -540,6 +606,7 @@ class PipeDeckIndicator extends QuickSettings.SystemIndicator {
       setMute: (id, mute) => this._callRemote('SetMuteRemote', id, mute),
       setPort: (nodeId, routeIndex) => this._callRemote('SetPortRemote', nodeId, routeIndex),
       setEq: (nodeId, preset) => this._callRemote('SetEqRemote', nodeId, preset),
+      setAutoMute: (nodeId, enabled) => this._callRemote('SetAutoMuteRemote', nodeId, enabled),
     });
     this.quickSettingsItems.push(this._toggle);
 
@@ -659,8 +726,8 @@ class PipeDeckIndicator extends QuickSettings.SystemIndicator {
     if (!this._proxy)
       return;
     try {
-      // this._proxy.Ports/EqPresets/Eq are undefined when talking to an
-      // older daemon (no such property in its introspection/cached
+      // this._proxy.Ports/EqPresets/Eq/AutoMute are undefined when talking
+      // to an older daemon (no such property in its introspection/cached
       // properties at all) -- normalize that to null so `rebuild()`
       // degrades gracefully rather than treating "unknown" the same as
       // "empty" (an empty array, which for EqPresets specifically must
@@ -672,6 +739,7 @@ class PipeDeckIndicator extends QuickSettings.SystemIndicator {
         ports: this._proxy.Ports ? this._proxy.Ports.map(unpackPort) : null,
         eqPresets: this._proxy.EqPresets ? this._proxy.EqPresets.map(unpackEqPreset) : null,
         eq: this._proxy.Eq ? this._proxy.Eq.map(unpackEq) : null,
+        autoMute: this._proxy.AutoMute ? this._proxy.AutoMute.map(unpackAutoMute) : null,
       };
       this._toggle.rebuild(state);
     } catch (e) {

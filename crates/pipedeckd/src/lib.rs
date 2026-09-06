@@ -5,12 +5,14 @@
 //! `pipedeck` CLI and any future front end are all thin D-Bus clients.
 //!
 //! Module layout follows one rule: [`pw`] is the *only* module that links
-//! against libpipewire. Everything else — [`config`], [`eq`], [`matching`],
-//! [`meta`], [`route`], [`state`], [`volume`] — is pure data and is unit-tested
-//! without a graph.
+//! against libpipewire, and [`alsa_mixer`] is the only one that links against
+//! alsa-lib. Everything else — [`config`], [`eq`], [`matching`], [`meta`],
+//! [`route`], [`state`], [`volume`] — is pure data and is unit-tested without a
+//! graph, as are all of [`alsa_mixer`] except its two mixer calls.
 
 #![warn(missing_docs)]
 
+pub mod alsa_mixer;
 pub mod command;
 pub mod config;
 pub mod eq;

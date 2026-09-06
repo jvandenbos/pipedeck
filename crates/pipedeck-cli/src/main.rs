@@ -13,7 +13,9 @@ use futures_util::StreamExt as _;
 
 use pipedeckd::eq;
 use pipedeckd::route::PortTuple;
-use pipedeckd::state::{DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, StreamTuple};
+use pipedeckd::state::{
+    AutoMuteTuple, DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, StreamTuple,
+};
 use pipedeckd::volume::{linear_to_percent, percent_to_linear, MAX_VOLUME};
 
 use proxy::DaemonProxy;
@@ -68,6 +70,18 @@ enum Cmd {
     /// EQ presets (SPEC §7.3).
     #[command(subcommand)]
     Eq(EqCmd),
+    /// Show or set ALSA "Auto-Mute Mode" (SPEC §8.1).
+    ///
+    /// Realtek codecs hard-mute the line-out whenever a headphone plug is
+    /// present, whatever port is selected. Turning it off lets the speaker
+    /// port play with headphones still plugged in.
+    #[command(name = "automute")]
+    AutoMute {
+        /// Node id, from `pipedeck outputs`. Omit to list every card.
+        id: Option<u32>,
+        /// `on` or `off`. Required when an id is given.
+        state: Option<String>,
+    },
     /// Ask the daemon to re-read the graph.
     Refresh,
     /// Print a line every time the daemon signals a change.
@@ -179,6 +193,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Eq(cmd) => eq_command(&daemon, cmd).await,
+        Cmd::AutoMute { id, state } => auto_mute_command(&daemon, id, state).await,
         Cmd::Refresh => {
             daemon.refresh().await?;
             println!("refreshed");
@@ -199,9 +214,15 @@ async fn current_mute(daemon: &DaemonProxy<'_>, id: u32) -> Result<bool> {
 }
 
 /// One device row: nick first (ALSA descriptions truncate), then the active
-/// port in brackets when the node has more than one (SPEC §6.1), then the full
-/// description and `node.name` on continuation lines.
-fn device_line(device: &DeviceTuple, ports: &[PortTuple], eq_label: Option<&str>) -> String {
+/// port in brackets when the node has more than one (SPEC §6.1), the EQ preset
+/// (SPEC §7.3) and `[auto-mute]` (SPEC §8.1), then the full description and
+/// `node.name` on continuation lines.
+fn device_line(
+    device: &DeviceTuple,
+    ports: &[PortTuple],
+    eq_label: Option<&str>,
+    auto_mute: bool,
+) -> String {
     let (id, name, description, _kind, is_default, virtual_, volume, mute, nick) = device;
     let marker = if *is_default { '*' } else { ' ' };
     let label = if nick.is_empty() { description } else { nick };
@@ -217,6 +238,8 @@ fn device_line(device: &DeviceTuple, ports: &[PortTuple], eq_label: Option<&str>
     };
     // SPEC §7.3: `{eq: <name>}` after the port bracket, only when EQ is on.
     let eq = eq_label.map_or_else(String::new, |name| format!(" {{eq: {name}}}"));
+    // SPEC §8.1: `[auto-mute]` while the card's Auto-Mute Mode is enabled.
+    let auto_mute = if auto_mute { " [auto-mute]" } else { "" };
 
     let mut flags = String::new();
     if *mute {
@@ -227,7 +250,7 @@ fn device_line(device: &DeviceTuple, ports: &[PortTuple], eq_label: Option<&str>
     }
 
     let mut line = format!(
-        "{marker} {id:>5}  {:>4.0}%  {label}{port}{eq}{flags}",
+        "{marker} {id:>5}  {:>4.0}%  {label}{port}{eq}{auto_mute}{flags}",
         linear_to_percent(*volume)
     );
     if description != label && !description.is_empty() {
@@ -316,6 +339,7 @@ async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
         &daemon.eq().await.unwrap_or_default(),
         &daemon.eq_presets().await.unwrap_or_default(),
     );
+    let auto_mute = daemon.auto_mute().await.unwrap_or_default();
     let streams = daemon.streams().await?;
     let notify = daemon.notification_sink().await?;
     let version = daemon.version().await.unwrap_or_default();
@@ -339,7 +363,12 @@ async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
         for device in devices.iter().filter(|d| d.3 == kind.as_str()) {
             println!(
                 "{}",
-                device_line(device, &ports, eq.get(&device.0).map(String::as_str))
+                device_line(
+                    device,
+                    &ports,
+                    eq.get(&device.0).map(String::as_str),
+                    auto_mute_on(&auto_mute, device.0)
+                )
             );
             any = true;
         }
@@ -365,11 +394,17 @@ async fn list_devices(daemon: &DaemonProxy<'_>, kind: DeviceKind) -> Result<()> 
         &daemon.eq().await.unwrap_or_default(),
         &daemon.eq_presets().await.unwrap_or_default(),
     );
+    let auto_mute = daemon.auto_mute().await.unwrap_or_default();
     let mut any = false;
     for device in devices.iter().filter(|d| d.3 == kind.as_str()) {
         println!(
             "{}",
-            device_line(device, &ports, eq.get(&device.0).map(String::as_str))
+            device_line(
+                device,
+                &ports,
+                eq.get(&device.0).map(String::as_str),
+                auto_mute_on(&auto_mute, device.0)
+            )
         );
         any = true;
     }
@@ -490,6 +525,68 @@ async fn eq_command(daemon: &DaemonProxy<'_>, cmd: EqCmd) -> Result<()> {
     }
 }
 
+/// Is a node's card reporting `Auto-Mute Mode` as enabled? (SPEC §8.1.)
+///
+/// A node with no row — a virtual sink, an HDMI card without the control, or
+/// an older daemon that has no `AutoMute` property at all — reads as "off",
+/// which is exactly what "no `[auto-mute]` tag" should mean.
+fn auto_mute_on(rows: &[AutoMuteTuple], node_id: u32) -> bool {
+    rows.iter()
+        .find(|(id, _)| *id == node_id)
+        .is_some_and(|(_, enabled)| *enabled)
+}
+
+/// Parse the `on`/`off` argument of `pipedeck automute <id> <state>`.
+fn parse_on_off(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "enabled" | "enable" => Some(true),
+        "off" | "false" | "no" | "0" | "disabled" | "disable" => Some(false),
+        _ => None,
+    }
+}
+
+/// `pipedeck automute [<id> on|off]` (SPEC §8.1).
+async fn auto_mute_command(
+    daemon: &DaemonProxy<'_>,
+    id: Option<u32>,
+    state: Option<String>,
+) -> Result<()> {
+    let Some(id) = id else {
+        let rows = daemon.auto_mute().await?;
+        if rows.is_empty() {
+            println!("(no cards with an `Auto-Mute Mode` control)");
+            return Ok(());
+        }
+        let devices = daemon.devices().await.unwrap_or_default();
+        for (node_id, enabled) in &rows {
+            let label = devices
+                .iter()
+                .find(|d| d.0 == *node_id)
+                .map_or_else(String::new, |d| {
+                    if d.8.is_empty() {
+                        d.2.clone()
+                    } else {
+                        d.8.clone()
+                    }
+                });
+            println!(
+                "  {node_id:>5}  {:<3}  {label}",
+                if *enabled { "on" } else { "off" }
+            );
+        }
+        return Ok(());
+    };
+
+    let Some(state) = state else {
+        bail!("expected `on` or `off` after the node id (see `pipedeck automute`)");
+    };
+    let enabled = parse_on_off(&state)
+        .ok_or_else(|| anyhow::anyhow!("expected `on` or `off`, got `{state}`"))?;
+    daemon.set_auto_mute(id, enabled).await?;
+    println!("{id} auto-mute -> {}", if enabled { "on" } else { "off" });
+    Ok(())
+}
+
 /// Is this argument one of the spellings that mean "no preset"?
 fn is_off(value: &str) -> bool {
     let value = value.trim();
@@ -553,6 +650,7 @@ mod tests {
             "vol",
             "mute",
             "eq",
+            "automute",
             "watch",
         ] {
             assert!(names.contains(&expected), "missing subcommand {expected}");
@@ -645,14 +743,19 @@ mod tests {
         d.5 = true;
         d.6 = 0.125; // 50 % on the cubic scale wpctl shows
         d.7 = true;
-        let line = device_line(&d, &[], None);
+        let line = device_line(&d, &[], None, false);
         assert!(line.starts_with('*'));
         assert!(line.contains("50%"));
         assert!(line.contains("[muted]"));
         assert!(line.contains("[virtual]"));
         assert!(line.contains("sink-a"));
 
-        let plain = device_line(&device(12, "sink-b", "HDMI", "Dell AW3423DW"), &[], None);
+        let plain = device_line(
+            &device(12, "sink-b", "HDMI", "Dell AW3423DW"),
+            &[],
+            None,
+            false,
+        );
         assert!(plain.starts_with(' '));
         assert!(!plain.contains("[muted]"));
     }
@@ -668,6 +771,7 @@ mod tests {
             ),
             &[],
             None,
+            false,
         );
         let first = line.lines().next().expect("a first line");
         assert!(first.contains("ALC892 Analog"));
@@ -676,7 +780,7 @@ mod tests {
         assert!(line.contains("alsa_output.pci-0000_28_00.4.analog-stereo"));
 
         // No nick: fall back to the description, and do not print it twice.
-        let bare = device_line(&device(12, "sink-b", "HDMI", ""), &[], None);
+        let bare = device_line(&device(12, "sink-b", "HDMI", ""), &[], None, false);
         assert_eq!(bare.matches("HDMI").count(), 1);
     }
 
@@ -686,6 +790,7 @@ mod tests {
             &device(39, "sink-a", "Analog", "ALC892 Analog"),
             &ports(),
             None,
+            false,
         );
         assert!(multi.contains("[Headphones]"));
 
@@ -694,11 +799,12 @@ mod tests {
             &device(43, "sink-hdmi", "HDMI", "Dell AW3423DW"),
             &ports(),
             None,
+            false,
         );
         assert!(!single.contains("[HDMI / DisplayPort]"));
 
         // No ports at all (virtual sink).
-        let none = device_line(&device(60, "null", "Null", "Null"), &ports(), None);
+        let none = device_line(&device(60, "null", "Null", "Null"), &ports(), None, false);
         assert!(!none.contains('['));
     }
 
@@ -769,6 +875,7 @@ mod tests {
             &device(39, "sink-a", "Analog", "ALC892 Analog"),
             &ports(),
             Some("Sennheiser HD 650"),
+            false,
         );
         let first = line.lines().next().expect("a first line");
         assert!(first.contains("[Headphones]"));
@@ -783,8 +890,96 @@ mod tests {
             &device(39, "sink-a", "Analog", "ALC892 Analog"),
             &ports(),
             None,
+            false,
         );
         assert!(!off.contains("{eq:"));
+    }
+
+    /// SPEC §8.1: `outputs` appends `[auto-mute]` after the port bracket while
+    /// the card's Auto-Mute Mode is enabled.
+    #[test]
+    fn device_line_shows_the_auto_mute_tag_after_the_port() {
+        let line = device_line(
+            &device(39, "sink-a", "Analog", "ALC892 Analog"),
+            &ports(),
+            Some("Sennheiser HD 650"),
+            true,
+        );
+        let first = line.lines().next().expect("a first line");
+        assert!(first.contains("[auto-mute]"));
+        assert!(
+            first.find("[Headphones]") < first.find("[auto-mute]"),
+            "the auto-mute tag must come after the port bracket: {first}"
+        );
+        assert!(
+            first.find("{eq:") < first.find("[auto-mute]"),
+            "the auto-mute tag must come after the eq bracket: {first}"
+        );
+
+        // Disabled means no tag at all.
+        let off = device_line(
+            &device(39, "sink-a", "Analog", "ALC892 Analog"),
+            &ports(),
+            None,
+            false,
+        );
+        assert!(!off.contains("[auto-mute]"));
+    }
+
+    /// A node with no `AutoMute` row — a virtual sink, an HDMI card without
+    /// the control, or an older daemon with no such property — reads as off.
+    #[test]
+    fn auto_mute_rows_are_looked_up_by_node_id() {
+        let rows: Vec<AutoMuteTuple> = vec![(39, true), (43, false)];
+        assert!(auto_mute_on(&rows, 39));
+        assert!(!auto_mute_on(&rows, 43));
+        assert!(!auto_mute_on(&rows, 60));
+        assert!(!auto_mute_on(&[], 39));
+    }
+
+    #[test]
+    fn auto_mute_state_spellings() {
+        for value in ["on", "ON", " true ", "yes", "1", "Enabled"] {
+            assert_eq!(parse_on_off(value), Some(true), "{value} should mean on");
+        }
+        for value in ["off", "OFF", "false", "no", "0", "Disabled"] {
+            assert_eq!(parse_on_off(value), Some(false), "{value} should mean off");
+        }
+        for value in ["toggle", "", "maybe"] {
+            assert_eq!(parse_on_off(value), None, "{value} should not parse");
+        }
+    }
+
+    /// `pipedeck automute` lists; `pipedeck automute <id> on|off` sets.
+    #[test]
+    fn automute_parses_with_and_without_arguments() {
+        let cli = Cli::try_parse_from(["pipedeck", "automute"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Cmd::AutoMute {
+                id: None,
+                state: None
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["pipedeck", "automute", "39", "off"]).expect("parses");
+        match cli.command {
+            Cmd::AutoMute { id, state } => {
+                assert_eq!(id, Some(39));
+                assert_eq!(state.as_deref(), Some("off"));
+            }
+            other => panic!("wrong subcommand: {other:?}"),
+        }
+
+        // An id with no state parses; the command itself is what complains.
+        let cli = Cli::try_parse_from(["pipedeck", "automute", "39"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Cmd::AutoMute {
+                id: Some(39),
+                state: None
+            }
+        ));
     }
 
     #[test]

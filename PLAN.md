@@ -92,6 +92,24 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
   `pw-link` to `<sink>:monitor_*` by hand.
 - ☐ Panel §7.5.12 — Jan's logout/login pending (extension v3 installed + enabled).
 
+## Phase 7 — ALSA auto-mute (SPEC §8) — agent: extension (§8.2) + daemon agent (crates/), concurrent 2026-09-06
+- ☑ Daemon side complete against SPEC §8.1: `crates/pipedeckd/src/alsa_mixer.rs` (policy + mixer),
+  `alsa.card`/card-name props in `pw.rs`, `[alsa]` config table, `AutoMute`/`SetAutoMute` in
+  `service.rs`, `pipedeck automute` + the `[auto-mute]` tag in the CLI. 132 tests, all four
+  container checks clean.
+- ☑ Extension side complete against SPEC §8.2 (see Handoffs below).
+- ☑ **Interface diff is CLEAN** — the regenerated `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`
+  and `extension/dbus.js`'s hand-written block agree on `AutoMute a(ub)` and
+  `SetAutoMute(node_id u, enabled b)`, argument names and order included.
+- ☐ Live verification on chronos (SPEC §8.3 13–16) — main session, needs the real ALC892.
+
+## Phase 7 — ALSA auto-mute (SPEC §8)  — **LIVE on chronos 2026-09-06, released 1.2.0**
+- ☑ Daemon (alsa-lib via the `alsa` crate, policy `auto`, per-card persistence), CLI, extension v4.
+- ☑ Live §8.3 13/14/15: list shows the ALC892 switch; `amixer … Enabled` + `set-port lineout` with
+  headphones in → daemon turns it off (journal line) and stores `"HD-Audio Generic" = false`;
+  restart re-applies; explicit on/off round-trips with `amixer`. Systemd user unit can write the control.
+- ☐ §8.3 16 (panel switch row) — Jan's next logout/login.
+
 ## v1.2 ideas (from first real use, 2026-09-05)
 - **ALSA Auto-Mute Mode.** On Realtek codecs, `Auto-Mute Mode = Enabled` hard-mutes Line Out while
   a headphone plug is present, so selecting the Line Out port produces silence. Not fixable via
@@ -858,3 +876,248 @@ pipedeck ports && pipedeck streams
 - **`{eq: <name>}` shows on `status`, `outputs` and `inputs`** (they share one `device_line`
   renderer); SPEC §7.3 only asked for `outputs`, and sources never have an EQ row so it is invisible
   there anyway. Same reasoning as the Phase 5 port bracket.
+
+### Phase 7 (extension side) — SPEC §8.2 ALSA auto-mute switch (2026-09-06)
+
+**Lane touched: `extension/**` only.** Built directly against SPEC §8.1's contract, concurrently
+with the daemon agent — **at the time of this work the checked-in
+`crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml` did not yet have `AutoMute`/`SetAutoMute`.**
+Whichever side lands second should diff and reconcile per the file's own header note; this
+extension is written to match the spec exactly, argument names included:
+
+```xml
+<property name="AutoMute" type="a(ub)" access="read"/>
+<method name="SetAutoMute">
+  <arg name="node_id" type="u" direction="in"/>
+  <arg name="enabled" type="b" direction="in"/>
+</method>
+```
+
+- **`dbus.js`**: added both to the hand-written XML block and the top-of-file wire-type comment,
+  following the existing `Eq`/`EqPresets` pattern (absent property on an older daemon → `undefined`
+  on the proxy → `extension.js` normalizes to `null` → nothing rendered, nothing thrown).
+- **`extension.js`**:
+  - `unpackAutoMute([nodeId, enabled])` next to `unpackEq`.
+  - `rebuild()` builds `autoMuteByNode = autoMute ? new Map(autoMute.map(a => [a.nodeId, a.enabled])) : null`
+    and passes it **only** to the Output section's `_rebuildDeviceSection` call — the Input call
+    doesn't get it, so the switch structurally cannot appear there even if a future daemon ever put
+    an input row in `AutoMute`.
+  - `_rebuildDeviceSection` takes the map as an optional 4th param and, after building a device's
+    port row(s) (or its single row), appends `_buildAutoMuteItem(device.id, enabled)` when the map
+    has an entry for that device id (`!== undefined` check, since `false` is a valid enabled value)
+    — hidden otherwise, hidden entirely when the map itself is `null`.
+  - `_buildAutoMuteItem` is a `PopupMenu.PopupSwitchMenuItem('Auto-mute speakers when headphones
+    are plugged in', enabled)` whose `toggled` handler calls `SetAutoMute` through the same
+    `_proxyOps`/`_callRemote` pattern as everything else (try/catch inside `_callRemote`,
+    `.catch(() => {})` at the call site).
+  - **No re-fire guard was needed beyond the existing rebuild-in-place architecture**: every device
+    section is `removeAll()`'d and rebuilt with brand-new items on every `Changed`/
+    `PropertiesChanged` tick (same as the port rows, device rows, EQ rows — nothing in this section
+    is a long-lived widget with `update()`, unlike `AppVolumeRow`). `PopupSwitchMenuItem` only
+    emits `toggled` from an actual user click/keyboard activation, never from the constructor's
+    initial `active` value, and this code never calls `.setToggleState()` on a live item — so a
+    daemon-driven flip (the automatic-switch case SPEC §8.2 calls out) arrives as a freshly
+    constructed switch already showing the new state, with no `toggled` signal in the loop to
+    re-fire. Documented inline at `_buildAutoMuteItem`.
+  - `setAutoMute` proxy-op wired into `PipeDeckIndicator`'s constructor alongside `setEq`/`setPort`.
+- **Unrelated fix folded in per a mid-task note from the coordinator**: `lookupAppIcon` was calling
+  `Gio.DesktopAppInfo.new(...)`, which on GNOME Shell 46+ logs "Gio.DesktopAppInfo has been moved to
+  a separate platform-specific library... use GioUnix.DesktopAppInfo instead" on every single call —
+  spamming the journal on every menu rebuild (observed live on GNOME 50). Fixed with a **lazy dynamic
+  `import('gi://GioUnix')`** at module scope (not a static `import ... from 'gi://GioUnix'`): a
+  static import would hard-fail the whole module's load on a shell/build without that typelib
+  (confirmed: `make ext-check`'s Docker image does NOT have it — see verification below), whereas
+  the dynamic form just rejects and the `.catch()` leaves the pre-existing `Gio.DesktopAppInfo`
+  fallback (`DesktopAppInfoCtor`) in place, functional but with the noisier log. `lookupAppIcon`'s
+  never-throws contract is unchanged.
+- **`metadata.json`**: `version` 3 → 4, `version-name` untouched (still "1.1.0").
+- **Verification, in the `pipedeck-dev` Docker image** (`docker run … pipedeck-dev sh -c '…'`):
+  - `python3 -m json.tool metadata.json` — valid.
+  - `gjs -c 'import("./dbus.js").then(()=>print("loaded OK"))'` → `dbus.js loaded OK`, clean.
+  - `gjs -c 'import("./extension.js").catch(e => print("REASON: " + e.message))'` →
+    `REASON: Unable to load file from: resource:///org/gnome/shell/extensions/extension.js (The
+    resource at "/org/gnome/shell/extensions/extension.js" does not exist)` — the one expected
+    failure, nothing else. Confirmed **identical** to the pre-change baseline via `git stash`
+    (byte-for-byte same warning before and after), so neither the AutoMute wiring nor the GioUnix
+    dynamic import changed the failure signature; the dynamic import's rejection is swallowed by its
+    own `.catch()` well before this outer promise resolves/rejects.
+- **Not done here (daemon lane)**: SPEC §8.3 acceptance 13–16 (live `pipedeck automute` /
+  `amixer` / restart-persistence / panel checks) need the daemon's `AutoMute`/`SetAutoMute` landed
+  and a real ALC892 host — main session, per this repo's "subagents never SSH to the integration
+  host" rule.
+
+### Phase 7 (daemon side) — SPEC §8.1 ALSA auto-mute (2026-09-06)
+
+**Lane touched: `crates/**` + `Cargo.lock` only. Nothing committed. Version stays 1.1.0.**
+
+- **New dependency `alsa`** (alsa-rs). `cargo add alsa` inside the container resolved **0.12.1**,
+  not the 0.9.x the brief named — 0.9 is long superseded on crates.io. The mixer API is the one the
+  brief described, verified against the vendored source rather than guessed:
+  `Mixer::new("hw:1", false)` (opens + registers the simple-element class + loads in one call),
+  `find_selem(&SelemId::new("Auto-Mute Mode", 0)) -> Option<Selem>`, `is_enumerated()`,
+  `get_enum_items() -> Result<u32>`, `get_enum_item_name(u32) -> Result<String>`,
+  `get_enum_item(SelemChannelId::mono()) -> Result<u32>`, `set_enum_item(channel, idx)`.
+  `Cargo.lock` gained `alsa 0.12.1` + `alsa-sys 0.6.1`.
+  → **packaging lane: `libasound2-dev` is now a BUILD dependency on the target host.** `install.sh`
+  runs `cargo build --release` on chronos, and without the ALSA headers + pkg-config file that build
+  fails at `alsa-sys`. The dev image already has it (alsa 1.2.15). Runtime needs only
+  `libasound.so.2`, which any PipeWire host has. Worth a line in README's requirements too.
+
+- **New module `crates/pipedeckd/src/alsa_mixer.rs`** — the only module that links alsa-lib, the
+  same way `pw.rs` is the only one that links libpipewire. Two impure functions,
+  `probe(card) -> Option<bool>` and `set(card, enabled) -> Result<(), String>`; everything else is
+  pure and unit-tested: `AutoMutePolicy` (`auto`/`manual`), `is_headphones_route`,
+  `should_disable_auto_mute(route_name, headphones_route_available, currently_enabled, policy)`,
+  `card_device` (`1` → `hw:1`), `enum_item_enabled` and `enum_index_for` (case-insensitive
+  `Enabled`/`Disabled`, and the item *order* is read off the card, never assumed).
+  - `probe` returns `None` for "no such control", "cannot open the mixer" **and** "the control
+    reports an item we do not understand" — all three mean the same thing to every caller ("this
+    card is not one we can help with") and all three are cached.
+  - A fresh `Mixer` per call is deliberate: a long-lived handle would need `handle_events()`
+    polling to notice `amixer`/`alsactl` changes made behind our back, and these calls are rare.
+  - `set` writes `SelemChannelId::mono()` only, per the brief. On the ALC892 the control is mono;
+    if a card ever turns up with a per-channel `Auto-Mute Mode`, this writes the first channel only.
+    Flagging rather than speculatively looping over channels.
+
+- **`pw.rs`** — `alsa_card_from(props)` reads `alsa.card` plus the first non-empty of
+  `alsa.card_name` / `api.alsa.card.name` / `alsa.long_card_name` / `api.alsa.card.longname`,
+  falling back to `hw:<index>` for the name. **Read in `on_node_info`, not from the registry
+  global** — same whitelist trap that ate the EQ node detection on 2026-09-02; the `on_node_global`
+  call is there only so a future PipeWire that *does* whitelist them is handled for free.
+  `publish()` fills `State.cards: BTreeMap<node id, AlsaCard>` for **port-capable sinks only**
+  (`node_device()` is `Some` and `kind == Sink`), which is what makes "the route is an Output
+  route" structurally true for the policy without threading a direction through. The PipeWire
+  thread never calls `probe`/`set`.
+
+- **`config.rs`** — new `[alsa]` table exactly as SPEC §8.1 spells it:
+  `auto_mute_policy = "auto"|"manual"` plus `[alsa.auto_mute] "<card name>" = true|false`.
+  Serialised shape verified by hand:
+  ```toml
+  notification_sink = "sink-a"
+  notification_apps = ["Discord"]
+
+  [eq]
+  "alsa_output.x" = "hd650"
+
+  [alsa]
+  auto_mute_policy = "auto"
+
+  [alsa.auto_mute]
+  "HDA Intel PCH" = false
+  ```
+  `AlsaConfig` has a hand-written `Default` (policy `"auto"`), and `Config` keeps its container-level
+  `#[serde(default)]`, so a v1.1 config with no `[alsa]` table loads and gains the defaults. Values
+  of the wrong type are ignored, not rejected — same rule `[eq]` already follows. `normalize()`
+  rewrites the policy to its canonical spelling, so an unrecognised value degrades to `auto` on the
+  next save rather than lingering. Every pre-existing config test still passes untouched (one
+  struct literal gained `..Config::default()`).
+
+- **`service.rs`** — `AutoMuteCache = BTreeMap<card index, Option<bool>>` behind a `tokio::Mutex` on
+  the `Daemon`, and `spawn_probe`/`spawn_set` wrap the two mixer calls in `spawn_blocking`.
+  - `sync_auto_mute(force)` reconciles the cache with the snapshot's cards. **Only a newly
+    discovered card has its persisted choice re-applied**; a forced re-probe observes and never
+    corrects. That distinction is deliberate and is what makes acceptance §8.3 14 mean anything: if
+    a forced re-probe re-applied, `amixer … Enabled` would be undone by the re-probe rather than by
+    `SetPort`'s policy, and the test would pass for the wrong reason. "Newly discovered" covers both
+    SPEC cases — startup (empty cache on the first published revision) and "the card's sink
+    appeared" — and is also why a daemon restart re-applies (§8.3 15).
+  - The **change notifier** calls `sync_auto_mute(false)` before it emits, so the appear-hook needs
+    no extra task and no extra watch channel; it emits `PropertiesChanged` for `AutoMute` alongside
+    the other four.
+  - `SetPort` reads the **requested** route's name off the snapshot *before* dispatching the write
+    (the snapshot's `active` flag only catches up once the card re-enumerates, so reading it back
+    afterwards would race), then runs `maybe_disable_auto_mute` and a forced re-probe.
+  - `SetAutoMute(node_id, enabled)`: `NotFound` for an unknown node, `InvalidArgument` for an input
+    node, for a node with no ALSA card row, and for a card that probes as having no control (it is
+    probed on demand for exactly this, so the error is real rather than a silent no-op). A mixer
+    write that fails comes back as `dev.pipedeck.Error.PipeWire`.
+  - **`SetPort`, `SetAutoMute` and `Refresh` each got an emitter-free `do_*` twin.** The interface
+    methods now take `#[zbus(signal_emitter)]`, which cannot be constructed in a unit test, so the
+    bodies live in the `do_*` inherent methods and the tests drive those — same split
+    `validate_set_eq` already used. `SetPort`'s D-Bus signature is unchanged.
+  - **Lock order is config → cache, never nested.** `persist_auto_mute` logs and continues on a
+    failed config write rather than returning an error, because the mixer has already moved and
+    refusing the call would leave the daemon reporting a state it just left.
+
+- **CLI** — `pipedeck automute` lists `(node id, on/off, nick)`; `pipedeck automute <id> on|off`
+  sets. `status`/`outputs`/`inputs` append `[auto-mute]` after the port and `{eq: …}` brackets.
+  `AutoMute` is fetched with `.unwrap_or_default()`, so the CLI still works against a v1.1 daemon.
+
+- **Tests: 132 (was 111)** — 111 daemon lib + 21 CLI. New: 6 in `alsa_mixer` (policy round-trip,
+  headphone-name matching, the five-way decision table, `hw:N`, item-name matching, index lookup
+  including a card whose items we do not understand), 1 in `state` (`port_name` /
+  `headphones_available` / `card_of`), 3 in `config` (`[alsa]` round-trip incl. a wrong-typed value,
+  unknown-policy fallback + normalisation, a v1.1 config with no `[alsa]` table), 7 in `service`
+  (row projection, card dedupe by index, `SetAutoMute` validation sync + async, empty-graph sync,
+  the property following cache *and* snapshot, and the snapshot feeding both policy inputs), 4 in
+  the CLI (tag placement, row lookup, `on`/`off` spellings, arg parsing). `cargo build`,
+  `cargo test`, `cargo clippy --all-targets -D warnings` and `cargo fmt --check` are all clean in
+  `pipedeck-dev`, as is `make presets-check`.
+
+**→ extension agent: the final XML.** `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml` is
+regenerated and **already agrees with `extension/dbus.js`** — diffed, nothing to change:
+```xml
+<property name="AutoMute" type="a(ub)" access="read"/>
+<method name="SetAutoMute">
+  <arg name="node_id" type="u" direction="in"/>
+  <arg name="enabled" type="b" direction="in"/>
+</method>
+```
+Everything else in the interface is byte-identical to v1.1. `AutoMute` rows exist **only** for
+sinks whose card has the control, so `autoMuteByNode.has(device.id)` is the right test and an HDMI
+or virtual sink simply has no row — exactly what §8.2's "hidden for devices without a row" wants.
+
+**→ main session, SPEC §8.3 live tests on chronos** (needs the real ALC892; `<id>` is the analog
+sink's node id from `pipedeck outputs`, card index from `alsa.card`, historically `1`):
+```bash
+# 13 — the list agrees with amixer
+pipedeck automute
+amixer -c 1 cget name='Auto-Mute Mode'
+
+# 14 — the automatic switch, with headphones physically plugged in
+amixer -c 1 sset "Auto-Mute Mode" Enabled
+pipedeck outputs                       # expect [auto-mute] on the ALC892 row
+pipedeck set-port <id> analog-output-lineout
+journalctl --user -u pipedeckd -n 20 | grep -i auto-mute
+#   expect: "headphones are plugged in and a speaker port was selected; turned ALSA
+#            Auto-Mute Mode off"
+pipedeck automute                      # now off
+amixer -c 1 cget name='Auto-Mute Mode' # : values=0  (Disabled)
+# ... and speakers actually play. Then:
+pipedeck set-port <id> analog-output-headphones   # must NOT turn it back on
+pipedeck automute                                 # still off
+
+# 15 — the stored choice survives a restart and an external change
+grep -A3 '\[alsa' ~/.config/pipedeck/config.toml
+amixer -c 1 sset "Auto-Mute Mode" Enabled
+systemctl --user restart pipedeckd
+sleep 2 && pipedeck automute           # off again, from the config
+amixer -c 1 cget name='Auto-Mute Mode' # : values=0
+
+# manual round-trip + the manual policy
+pipedeck automute <id> on  && pipedeck automute
+pipedeck automute <id> off && pipedeck automute
+#   with `auto_mute_policy = "manual"` in [alsa], SetPort must leave it alone
+```
+Watch for: no ALSA errors in `journalctl --user -u pipedeckd`, and `pipedeck automute` on a host
+whose card has no such control printing `(no cards with an `Auto-Mute Mode` control)` rather than
+erroring.
+
+**What can only be checked live:**
+1. That `alsa.card` and one of the four card-name keys really do arrive in the ALC892 sink node's
+   `info` props (the whole card→mixer mapping hangs off this; `pw-dump <node id> | jq '.[].info.props'`
+   is the check, and `pipedeck automute` printing an empty list is the symptom if they do not).
+2. Which card-name key wins in practice, and whether it is stable across reboots — it is the
+   `[alsa.auto_mute]` key, so an unstable one would silently orphan the stored choice.
+3. That `Mixer::new("hw:1", …)` from inside the daemon's systemd user unit has permission to *write*
+   the control (reads are near-certain; the write is the one that could hit an ACL).
+4. Whether the headphones route's `available` flag flips promptly on plug/unplug on this codec.
+   The automatic switch is gated on it, and note the inherited semantics: `Port.available` comes
+   from `Availability::is_selectable()`, which maps **`unknown` → true**. So a card with no jack
+   detection reads as "a plug is in" and the policy would fire the first time a speaker port is
+   selected. That is a deliberate accepted call — auto-mute is useless on a card that cannot detect
+   the jack anyway, so turning it off there costs nothing — but it is the one case where the
+   daemon acts without real evidence, and the ALC892 (which SPEC §6 shows reporting `available yes`)
+   is not the card that would expose it.
+5. The `spawn_blocking` timing: whether a mixer open/load inside `SetPort`'s reply path adds any
+   perceptible latency to a port switch in the panel.

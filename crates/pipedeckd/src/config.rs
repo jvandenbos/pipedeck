@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::alsa_mixer::AutoMutePolicy;
+
 /// Directory name under the XDG config root.
 const APP_DIR: &str = "pipedeck";
 /// File name of the config.
@@ -62,6 +64,34 @@ pub struct Config {
     /// Kept as a raw table rather than a typed map so a hand-edited file with
     /// an unexpected value round-trips untouched instead of refusing to load.
     pub eq: toml::Table,
+    /// ALSA mixer settings — the `Auto-Mute Mode` policy and the per-card
+    /// choice the daemon remembers (SPEC §8.1).
+    pub alsa: AlsaConfig,
+}
+
+/// The `[alsa]` table (SPEC §8.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlsaConfig {
+    /// `auto` (default) or `manual`. Anything else reads as `auto`, so a typo
+    /// cannot stop the daemon from starting.
+    pub auto_mute_policy: String,
+    /// `"<card name>" = true|false` — the remembered `Auto-Mute Mode` choice,
+    /// keyed by `alsa.card_name`/`api.alsa.card.longname` because card
+    /// *indices* move between boots.
+    ///
+    /// A raw table for the same reason `[eq]` is one: a hand-edited value of
+    /// the wrong type round-trips instead of refusing to load.
+    pub auto_mute: toml::Table,
+}
+
+impl Default for AlsaConfig {
+    fn default() -> Self {
+        Self {
+            auto_mute_policy: AutoMutePolicy::Auto.as_str().to_owned(),
+            auto_mute: toml::Table::new(),
+        }
+    }
 }
 
 impl Config {
@@ -175,9 +205,52 @@ impl Config {
         entries
     }
 
+    /// The `Auto-Mute Mode` policy (SPEC §8.1).
+    ///
+    /// An unrecognised spelling reads as the default `auto` rather than
+    /// erroring — the file is hand-editable and a typo must not wedge the
+    /// daemon.
+    #[must_use]
+    pub fn auto_mute_policy(&self) -> AutoMutePolicy {
+        AutoMutePolicy::parse(&self.alsa.auto_mute_policy).unwrap_or_default()
+    }
+
+    /// The remembered `Auto-Mute Mode` choice for a card, if there is one.
+    ///
+    /// A non-boolean value is ignored rather than rejected, matching
+    /// [`Config::eq_preset`].
+    #[must_use]
+    pub fn auto_mute(&self, card_name: &str) -> Option<bool> {
+        self.alsa
+            .auto_mute
+            .get(card_name)
+            .and_then(toml::Value::as_bool)
+    }
+
+    /// Remember a card's `Auto-Mute Mode` choice.
+    pub fn set_auto_mute(&mut self, card_name: &str, enabled: bool) {
+        self.alsa
+            .auto_mute
+            .insert(card_name.to_owned(), toml::Value::Boolean(enabled));
+    }
+
+    /// Every `(card name, enabled)` pair in `[alsa.auto_mute]`, sorted.
+    #[must_use]
+    pub fn auto_mute_entries(&self) -> Vec<(String, bool)> {
+        let mut entries: Vec<(String, bool)> = self
+            .alsa
+            .auto_mute
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_bool()?)))
+            .collect();
+        entries.sort();
+        entries
+    }
+
     /// Trim whitespace and drop empty entries so comparisons are predictable.
     pub fn normalize(&mut self) {
         self.notification_sink = self.notification_sink.trim().to_owned();
+        self.alsa.auto_mute_policy = self.auto_mute_policy().as_str().to_owned();
         self.notification_apps = self
             .notification_apps
             .iter()
@@ -217,6 +290,92 @@ mod tests {
         assert!(config.notification_sink.is_empty());
         assert!(config.notification_apps.is_empty());
         assert!(config.eq.is_empty());
+        assert!(config.alsa.auto_mute.is_empty());
+        // SPEC §8.1: `auto` is the default policy.
+        assert_eq!(config.auto_mute_policy(), AutoMutePolicy::Auto);
+    }
+
+    /// SPEC §8.1: `[alsa]` carries `auto_mute_policy` plus a card-name-keyed
+    /// `[alsa.auto_mute]` map, and the whole thing survives a save/load.
+    #[test]
+    fn alsa_table_round_trips() {
+        let mut config = Config::from_toml(
+            r#"
+[alsa]
+auto_mute_policy = "manual"
+[alsa.auto_mute]
+"HDA Intel PCH" = false
+"USB Audio" = true
+"broken" = "yes"
+"#,
+        )
+        .expect("parses");
+
+        assert_eq!(config.auto_mute_policy(), AutoMutePolicy::Manual);
+        assert_eq!(config.auto_mute("HDA Intel PCH"), Some(false));
+        assert_eq!(config.auto_mute("USB Audio"), Some(true));
+        // A hand-edited value of the wrong type reads as "no choice", never as
+        // a parse error.
+        assert_eq!(config.auto_mute("broken"), None);
+        assert_eq!(config.auto_mute("absent"), None);
+        assert_eq!(
+            config.auto_mute_entries(),
+            vec![
+                ("HDA Intel PCH".to_owned(), false),
+                ("USB Audio".to_owned(), true)
+            ]
+        );
+
+        config.set_auto_mute("Dell AW3423DW", true);
+        assert_eq!(config.auto_mute("Dell AW3423DW"), Some(true));
+        config.set_auto_mute("Dell AW3423DW", false);
+        assert_eq!(config.auto_mute("Dell AW3423DW"), Some(false));
+
+        let again = Config::from_toml(&config.to_toml().expect("serialise")).expect("reparse");
+        assert_eq!(again, config);
+        assert!(again.alsa.auto_mute.contains_key("broken"));
+    }
+
+    /// An unrecognised policy reads as `auto` and normalises to it, so a typo
+    /// cannot stop the daemon from starting.
+    #[test]
+    fn unknown_policy_falls_back_to_auto() {
+        let config = Config::from_toml(
+            r#"
+[alsa]
+auto_mute_policy = "aggressive"
+"#,
+        )
+        .expect("parses");
+        assert_eq!(config.auto_mute_policy(), AutoMutePolicy::Auto);
+        assert_eq!(config.alsa.auto_mute_policy, "auto");
+
+        // ... and the accepted spellings are normalised, not just parsed.
+        let config = Config::from_toml(
+            r#"
+[alsa]
+auto_mute_policy = "  MANUAL  "
+"#,
+        )
+        .expect("parses");
+        assert_eq!(config.alsa.auto_mute_policy, "manual");
+    }
+
+    /// A config written by v1.1 must still load, and must gain the defaults.
+    #[test]
+    fn a_config_without_an_alsa_table_still_loads() {
+        let config = Config::from_toml(
+            r#"
+notification_sink = "sink-a"
+notification_apps = ["Discord"]
+[eq]
+"alsa_output.analog-stereo" = "hd650"
+"#,
+        )
+        .expect("parses");
+        assert_eq!(config.notification_sink, "sink-a");
+        assert_eq!(config.auto_mute_policy(), AutoMutePolicy::Auto);
+        assert!(config.auto_mute_entries().is_empty());
     }
 
     #[test]
@@ -268,7 +427,7 @@ notification_apps = ["  Discord ", "", "   "]
         let mut original = Config {
             notification_sink: "alsa_output.pci-0000_0c_00.4.analog-stereo".to_owned(),
             notification_apps: vec!["Discord".to_owned(), "Slack".to_owned()],
-            eq: toml::Table::new(),
+            ..Config::default()
         };
         original.normalize();
 

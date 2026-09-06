@@ -50,6 +50,25 @@ pub type StreamTuple = (u32, String, String, String, String, f64, bool);
 pub type EqTuple = (u32, String);
 /// D-Bus tuple for one entry of the `EqPresets` property: `(ss)` — `(id, name)`.
 pub type EqPresetTuple = (String, String);
+/// D-Bus tuple for one entry of the `AutoMute` property: `(ub)` —
+/// `(node_id, enabled)`, one row per sink whose card has the control
+/// (SPEC §8.1).
+pub type AutoMuteTuple = (u32, bool);
+
+/// The ALSA card behind a routed sink (SPEC §8.1).
+///
+/// Published by the PipeWire thread from the node's own `info` props — neither
+/// `alsa.card` nor the card-name keys are in the registry global's property
+/// whitelist. It never goes on the wire itself: it is what the D-Bus side needs
+/// in order to find the right mixer and the right config key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlsaCard {
+    /// `alsa.card` — the card index, i.e. `hw:<index>`.
+    pub index: u32,
+    /// `alsa.card_name`, falling back to the longname and then to `hw:<index>`.
+    /// This is the key `[alsa.auto_mute]` uses, because indices move.
+    pub name: String,
+}
 
 /// A sink or source node.
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +161,9 @@ pub struct State {
     pub streams: BTreeMap<u32, Stream>,
     /// Selectable ports, ordered by `(node id, route index)` (SPEC §6.1).
     pub ports: Vec<Port>,
+    /// The ALSA card behind each port-capable sink, by node id (SPEC §8.1).
+    /// Sinks only: an output route is the only thing auto-mute affects.
+    pub cards: BTreeMap<u32, AlsaCard>,
     /// The EQ preset in force on each output device, ordered by node id; an
     /// empty string is "off" (SPEC §7.3). One row per output device, routed or
     /// not — but never for the daemon's own hidden EQ nodes.
@@ -203,6 +225,31 @@ impl State {
     #[must_use]
     pub fn active_port(&self, node_id: u32) -> Option<&Port> {
         self.ports_of(node_id).find(|p| p.active)
+    }
+
+    /// The `name` of one of a node's ports, by route index.
+    ///
+    /// Read *before* a `SetPort` write, because the snapshot's `active` flag
+    /// only catches up once the card re-enumerates its routes.
+    #[must_use]
+    pub fn port_name(&self, node_id: u32, route_index: u32) -> Option<&str> {
+        self.ports_of(node_id)
+            .find(|p| p.index == route_index)
+            .map(|p| p.name.as_str())
+    }
+
+    /// Does this node have a headphones port that the card reports as
+    /// available — i.e. is a plug in? (SPEC §8.1.)
+    #[must_use]
+    pub fn headphones_available(&self, node_id: u32) -> bool {
+        self.ports_of(node_id)
+            .any(|p| p.available && crate::alsa_mixer::is_headphones_route(&p.name))
+    }
+
+    /// The ALSA card behind a node, when it has one.
+    #[must_use]
+    pub fn card_of(&self, node_id: u32) -> Option<&AlsaCard> {
+        self.cards.get(&node_id)
     }
 
     /// Look up a device by `node.name`.
@@ -346,6 +393,54 @@ mod tests {
         assert_eq!(state.ports_of(39).count(), 2);
         assert_eq!(state.active_port(39).map(|p| p.index), Some(4));
         assert_eq!(state.active_port(99), None);
+    }
+
+    /// SPEC §8.1: the automatic switch needs the *requested* route's name and
+    /// whether the headphones route is available, both read off the snapshot.
+    #[test]
+    fn port_name_and_headphone_availability_come_off_the_snapshot() {
+        let port = |node_id, index, name: &str, available| Port {
+            node_id,
+            index,
+            name: name.to_owned(),
+            description: name.to_owned(),
+            available,
+            active: false,
+        };
+        let state = State {
+            ports: vec![
+                port(39, 3, "analog-output-lineout", true),
+                port(39, 4, "analog-output-headphones", true),
+                port(43, 0, "hdmi-output-0", true),
+                port(47, 3, "analog-output-lineout", true),
+                port(47, 4, "analog-output-headphones", false),
+            ],
+            cards: BTreeMap::from([(
+                39,
+                AlsaCard {
+                    index: 1,
+                    name: "HDA Intel PCH".to_owned(),
+                },
+            )]),
+            ..State::default()
+        };
+
+        assert_eq!(state.port_name(39, 3), Some("analog-output-lineout"));
+        assert_eq!(state.port_name(39, 9), None);
+        assert_eq!(state.port_name(99, 3), None);
+
+        assert!(state.headphones_available(39));
+        // No headphones port at all, and one whose jack is empty.
+        assert!(!state.headphones_available(43));
+        assert!(!state.headphones_available(47));
+        assert!(!state.headphones_available(99));
+
+        assert_eq!(state.card_of(39).map(|c| c.index), Some(1));
+        assert_eq!(
+            state.card_of(39).map(|c| c.name.as_str()),
+            Some("HDA Intel PCH")
+        );
+        assert!(state.card_of(43).is_none());
     }
 
     /// SPEC §7.3: `Eq a(us)`, one row per output device, "" when off.

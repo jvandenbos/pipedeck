@@ -2,7 +2,7 @@
 
 SoundSource-style audio control for PipeWire desktops: a Quick Settings panel for GNOME Shell with output / input / **notification** device pickers, headphone-vs-speaker port switching, per-application volume, and a parametric equalizer with AutoEq import — built on nothing but libpipewire, WirePlumber and the GNOME Shell APIs.
 
-> **Status:** v1.1.0, first public release. Developed and tested on one machine (Ubuntu 26.04.1,
+> **Status:** v1.2.0. Developed and tested on one machine (Ubuntu 26.04.1,
 > GNOME Shell 50.1, PipeWire 1.6.2, WirePlumber 0.5.13, Realtek ALC892 + NVIDIA HDMI). Reports from
 > other cards, Bluetooth devices and multi-channel outputs are welcome. See [CHANGELOG.md](CHANGELOG.md).
 
@@ -11,7 +11,7 @@ SoundSource-style audio control for PipeWire desktops: a Quick Settings panel fo
 - **Output device picker** — Select the default audio output sink
 - **Input device picker** — Select the default audio input source  
 - **Notification device picker** — Route notification/event sounds independently (unique to PipeDeck)
-- **Ports** — Headphones, Line Out, HDMI… listed as separate rows even when they are ports of one card
+- **Ports** — Headphones, Line Out, HDMI… listed as separate rows even when they are ports of one card; the codec's *Auto-Mute Mode* (which silently kills line-out while headphones are plugged in) is detected and switched off for you
 - **Per-application volume sliders** — Control volume and mute for every playback stream
 - **Equalizer presets** — Parametric EQ per output via PipeWire's filter-chain, inserted transparently by WirePlumber as a smart filter; import headphone corrections straight from [AutoEq](https://github.com/jaakkopasanen/AutoEq)
 - **Menu-bar integration** — Built into GNOME Quick Settings for quick access
@@ -34,7 +34,7 @@ pipedeck CLI (Rust, same crate) ─────┘
 
 - **PipeWire** 1.0 or later (1.6 tested) and **WirePlumber** 0.5 or later (smart filters are needed for the EQ)
 - **GNOME Shell 50** for the panel (the daemon and CLI work on any desktop)
-- **Rust** 1.85+ with `libpipewire-0.3-dev`, `libclang-dev`, `pkg-config` to build (Ubuntu 26.04: `sudo apt install cargo rustc libpipewire-0.3-dev libclang-dev clang pkg-config build-essential`)
+- **Rust** 1.85+ with `libpipewire-0.3-dev`, `libclang-dev`, `pkg-config` to build (Ubuntu 26.04: `sudo apt install cargo rustc libpipewire-0.3-dev libclang-dev clang pkg-config build-essential libasound2-dev`)
 
 No dependency on EasyEffects, pavucontrol, or other external audio tools — PipeDeck uses only platform libraries (libpipewire, WirePlumber metadata, GNOME Shell APIs).
 

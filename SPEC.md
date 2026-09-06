@@ -319,3 +319,53 @@ empty. Subtitle unchanged.
 11. Restart daemon → EQ re-applied from config; remove the sink (or restart pipewire) → no crash,
     re-applied when it returns.
 12. Panel: Equalizer section switches presets on the default output.
+
+## 8. v1.2 — ALSA auto-mute detection and switch (2026-09-06)
+
+**Finding (live, ALC892):** the codec's ALSA mixer enum **`Auto-Mute Mode`** (`Enabled`/`Disabled`)
+hard-mutes the line-out whenever a headphone plug is present, whatever port software selects —
+"Line Out" in the panel produced silence. With it `Disabled`, ACP's port switching is fully
+exclusive (Headphones → `Front` off/`Headphone` on; Line Out → the reverse), so the port picker
+alone decides. Card index comes from the sink node's `alsa.card` prop (`"1"` → mixer `hw:1`);
+the control is `amixer -c 1 cget name='Auto-Mute Mode'` (ENUMERATED, items Disabled/Enabled).
+
+### 8.1 Daemon
+- New graph-free module `alsa_mixer.rs` using the **`alsa` crate** (alsa-lib bindings; `libasound2-dev`
+  in the image and on the target): `probe(card_index) -> Option<bool>` (Some(enabled) if the card
+  has an `Auto-Mute Mode` selem, None otherwise) and `set(card_index, enabled) -> Result`. Mixer
+  calls are quick but blocking; run them on the tokio side via `spawn_blocking`, never on the
+  PipeWire thread. Cache per card; re-probe on startup, on `Refresh`, after every `SetPort` /
+  `SetAutoMute`, and whenever a routed sink appears.
+- Nodes → card: sink nodes carrying `alsa.card` (from node info props; **not** in the registry
+  global) map to a card index; `Ports`-capable sinks only.
+- **Policy `auto` (default):** on `SetPort(node, route)` where the route is an *output* route that
+  is not the headphones route (name doesn't contain `headphone`) **and** the card's headphones
+  route is currently `available` (a plug is in) **and** auto-mute is `Enabled` → set it `Disabled`,
+  persist the choice, `info!` log it. Never re-enable automatically.
+- **Persisted choice:** config `[alsa.auto_mute] "<alsa.card_name or api.alsa.card.longname>" = false|true`
+  keyed by card *name* (indices move). Re-applied at startup and when the card's sink appears
+  (alsa-restore may have put the boot-time value back). Config key `alsa.auto_mute_policy = "auto" | "manual"`
+  (`manual` = never touch it unless `SetAutoMute` is called).
+- D-Bus (existing signatures unchanged):
+  ```
+  AutoMute   a(ub)    (node_id, enabled) — one row per sink whose card has the control
+  SetAutoMute(node_id u, enabled b)     NotFound (no such node) / InvalidArgument (card has no control)
+  ```
+  Emits `PropertiesChanged` + `Changed` like the rest.
+- CLI: `pipedeck automute` (list), `pipedeck automute <node id> on|off`; `outputs` appends
+  `[auto-mute]` after the port bracket while it is enabled.
+
+### 8.2 Extension
+- In the **Output** section, directly under a device's port rows, when `AutoMute` has a row for
+  that device: a `PopupSwitchMenuItem` "Auto-mute speakers when headphones are plugged in"
+  reflecting `enabled`; toggling calls `SetAutoMute`. Hidden for devices without a row. Older daemon
+  (property missing) → nothing rendered, nothing thrown.
+- No pop-ups; the daemon's automatic switch just shows up as the toggle flipping off.
+
+### 8.3 Acceptance
+13. `pipedeck automute` lists the ALC892 sink with its current state; `amixer` agrees.
+14. `amixer -c 1 sset "Auto-Mute Mode" Enabled`, then `pipedeck set-port <id> analog-output-lineout`
+    with headphones plugged → daemon flips it to Disabled (log line + `pipedeck automute` shows
+    off) and speakers play. Selecting Headphones afterwards leaves it Disabled.
+15. Restart daemon → stored choice re-applied even after `amixer … Enabled` in between.
+16. Panel: the switch row appears under the ALC892 rows and follows/controls the state.

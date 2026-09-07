@@ -15,7 +15,7 @@ use zbus::object_server::SignalEmitter;
 
 use crate::alsa_mixer;
 use crate::command::{await_reply, Command};
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::eq::{self, Preset};
 use crate::error::{Error, Result};
 use crate::pw::PwHandle;
@@ -383,6 +383,47 @@ impl Daemon {
         Ok(())
     }
 
+    /// `SetPortSwitchCap` without the `PropertiesChanged` emission (SPEC §9.2).
+    ///
+    /// Saves the config, then hands the PipeWire thread the new value — the
+    /// same read-modify-write-dispatch shape `SetEq` and the notification sink
+    /// use, so a failed save leaves both sides on the old cap.
+    async fn do_set_port_switch_cap(&self, percent: u32) -> Result<()> {
+        if percent > config::MAX_PORT_SWITCH_MAX_PERCENT {
+            return Err(Error::invalid(format!(
+                "the port-switch cap must be 0-{} percent (0 turns it off), got {percent}",
+                config::MAX_PORT_SWITCH_MAX_PERCENT
+            )));
+        }
+
+        let mut guard = self.config.lock().await;
+        if guard.port_switch_max_percent() == percent {
+            return Ok(());
+        }
+        let previous = guard.safety.port_switch_max_percent;
+        guard.set_port_switch_max_percent(percent);
+        let config = guard.clone();
+
+        if let Some(path) = self.config_path.as_ref() {
+            if let Err(e) = config.save_to(path) {
+                guard.safety.port_switch_max_percent = previous;
+                return Err(Error::from(e));
+            }
+        }
+        drop(guard);
+
+        let result = self
+            .dispatch(move |reply| Command::SetConfig {
+                config: Box::new(config),
+                reply,
+            })
+            .await;
+        if result.is_ok() {
+            info!(percent, "port-switch level cap set");
+        }
+        result
+    }
+
     /// `Refresh` without the `PropertiesChanged` emission.
     async fn do_refresh(&self) -> Result<()> {
         // SPEC §7.3: `EqPresets` is rescanned on Refresh.
@@ -491,6 +532,12 @@ impl Daemon {
     #[zbus(property)]
     async fn notification_sink(&self) -> String {
         self.config.lock().await.notification_sink.clone()
+    }
+
+    /// Ceiling on the level a port switch may restore, as a cubic-scale percentage; 0 means off.
+    #[zbus(property)]
+    async fn port_switch_cap(&self) -> u32 {
+        self.config.lock().await.port_switch_max_percent()
     }
 
     /// Daemon version string.
@@ -650,6 +697,17 @@ impl Daemon {
         result
     }
 
+    /// Set the port-switch level cap, as a cubic-scale percentage; 0 turns it off.
+    async fn set_port_switch_cap(
+        &self,
+        percent: u32,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<()> {
+        self.do_set_port_switch_cap(percent).await?;
+        let _ = self.port_switch_cap_changed(&emitter).await;
+        Ok(())
+    }
+
     /// Re-read every node's params and re-publish the snapshot.
     async fn refresh(&self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> Result<()> {
         self.do_refresh().await?;
@@ -803,6 +861,10 @@ mod tests {
         assert!(xml.contains(r#"<property name="Eq" type="a(us)" access="read"/>"#));
         // SPEC §8.1.
         assert!(xml.contains(r#"<property name="AutoMute" type="a(ub)" access="read"/>"#));
+        // SPEC §9.2's deviation: the cap is reachable over D-Bus so the CLI
+        // stays a pure D-Bus client.
+        assert!(xml.contains(r#"<property name="PortSwitchCap" type="u" access="read"/>"#));
+        assert!(xml.contains(r#"<arg name="percent" type="u" direction="in"/>"#));
         assert!(xml.contains(r#"<arg name="node_id" type="u" direction="in"/>"#));
         assert!(xml.contains(r#"<arg name="enabled" type="b" direction="in"/>"#));
         for method in [
@@ -814,6 +876,7 @@ mod tests {
             "SetPort",
             "SetEq",
             "SetAutoMute",
+            "SetPortSwitchCap",
             "Refresh",
         ] {
             assert!(
@@ -841,6 +904,39 @@ mod tests {
             daemon.do_set_port(3, 4).await,
             Err(Error::PipeWire(_))
         ));
+        // SPEC §9.2: a cap change has to reach the PipeWire thread to count.
+        assert!(matches!(
+            daemon.do_set_port_switch_cap(45).await,
+            Err(Error::PipeWire(_))
+        ));
+    }
+
+    /// SPEC §9.2: the cap is readable and settable over D-Bus, validates its
+    /// argument before touching anything, and no-ops when nothing changes.
+    #[tokio::test]
+    async fn port_switch_cap_reads_and_validates() {
+        let daemon = daemon();
+        // The default the property reports is SPEC §9.2's 60 %.
+        assert_eq!(daemon.port_switch_cap().await, 60);
+
+        // Above the daemon's own maximum volume is a rejection, not a clamp.
+        assert!(matches!(
+            daemon.do_set_port_switch_cap(151).await,
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(daemon.port_switch_cap().await, 60);
+
+        // Setting the value it already has short-circuits before the dispatch
+        // that would otherwise fail with no PipeWire thread behind it.
+        assert!(daemon.do_set_port_switch_cap(60).await.is_ok());
+
+        // `0` is a legal value (the cap off), so it gets as far as the
+        // dispatch — which fails here for want of a PipeWire thread. The
+        // config keeps the new value, exactly as `SetEq` and
+        // `SetNotificationSink` already behave: the save is the record of
+        // intent, the dispatch is the delivery.
+        assert!(daemon.do_set_port_switch_cap(0).await.is_err());
+        assert_eq!(daemon.port_switch_cap().await, 0);
     }
 
     /// Argument validation happens before anything is queued, so these must be

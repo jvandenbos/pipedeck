@@ -82,6 +82,15 @@ enum Cmd {
         /// `on` or `off`. Required when an id is given.
         state: Option<String>,
     },
+    /// Show or set the port-switch level cap (SPEC §9.2).
+    ///
+    /// WirePlumber restores volume per port, so switching from a quiet
+    /// headphone port to a loud speaker port jumps straight to the loud
+    /// level. The cap clamps whatever a PipeDeck-initiated switch restores.
+    Cap {
+        /// `0`-`150` (cubic percent, like `pipedeck vol`) or `off`. Omit to show.
+        value: Option<String>,
+    },
     /// Ask the daemon to re-read the graph.
     Refresh,
     /// Print a line every time the daemon signals a change.
@@ -194,6 +203,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Eq(cmd) => eq_command(&daemon, cmd).await,
         Cmd::AutoMute { id, state } => auto_mute_command(&daemon, id, state).await,
+        Cmd::Cap { value } => cap_command(&daemon, value).await,
         Cmd::Refresh => {
             daemon.refresh().await?;
             println!("refreshed");
@@ -587,6 +597,49 @@ async fn auto_mute_command(
     Ok(())
 }
 
+/// Highest cap the daemon will take, on the cubic scale (SPEC §9.2).
+const MAX_CAP_PERCENT: u32 = 150;
+
+/// Parse the argument of `pipedeck cap <0-150|off>` into a percentage.
+///
+/// `off`/`none`/`-` and a bare `0` all mean the same thing to the daemon: the
+/// rule is disabled. A trailing `%` is accepted because the output prints one.
+fn parse_cap(value: &str) -> Result<u32> {
+    let value = value.trim();
+    if is_off(value) {
+        return Ok(0);
+    }
+    let digits = value.strip_suffix('%').unwrap_or(value).trim();
+    let percent: u32 = digits.parse().map_err(|_| {
+        anyhow::anyhow!("expected a percentage 0-{MAX_CAP_PERCENT} or `off`, got `{value}`")
+    })?;
+    if percent > MAX_CAP_PERCENT {
+        bail!("the cap must be between 0 and {MAX_CAP_PERCENT} percent (0 turns it off)");
+    }
+    Ok(percent)
+}
+
+/// How `pipedeck cap` renders the daemon's current value.
+fn cap_label(percent: u32) -> String {
+    if percent == 0 {
+        "off".to_owned()
+    } else {
+        format!("{percent}% (cubic)")
+    }
+}
+
+/// `pipedeck cap [<0-150|off>]` (SPEC §9.2).
+async fn cap_command(daemon: &DaemonProxy<'_>, value: Option<String>) -> Result<()> {
+    let Some(value) = value else {
+        println!("{}", cap_label(daemon.port_switch_cap().await?));
+        return Ok(());
+    };
+    let percent = parse_cap(&value)?;
+    daemon.set_port_switch_cap(percent).await?;
+    println!("port-switch cap -> {}", cap_label(percent));
+    Ok(())
+}
+
 /// Is this argument one of the spellings that mean "no preset"?
 fn is_off(value: &str) -> bool {
     let value = value.trim();
@@ -651,6 +704,7 @@ mod tests {
             "mute",
             "eq",
             "automute",
+            "cap",
             "watch",
         ] {
             assert!(names.contains(&expected), "missing subcommand {expected}");
@@ -1092,5 +1146,35 @@ mod tests {
         assert!(untargeted.contains("Firefox"));
         assert!(untargeted.contains("[muted]"));
         assert!(!untargeted.contains("->"));
+    }
+
+    /// SPEC §9.2: `pipedeck cap` shows, `pipedeck cap <value>` sets — so the
+    /// argument is optional and every "off" spelling reaches the daemon as 0.
+    #[test]
+    fn cap_takes_an_optional_value() {
+        let cli = Cli::try_parse_from(["pipedeck", "cap"]).expect("parses");
+        assert!(matches!(cli.command, Cmd::Cap { value: None }));
+        let cli = Cli::try_parse_from(["pipedeck", "cap", "off"]).expect("parses");
+        assert!(matches!(cli.command, Cmd::Cap { value: Some(ref v) } if v == "off"));
+
+        assert_eq!(parse_cap("60").expect("parses"), 60);
+        assert_eq!(parse_cap(" 60% ").expect("parses"), 60);
+        assert_eq!(parse_cap("0").expect("parses"), 0);
+        for off in ["off", "OFF", "none", "-"] {
+            assert_eq!(parse_cap(off).expect("parses"), 0, "spelling {off}");
+        }
+        assert_eq!(parse_cap("150").expect("parses"), 150);
+        assert!(parse_cap("151").is_err());
+        assert!(parse_cap("sixty").is_err());
+        assert!(parse_cap("-5").is_err());
+        assert!(parse_cap("60.5").is_err());
+    }
+
+    /// The two lines SPEC §9.2 asks `pipedeck cap` to print.
+    #[test]
+    fn cap_label_reads_as_the_spec_writes_it() {
+        assert_eq!(cap_label(60), "60% (cubic)");
+        assert_eq!(cap_label(45), "45% (cubic)");
+        assert_eq!(cap_label(0), "off");
     }
 }

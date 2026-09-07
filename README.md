@@ -2,7 +2,7 @@
 
 SoundSource-style audio control for PipeWire desktops: a Quick Settings panel for GNOME Shell with output / input / **notification** device pickers, headphone-vs-speaker port switching, per-application volume, and a parametric equalizer with AutoEq import — built on nothing but libpipewire, WirePlumber and the GNOME Shell APIs.
 
-> **Status:** v1.2.0. Developed and tested on one machine (Ubuntu 26.04.1,
+> **Status:** v1.3.0. Developed and tested on one machine (Ubuntu 26.04.1,
 > GNOME Shell 50.1, PipeWire 1.6.2, WirePlumber 0.5.13, Realtek ALC892 + NVIDIA HDMI). Reports from
 > other cards, Bluetooth devices and multi-channel outputs are welcome. See [CHANGELOG.md](CHANGELOG.md).
 
@@ -13,6 +13,7 @@ SoundSource-style audio control for PipeWire desktops: a Quick Settings panel fo
 - **Notification device picker** — Route notification/event sounds independently (unique to PipeDeck)
 - **Ports** — Headphones, Line Out, HDMI… listed as separate rows even when they are ports of one card; the codec's *Auto-Mute Mode* (which silently kills line-out while headphones are plugged in) is detected and switched off for you
 - **Per-application volume sliders** — Control volume and mute for every playback stream
+- **Loudness safety** — a port switch never comes up louder than a configurable cap (default 60 %), and volume writes never carry a stale mute state (`pipedeck cap`)
 - **Equalizer presets** — Parametric EQ per output via PipeWire's filter-chain, inserted transparently by WirePlumber as a smart filter; import headphone corrections straight from [AutoEq](https://github.com/jaakkopasanen/AutoEq)
 - **Menu-bar integration** — Built into GNOME Quick Settings for quick access
 

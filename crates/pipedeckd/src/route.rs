@@ -12,7 +12,8 @@
 //! of it is unit-tested without a graph. Pod parsing and writing live in
 //! [`crate::pw`], the only module that links against libpipewire.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use crate::state::DeviceKind;
 
@@ -322,6 +323,143 @@ pub fn validate_set_port(
     Ok(route)
 }
 
+// ---------------------------------------------------------------------------
+// SPEC §9.2 — the port-switch level cap's pending state
+// ---------------------------------------------------------------------------
+
+/// How long a PipeDeck-initiated `SetPort` stays eligible for the level cap.
+///
+/// The card re-enumerates its `Route` param within a few tens of milliseconds,
+/// but that first arrival is **not** the last word: on chronos (2026-09-06)
+/// WirePlumber's own per-port restore reacted to the same Route change and
+/// wrote the stored 82 % *after* our clamp, so a one-shot clamp was silently
+/// overwritten. The entry therefore stays live for the whole window and every
+/// arrival above the cap is re-clamped. Two seconds is long enough to outlast
+/// the session manager and short enough that a switch which never took cannot
+/// cap a level the user set by hand afterwards.
+pub const PORT_SWITCH_CAP_WINDOW: Duration = Duration::from_secs(2);
+
+/// One PipeDeck-initiated port switch, live until its window closes.
+///
+/// Recorded by the `SetPort` write and consulted by **every** `Route`
+/// re-enumeration that shows the requested route active — see SPEC §9.2. It is
+/// not consumed by the first clamp; only the window closing, a `SetVolume`/
+/// `SetMute` for the node, or the next `SetPort` retires it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPortSwitch {
+    /// Node the switch was requested for; also the key it is stored under.
+    pub node_id: u32,
+    /// `Audio/Device` global that owns the route.
+    pub device_id: u32,
+    /// `card.profile.device` the route must come back active for.
+    pub card_profile_device: i32,
+    /// Route index that was requested.
+    pub route_index: u32,
+    /// The ceiling to apply, **linear** (already through `cubic_to_linear`).
+    pub cap_linear: f64,
+    /// When the `SetPort` write went out.
+    pub issued: Instant,
+    /// How many clamp writes have already gone out for this switch, so a
+    /// repeat can log `re-clamped` instead of `clamped`.
+    pub clamps: u32,
+}
+
+impl PendingPortSwitch {
+    /// Does a `Route` re-enumeration identify this switch?
+    #[must_use]
+    pub fn matches(&self, device_id: u32, card_profile_device: i32, route_index: u32) -> bool {
+        self.device_id == device_id
+            && self.card_profile_device == card_profile_device
+            && self.route_index == route_index
+    }
+
+    /// Has the window closed on this switch?
+    #[must_use]
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.issued) > PORT_SWITCH_CAP_WINDOW
+    }
+}
+
+/// Port switches PipeDeck has issued whose window is still open.
+///
+/// At most one per node: a second `SetPort` for the same node replaces the
+/// first, which is exactly SPEC §9.2's "or on the next `SetPort` for that
+/// node". Time is passed in rather than read so the whole thing is testable
+/// without sleeping.
+#[derive(Debug, Default)]
+pub struct PendingPortSwitches {
+    entries: HashMap<u32, PendingPortSwitch>,
+}
+
+impl PendingPortSwitches {
+    /// Record a switch, replacing any earlier one for the same node.
+    ///
+    /// Also sweeps anything whose window closed, so entries on a card nobody
+    /// touches again cannot accumulate.
+    pub fn record(&mut self, pending: PendingPortSwitch) {
+        self.expire(pending.issued);
+        self.entries.insert(pending.node_id, pending);
+    }
+
+    /// Forget any switch pending for a node.
+    ///
+    /// SPEC §9.2's early cancels: a `SetVolume`/`SetMute` for the node (the
+    /// user is taking over), the next `SetPort` with the cap off, or the node
+    /// going away.
+    pub fn remove_node(&mut self, node_id: u32) {
+        self.entries.remove(&node_id);
+    }
+
+    /// Drop everything whose window has closed.
+    pub fn expire(&mut self, now: Instant) {
+        self.entries.retain(|_, pending| !pending.is_expired(now));
+    }
+
+    /// The still-live switch a `Route` re-enumeration confirms, if any.
+    ///
+    /// Expired entries are dropped first, so a switch that never took cannot
+    /// cap a level minutes later. The entry is **not** consumed: WirePlumber
+    /// may write the port's stored level after ours, and every arrival inside
+    /// the window has to be answered.
+    pub fn matching(
+        &mut self,
+        device_id: u32,
+        card_profile_device: i32,
+        route_index: u32,
+        now: Instant,
+    ) -> Option<&PendingPortSwitch> {
+        self.expire(now);
+        self.entries
+            .values()
+            .find(|pending| pending.matches(device_id, card_profile_device, route_index))
+    }
+
+    /// Count a clamp write against a node's pending switch, returning how many
+    /// have now gone out (`1` is the first, so anything higher logs as a
+    /// re-clamp).
+    pub fn note_clamp(&mut self, node_id: u32) -> u32 {
+        match self.entries.get_mut(&node_id) {
+            Some(pending) => {
+                pending.clamps += 1;
+                pending.clamps
+            }
+            None => 0,
+        }
+    }
+
+    /// How many switches are outstanding.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Is nothing outstanding?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +721,142 @@ mod tests {
             .message(39, 4)
             .contains("not available"));
         assert_eq!(SetPortError::NoPorts.to_string(), "no ports");
+    }
+
+    // -- SPEC §9.2: the pending-switch bookkeeping ---------------------------
+
+    fn pending(node_id: u32, route_index: u32, issued: Instant) -> PendingPortSwitch {
+        PendingPortSwitch {
+            node_id,
+            device_id: 53,
+            card_profile_device: 4,
+            route_index,
+            cap_linear: 0.216,
+            issued,
+            clamps: 0,
+        }
+    }
+
+    /// Only the re-enumeration that actually shows the requested route active
+    /// for this card's profile-device matches the pending entry.
+    #[test]
+    fn pending_switch_is_matched_by_its_own_route() {
+        let now = Instant::now();
+        let mut switches = PendingPortSwitches::default();
+        assert!(switches.is_empty());
+        switches.record(pending(39, 3, now));
+        assert_eq!(switches.len(), 1);
+
+        // Wrong route index, wrong profile-device, wrong card: all leave it be.
+        assert!(switches.matching(53, 4, 4, now).is_none());
+        assert!(switches.matching(53, 5, 3, now).is_none());
+        assert!(switches.matching(54, 4, 3, now).is_none());
+        assert_eq!(switches.len(), 1);
+
+        let found = switches.matching(53, 4, 3, now).expect("matches");
+        assert_eq!(found.node_id, 39);
+        assert_eq!(found.clamps, 0);
+        assert!((found.cap_linear - 0.216).abs() < 1e-9);
+    }
+
+    /// The chronos 2026-09-06 finding: WirePlumber's per-port restore lands
+    /// *after* our clamp, so the entry must survive the first clamp and answer
+    /// every later arrival inside the window.
+    #[test]
+    fn a_second_arrival_inside_the_window_clamps_again() {
+        let issued = Instant::now();
+        let mut switches = PendingPortSwitches::default();
+        switches.record(pending(39, 3, issued));
+
+        // First arrival: matched, and the clamp is counted as the first one.
+        assert!(switches.matching(53, 4, 3, issued).is_some());
+        assert_eq!(switches.note_clamp(39), 1);
+        assert_eq!(switches.len(), 1, "the entry survives its own clamp");
+
+        // WirePlumber writes the stored level back a moment later: the same
+        // entry matches again, and the clamp logs as a repeat.
+        let later = issued + Duration::from_millis(400);
+        let again = switches.matching(53, 4, 3, later).expect("still live");
+        assert_eq!(again.clamps, 1, "a repeat, so the journal says re-clamped");
+        assert_eq!(switches.note_clamp(39), 2);
+
+        // ... and again, right up to the edge of the window.
+        let edge = issued + PORT_SWITCH_CAP_WINDOW;
+        assert!(switches.matching(53, 4, 3, edge).is_some());
+
+        // Once the window closes it stops answering, however loud the card is.
+        let late = issued + PORT_SWITCH_CAP_WINDOW + Duration::from_millis(1);
+        assert!(switches.matching(53, 4, 3, late).is_none());
+        assert!(switches.is_empty());
+        // Counting a clamp against a retired entry is a no-op, not a panic.
+        assert_eq!(switches.note_clamp(39), 0);
+    }
+
+    /// A switch that never took must not cap a level set by hand later.
+    #[test]
+    fn pending_switch_expires_after_the_window() {
+        let issued = Instant::now();
+        let mut switches = PendingPortSwitches::default();
+        switches.record(pending(39, 3, issued));
+
+        // Still inside the window (and the boundary itself counts as inside).
+        let inside = issued + PORT_SWITCH_CAP_WINDOW;
+        assert!(!pending(39, 3, issued).is_expired(inside));
+
+        let late = issued + PORT_SWITCH_CAP_WINDOW + Duration::from_millis(1);
+        assert!(pending(39, 3, issued).is_expired(late));
+        assert!(switches.matching(53, 4, 3, late).is_none());
+        assert!(switches.is_empty(), "the expired entry was dropped");
+
+        // `expire` alone sweeps without a matching re-enumeration.
+        switches.record(pending(39, 3, issued));
+        switches.expire(inside);
+        assert_eq!(switches.len(), 1);
+        switches.expire(late);
+        assert!(switches.is_empty());
+
+        // `record` sweeps too, so an entry on a card nobody touches again does
+        // not sit in the map forever.
+        switches.record(pending(39, 3, issued));
+        let mut other = pending(41, 5, issued);
+        other.card_profile_device = 5;
+        switches.record(other);
+        assert_eq!(switches.len(), 2);
+        switches.record(pending(43, 7, late));
+        assert_eq!(switches.len(), 1, "the two stale entries were swept");
+    }
+
+    /// SPEC §9.2's early cancels: the next `SetPort` for a node replaces its
+    /// entry, and `SetVolume`/`SetMute` (via `remove_node`) retires it.
+    #[test]
+    fn a_second_switch_or_a_manual_level_retires_the_entry() {
+        let now = Instant::now();
+        let mut switches = PendingPortSwitches::default();
+        switches.record(pending(39, 3, now));
+        switches.record(pending(39, 4, now));
+        assert_eq!(switches.len(), 1);
+        assert!(switches.matching(53, 4, 3, now).is_none());
+        assert_eq!(
+            switches
+                .matching(53, 4, 4, now)
+                .expect("the newer switch")
+                .route_index,
+            4
+        );
+
+        // Different nodes on the same card coexist.
+        switches.record(pending(39, 3, now));
+        let mut other = pending(41, 5, now);
+        other.card_profile_device = 5;
+        switches.record(other);
+        assert_eq!(switches.len(), 2);
+
+        // The user taking over one node leaves the other alone.
+        switches.remove_node(41);
+        assert_eq!(switches.len(), 1);
+        assert!(switches.matching(53, 4, 3, now).is_some());
+        switches.remove_node(39);
+        assert!(switches.is_empty());
+        assert!(switches.matching(53, 4, 3, now).is_none());
     }
 }

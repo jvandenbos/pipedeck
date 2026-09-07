@@ -57,6 +57,49 @@ pub fn linear_to_percent(volume: f64) -> f64 {
     linear_to_cubic(volume) * 100.0
 }
 
+/// How far above the cap a level has to sit, in cubic percent, before it is
+/// worth a write (SPEC §9.2).
+///
+/// Two reasons this is not zero. A strict `>` compares two `f32`s that have
+/// each been through `cubic_to_linear` and a `f64`->`f32` narrowing, so the
+/// card echoing back the exact level we just wrote reads as a few ULPs *above*
+/// the cap — chronos logged `restored 60%, above the 60% cap` on 2026-09-06
+/// from precisely that. And because the clamp now re-fires for the whole
+/// window, that echo would otherwise be an infinite ping-pong rather than a
+/// one-off cosmetic wrinkle. Half a cubic percent is below `wpctl`'s own
+/// two-decimal display precision, so nothing the user could see is ignored.
+pub const PORT_SWITCH_CLAMP_EPSILON_PERCENT: f64 = 0.5;
+
+/// SPEC §9.2's decision: does a port switch's restored level need clamping?
+///
+/// `current` is the route's `channelVolumes` — every channel, linear. (The
+/// daemon's [`crate::route::RouteProps`] has already reduced that array to its
+/// loudest entry, so the PipeWire side passes a one-element slice; the general
+/// shape is kept because the rule is "no channel above the cap".) `cap` is the
+/// linear ceiling, or `None` when `safety.port_switch_max_percent` is `0`.
+///
+/// Returns the linear level to write, or `None` when nothing needs doing —
+/// which covers a disabled cap, an empty/`NaN`-only array, a route that came
+/// back quieter than the cap, and a route sitting *at* the cap within
+/// [`PORT_SWITCH_CLAMP_EPSILON_PERCENT`].
+///
+/// The comparison happens on the **cubic** scale, which is the scale the cap is
+/// configured on, so the tolerance means the same thing at 20 % as at 120 %.
+#[must_use]
+pub fn port_switch_clamp(current: &[f32], cap: Option<f32>) -> Option<f32> {
+    let cap = cap.filter(|c| c.is_finite() && *c >= 0.0)?;
+    let loudest = current
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !loudest.is_finite() {
+        return None;
+    }
+    let over = linear_to_percent(f64::from(loudest)) - linear_to_percent(f64::from(cap));
+    (over > PORT_SWITCH_CLAMP_EPSILON_PERCENT).then_some(cap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +148,56 @@ mod tests {
         assert!(close(percent_to_linear(400.0), MAX_VOLUME));
         assert!(close(linear_to_percent(0.125), 50.0));
         assert!(close(linear_to_percent(MAX_VOLUME), 150.0));
+    }
+
+    /// SPEC §9.2: only a route louder than the cap is clamped, and only when
+    /// the cap is on.
+    #[test]
+    fn port_switch_clamp_only_pulls_levels_down() {
+        // The SPEC's own example: 82 % restored against a 60 % cap.
+        let cap = percent_to_linear(60.0) as f32;
+        let restored = percent_to_linear(82.0) as f32;
+        let clamped = port_switch_clamp(&[restored, restored], Some(cap)).expect("clamps");
+        assert!((f64::from(clamped) - percent_to_linear(60.0)).abs() < 1e-6);
+
+        // 40 % is below the cap: untouched.
+        let quiet = percent_to_linear(40.0) as f32;
+        assert_eq!(port_switch_clamp(&[quiet, quiet], Some(cap)), None);
+
+        // Exactly at the cap is not "above" it — no pointless write.
+        assert_eq!(port_switch_clamp(&[cap, cap], Some(cap)), None);
+
+        // ... and neither is the echo of our own clamp write, which comes back
+        // a few ULPs off after a cubic_to_linear + f64->f32 round trip. This is
+        // the chronos 2026-09-06 "restored 60%, above the 60% cap" case, and
+        // with the re-clamping window it would otherwise ping-pong forever.
+        let echo = (cubic_to_linear(0.60) as f32).to_bits() + 4;
+        let echo = f32::from_bits(echo);
+        assert!(echo > cap, "the echo really is numerically above the cap");
+        assert_eq!(port_switch_clamp(&[echo, echo], Some(cap)), None);
+
+        // The tolerance is only a tolerance: a level a user could actually see
+        // as different still gets pulled down.
+        let just_over = percent_to_linear(61.0) as f32;
+        assert_eq!(port_switch_clamp(&[just_over], Some(cap)), Some(cap));
+
+        // The *loudest* channel decides, not the first or an average.
+        assert_eq!(port_switch_clamp(&[quiet, restored], Some(cap)), Some(cap));
+    }
+
+    /// `port_switch_max_percent = 0` turns the whole rule off, and a degenerate
+    /// input can never produce a write.
+    #[test]
+    fn port_switch_clamp_is_off_or_silent_on_degenerate_input() {
+        let loud = percent_to_linear(120.0) as f32;
+        assert_eq!(port_switch_clamp(&[loud], None), None);
+        assert_eq!(port_switch_clamp(&[], Some(0.5)), None);
+        assert_eq!(port_switch_clamp(&[f32::NAN], Some(0.5)), None);
+        assert_eq!(port_switch_clamp(&[loud], Some(f32::NAN)), None);
+        assert_eq!(port_switch_clamp(&[loud], Some(-1.0)), None);
+        // A cap of 0 % is a real setting: silence the port rather than ignore it.
+        assert_eq!(port_switch_clamp(&[loud], Some(0.0)), Some(0.0));
+        // One NaN channel does not hide a loud one.
+        assert_eq!(port_switch_clamp(&[f32::NAN, loud], Some(0.5)), Some(0.5));
     }
 }

@@ -3,6 +3,23 @@
 All notable changes to PipeDeck. Versions follow [Semantic Versioning](https://semver.org);
 milestones map to the numbered sections of `SPEC.md`.
 
+## [1.3.0] — 2026-09-07
+
+Loudness safety (SPEC §9).
+
+### Changed
+- **Volume and mute writes are independent.** A volume write carries only `channelVolumes`, a
+  mute write only `mute` — never the daemon's cached value of the other field, so a mute made
+  elsewhere a moment earlier can no longer be undone by a slider move (and vice-versa).
+
+### Added
+- **Port-switch level cap.** WirePlumber restores volume per port, so switching from quiet
+  headphones to speakers stored at 82 % used to jump straight there. After a PipeDeck-initiated
+  port switch the new port is clamped to `[safety] port_switch_max_percent` (default 60 % on the
+  cubic scale) for a 2 s window, re-applied if WirePlumber's own restore lands later; a volume
+  change by the user inside the window cancels it. `pipedeck cap [<0-150>|off]`, D-Bus
+  `PortSwitchCap` / `SetPortSwitchCap`. Outputs only — capture levels are never touched.
+
 ## [1.2.0] — 2026-09-06
 
 ### Added
@@ -69,7 +86,8 @@ First public release.
   volume sliders.
 - Docker dev image mirroring the target (Ubuntu 26.04, PipeWire 1.6, Rust 1.93).
 
-[1.2.0]: https://github.com/jvandenbos/pipedeck/releases/tag/v1.2.0
+[1.3.0]: https://github.com/jvandenbos/pipedeck/releases/tag/v1.3.0
+[1.2.0]: https://github.com/jvandenbos/pipedeck/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jvandenbos/pipedeck/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/jvandenbos/pipedeck/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jvandenbos/pipedeck/commits/v1.0.0

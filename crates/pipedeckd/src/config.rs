@@ -67,6 +67,34 @@ pub struct Config {
     /// ALSA mixer settings — the `Auto-Mute Mode` policy and the per-card
     /// choice the daemon remembers (SPEC §8.1).
     pub alsa: AlsaConfig,
+    /// Loudness safety — the port-switch level cap (SPEC §9.2).
+    pub safety: SafetyConfig,
+}
+
+/// The `[safety]` table (SPEC §9.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SafetyConfig {
+    /// Ceiling, as a **cubic-scale** percentage (the number `wpctl` and GNOME
+    /// show), on the level a PipeDeck-initiated port switch may restore. `0`
+    /// turns the rule off; anything above 150 normalises to 150, which is the
+    /// daemon's own maximum volume and therefore can never clamp anything.
+    pub port_switch_max_percent: u32,
+}
+
+/// SPEC §9.2's default cap: 60 % on the cubic scale.
+pub const DEFAULT_PORT_SWITCH_MAX_PERCENT: u32 = 60;
+
+/// Highest cap the daemon will store — [`crate::volume::MAX_VOLUME`] expressed
+/// on the cubic scale.
+pub const MAX_PORT_SWITCH_MAX_PERCENT: u32 = 150;
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            port_switch_max_percent: DEFAULT_PORT_SWITCH_MAX_PERCENT,
+        }
+    }
 }
 
 /// The `[alsa]` table (SPEC §8.1).
@@ -247,10 +275,36 @@ impl Config {
         entries
     }
 
+    /// The port-switch level cap as a cubic-scale percentage (SPEC §9.2).
+    ///
+    /// Always in `0 ..= 150`, whatever the file said.
+    #[must_use]
+    pub fn port_switch_max_percent(&self) -> u32 {
+        self.safety
+            .port_switch_max_percent
+            .min(MAX_PORT_SWITCH_MAX_PERCENT)
+    }
+
+    /// The cap as a **linear** volume, or `None` when it is off (`0`).
+    ///
+    /// This is the form the PipeWire side compares `channelVolumes` against.
+    #[must_use]
+    pub fn port_switch_cap(&self) -> Option<f64> {
+        let percent = self.port_switch_max_percent();
+        (percent > 0).then(|| crate::volume::percent_to_linear(f64::from(percent)))
+    }
+
+    /// Set the port-switch level cap; `0` turns it off. Values above 150 are
+    /// clamped rather than rejected, matching every other hand-editable field.
+    pub fn set_port_switch_max_percent(&mut self, percent: u32) {
+        self.safety.port_switch_max_percent = percent.min(MAX_PORT_SWITCH_MAX_PERCENT);
+    }
+
     /// Trim whitespace and drop empty entries so comparisons are predictable.
     pub fn normalize(&mut self) {
         self.notification_sink = self.notification_sink.trim().to_owned();
         self.alsa.auto_mute_policy = self.auto_mute_policy().as_str().to_owned();
+        self.safety.port_switch_max_percent = self.port_switch_max_percent();
         self.notification_apps = self
             .notification_apps
             .iter()
@@ -293,6 +347,83 @@ mod tests {
         assert!(config.alsa.auto_mute.is_empty());
         // SPEC §8.1: `auto` is the default policy.
         assert_eq!(config.auto_mute_policy(), AutoMutePolicy::Auto);
+        // SPEC §9.2: the cap defaults to 60 % cubic, i.e. on.
+        assert_eq!(config.port_switch_max_percent(), 60);
+    }
+
+    /// SPEC §9.2: `[safety] port_switch_max_percent` round-trips, `0` means
+    /// off, and an out-of-range value normalises instead of failing to load.
+    #[test]
+    fn safety_table_round_trips() {
+        let config = Config::from_toml(
+            r"
+[safety]
+port_switch_max_percent = 45
+",
+        )
+        .expect("parses");
+        assert_eq!(config.port_switch_max_percent(), 45);
+        let cap = config.port_switch_cap().expect("cap is on");
+        assert!((cap - crate::volume::percent_to_linear(45.0)).abs() < 1e-9);
+
+        let again = Config::from_toml(&config.to_toml().expect("serialise")).expect("reparse");
+        assert_eq!(again, config);
+
+        // `0` is off, not "silence everything".
+        let off = Config::from_toml(
+            r"
+[safety]
+port_switch_max_percent = 0
+",
+        )
+        .expect("parses");
+        assert_eq!(off.port_switch_max_percent(), 0);
+        assert_eq!(off.port_switch_cap(), None);
+
+        // Above the daemon's own maximum, normalised on load.
+        let silly = Config::from_toml(
+            r"
+[safety]
+port_switch_max_percent = 4000
+",
+        )
+        .expect("parses");
+        assert_eq!(silly.port_switch_max_percent(), 150);
+        assert_eq!(silly.safety.port_switch_max_percent, 150);
+
+        let mut config = Config::default();
+        config.set_port_switch_max_percent(200);
+        assert_eq!(config.port_switch_max_percent(), 150);
+        config.set_port_switch_max_percent(0);
+        assert_eq!(config.port_switch_cap(), None);
+    }
+
+    /// A config written before v1.3 has no `[safety]` table at all; it must
+    /// still load, and pick up the default cap.
+    #[test]
+    fn pre_v1_3_configs_still_load() {
+        let config = Config::from_toml(
+            r#"
+notification_sink = "alsa_output.pci-0000_00_1f.3.analog-stereo"
+notification_apps = ["Slack"]
+
+[eq]
+"alsa_output.pci-0000_00_1f.3.analog-stereo" = "hd650"
+
+[alsa]
+auto_mute_policy = "auto"
+
+[alsa.auto_mute]
+"HD-Audio Generic" = false
+"#,
+        )
+        .expect("an older config still parses");
+        assert_eq!(config.notification_apps, vec!["Slack".to_owned()]);
+        assert_eq!(config.auto_mute("HD-Audio Generic"), Some(false));
+        assert_eq!(
+            config.port_switch_max_percent(),
+            DEFAULT_PORT_SWITCH_MAX_PERCENT
+        );
     }
 
     /// SPEC §8.1: `[alsa]` carries `auto_mute_policy` plus a card-name-keyed

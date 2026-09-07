@@ -63,6 +63,12 @@
     <arg name="preset" type="s" direction="in"/>
   </method>
   <!--
+   Set the port-switch level cap, as a cubic-scale percentage; 0 turns it off.
+   -->
+  <method name="SetPortSwitchCap">
+    <arg name="percent" type="u" direction="in"/>
+  </method>
+  <!--
    Re-read every node's params and re-publish the snapshot.
    -->
   <method name="Refresh">
@@ -92,6 +98,10 @@
    `node.name` of the notification sink; empty means "follow the default output".
    -->
   <property name="NotificationSink" type="s" access="read"/>
+  <!--
+   Ceiling on the level a port switch may restore, as a cubic-scale percentage; 0 means off.
+   -->
+  <property name="PortSwitchCap" type="u" access="read"/>
   <!--
    Selectable ports: `(node_id, route_index, name, description, available, active)`.
    -->

@@ -110,6 +110,27 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
   restart re-applies; explicit on/off round-trips with `amixer`. Systemd user unit can write the control.
 - ☐ §8.3 16 (panel switch row) — Jan's next logout/login.
 
+## Phase 8 — loudness safety (SPEC §9) — daemon agent (crates/), 2026-09-06
+- ☑ Daemon side complete against SPEC §9.1/§9.2: independent volume/mute Route+Props writes,
+  `[safety] port_switch_max_percent`, the pending-switch cap in `pw.rs`, `PortSwitchCap`/
+  `SetPortSwitchCap` in `service.rs`, `pipedeck cap` in the CLI. 146 tests (was 132), all four
+  container checks clean.
+- ☑ Live run 1 on chronos (2026-09-06, sink 41 / device 53): §9.3 **19 passed**; **17 half-passed**
+  — the clamp fired and logged, then WirePlumber's per-port restore overwrote it. Reworked:
+  the pending entry now survives the whole window and re-clamps, with a 0.5 cubic-% epsilon so
+  "at the cap" is not "above the cap". Details in Handoffs below.
+- ☐ Live run 2 on chronos (§9.3 17–18 retest + the new cancel path) — main session.
+- Extension is untouched and needs no change: the two new interface members are additive, and
+  `extension/dbus.js`'s hand-written XML is a subset — GDBusProxy is fine with that.
+
+## Phase 8 — loudness safety (SPEC §9)  — **LIVE on chronos 2026-09-07, released 1.3.0**
+- ☑ Independent volume/mute Route + Props writes (pod tests assert the absent key).
+- ☑ Port-switch cap: pending entry lives for the 2 s window, re-clamps on every above-cap Route
+  arrival (WirePlumber's per-port restore lands after our first clamp), 0.5 % cubic epsilon,
+  user SetVolume/SetMute cancels. Live: Headphones 0.40 → Line Out stored 0.82 → reads 0.60 at
+  0.5 s and 3.5 s; back to Headphones 0.40 untouched; `set-port` + `vol 70` inside the window → 0.70;
+  `mute on` + `vol 45` → `0.45 [MUTED]`. One `clamped` journal line, no re-clamp needed on this card.
+
 ## v1.2 ideas (from first real use, 2026-09-05)
 - **ALSA Auto-Mute Mode.** On Realtek codecs, `Auto-Mute Mode = Enabled` hard-mutes Line Out while
   a headphone plug is present, so selecting the Line Out port produces silence. Not fixable via
@@ -1121,3 +1142,192 @@ erroring.
    is not the card that would expose it.
 5. The `spawn_blocking` timing: whether a mixer open/load inside `SetPort`'s reply path adds any
    perceptible latency to a port switch in the panel.
+
+### Phase 8 (daemon side) — SPEC §9 loudness safety (2026-09-06)
+
+Lane was `crates/**` + `Cargo.lock`; `Cargo.lock` did not move (no dependency changes). Version
+stays **1.2.0** — the main session bumps it.
+
+#### §9.1 — volume and mute writes are independent
+
+`write_route_props` used to build one `Props` object carrying *both* `channelVolumes` and `mute`,
+filling in whichever field the caller was not changing from `RouteProps`/`NodeEntry` — i.e. from a
+cache that could be milliseconds stale. It is now split:
+
+- `volume_properties(Vec<f32>)` / `mute_properties(bool)` build one-key property lists;
+- `write_route_volume` / `write_route_mute` are the only two callers of the (now private,
+  props-taking) `write_route_props`;
+- `set_volume` no longer reads `target.props.mute`/`entry.mute`; `set_mute` no longer reads
+  `target.props.volume`/`entry.volume` or computes a channel count at all.
+
+The **node-`Props` path already was independent** (streams and routed-less sinks) — `set_volume`
+sent only `channelVolumes`, `set_mute` only `mute`. It now goes through the same two builders so
+one edit cannot re-bundle them, and it is covered by the same tests.
+
+Tests build the real pods and assert on the *keys present*, not just the parsed values:
+`route_volume_write_carries_no_mute`, `route_mute_write_carries_no_volume`,
+`node_props_writes_are_independent_too` (pw.rs).
+
+#### §9.2 — port-switch level cap
+
+- **Config**: new `[safety]` table, `port_switch_max_percent: u32`, default **60**, `0` = off,
+  `>150` normalises to 150 on load (150 % cubic is `MAX_VOLUME`, so a larger cap could never
+  clamp). Pre-v1.3 configs with no `[safety]` table load and pick up the default —
+  `pre_v1_3_configs_still_load` asserts exactly that.
+- **Decision**: `volume::port_switch_clamp(current: &[f32], cap: Option<f32>) -> Option<f32>` —
+  pure, returns the level to write or `None`. `None` cap, empty/`NaN` input, and "at or below the
+  cap" all return `None`. The comparison is made on the **cubic** scale with a
+  `PORT_SWITCH_CLAMP_EPSILON_PERCENT` = **0.5 %** tolerance (see the 2026-09-06 revision below).
+- **Bookkeeping**: `route::PendingPortSwitches` — at most one `PendingPortSwitch` per node
+  (`node_id`, `device_id`, `card_profile_device`, `route_index`, `cap_linear`, `issued`, `clamps`),
+  keyed by node so a second `SetPort` replaces the first. `matching(device, cpd, route, now)`
+  expires first (window `PORT_SWITCH_CAP_WINDOW` = **2 s**) and returns — without consuming — the
+  entry the re-enumeration confirms; `note_clamp(node)` counts a clamp write against it.
+  `record` also sweeps expired entries. Time is a parameter, so the tests never sleep.
+- **Wiring**: `set_port` records the pending entry after its `Route` write;
+  `on_device_param` hands every *active*-Route arrival to `apply_port_switch_cap`, which looks up a
+  matching live entry and, if the level is above the cap, issues a **volume-only** Route write and
+  `info!`s the before/after percents. `set_volume`/`set_mute` and `on_global_remove` retire the
+  entry for that node.
+
+Two deliberate readings of the SPEC, both narrowing:
+
+1. **Sinks only.** §9.2's own preamble is "never make an *output* louder than the user meant";
+   silently pulling a capture level down on a source port switch would be a surprise, not a safety
+   net. `set_port` gates the recording on `DeviceKind::Sink`.
+2. **Nothing is recorded while the cap is off**, rather than recording always and checking the cap
+   at re-enumeration time. Otherwise a switch made under `pipedeck cap off` could be clamped by a
+   `pipedeck cap 60` typed a second later.
+
+Known corollary, not a bug: `set-port` to the port a sink is *already* on is still a
+PipeDeck-initiated switch, so a level above the cap gets clamped. That is what §9.2 literally says
+and it is the harmless direction.
+
+#### §9.2 revision after the first chronos run (2026-09-06, sink 41 / device 53)
+
+The first live run passed §9.3 19 outright and **half**-passed 17: the journal showed
+`port switch restored 82%, above the 60% cap; clamped to 60%` within ~0.4 s of the `SetPort`, but
+`wpctl get-volume` still read **0.82**, immediately and two seconds later. Two faults, both fixed:
+
+1. **The clamp was a one-shot and got overwritten.** WirePlumber's own default-routes script
+   reacts to the *same* `Route` change and writes the port's stored 82 % **after** our clamp
+   lands. The pending entry had already been consumed by the first match, so the daemon never
+   answered. **Fix:** the entry now stays live for the whole `PORT_SWITCH_CAP_WINDOW` and *every*
+   active-Route arrival above the cap gets its own volume-only clamp write. The echo of our own
+   clamp arrives *at* the cap, so it is a no-op — that (plus the epsilon below) is what keeps this
+   from becoming a ping-pong. Because the entry now outlives the first clamp, it needs explicit
+   early cancels: a PipeDeck `SetVolume` or `SetMute` for that node retires it (the user is taking
+   over), as does the next `SetPort` for that node and the node disappearing.
+2. **`60% > 60%` was true.** The run also logged
+   `port switch restored 60%, above the 60% cap; clamped to 60%` — a strict `>` on two `f32`s that
+   have each been through `cubic_to_linear` and an `f64`->`f32` narrowing, so the card's echo of
+   the level we had just written read as a few ULPs above the cap. Harmless on a one-shot clamp;
+   an infinite loop once the clamp re-fires. **Fix:** compare on the cubic scale with a
+   `PORT_SWITCH_CLAMP_EPSILON_PERCENT` = 0.5 % tolerance — below `wpctl`'s own two-decimal display
+   precision, so nothing a user could see is ignored.
+3. **The journal now distinguishes repeats:** the first write for a switch says `clamped to 60%`,
+   every later one inside the window says `re-clamped to 60%`. `grep 'port switch restored'` still
+   catches both.
+
+New tests for exactly this: `a_second_arrival_inside_the_window_clamps_again` (route.rs — matches
+twice, `note_clamp` counts 1 then 2, stops at the window edge) and the echo/at-the-cap assertions
+in `port_switch_clamp_only_pulls_levels_down` (volume.rs — an `f32` one ULP-group above the cap
+does *not* clamp, while 61 % against a 60 % cap still does).
+
+Residual, worth watching on the retest: if the codec quantises volume to mixer steps coarser than
+0.5 cubic percent, our clamp would be re-issued on every arrival for up to 2 s. That is bounded
+(the window closes) and not a loop, but it would show as a burst of `re-clamped` lines rather than
+one or two.
+
+#### SPEC deviation — the cap has a D-Bus surface
+
+§9.2 says "No D-Bus surface needed in v1.3 (config-driven)". Implemented **with** one, because the
+CLI is specified (SPEC §2.3) as a pure D-Bus client that never touches PipeWire or the config file
+itself — `pipedeck cap 45` writing `~/.config/pipedeck/config.toml` behind the daemon's back would
+also be lost on the daemon's next config save. Added to `dev.pipedeck.Daemon1`:
+
+```xml
+<method name="SetPortSwitchCap">
+  <arg name="percent" type="u" direction="in"/>
+</method>
+<property name="PortSwitchCap" type="u" access="read"/>
+```
+
+`SetPortSwitchCap` validates `percent <= 150` (`InvalidArgument` above that), saves the config, then
+dispatches `SetConfig` into the PipeWire thread — the same shape `SetEq` and `SetNotificationSink`
+already use. The pinned `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml` is regenerated; both new
+members are additive and **the extension does not use them**, so `extension/dbus.js` needs no
+change (its hand-written XML is a strict subset, which GDBusProxy accepts).
+
+#### CLI
+
+`pipedeck cap` prints `60% (cubic)` or `off`. `pipedeck cap <0-150|off>` sets and persists;
+`off`/`none`/`-`/`0` are all accepted for off, a trailing `%` is accepted, and anything else or
+`>150` is a clear error before any D-Bus call.
+
+**→ main session, SPEC §9.3 live tests on chronos.** §9.3 19 already **passed** on the first run;
+17 and 18 are the retest after the re-clamping fix above. `<id>` is the ALC892 analog sink's node
+id from `pipedeck outputs` (**41** on the first run; `<sink>` is its `node.name`, device 53):
+
+```bash
+# 17 — the cap fires on a PipeDeck-initiated switch, and only when it must
+pipedeck cap                                    # expect: 60% (cubic)
+pipedeck set-port <id> analog-output-lineout    # make sure Line Out is stored loud first
+wpctl set-volume <sink> 0.82
+pipedeck set-port <id> analog-output-headphones
+wpctl set-volume <sink> 0.40                    # Headphones stored at 40 %
+pipedeck set-port <id> analog-output-lineout
+sleep 3 && wpctl get-volume <sink>              # expect 0.60, NOT 0.82 — and check twice:
+wpctl get-volume <sink>                         #   it must STAY 0.60 past the 2 s window
+journalctl --user -u pipedeckd -n 20 | grep -i 'port switch restored'
+#   expect: "port switch restored 82%, above the 60% cap; clamped to 60%"
+#   likely followed by one or more "... re-clamped to 60%" — that is WirePlumber's
+#   per-port restore being answered, and is the fix working, not a fault.
+#   There must be NO "restored 60%, above the 60% cap" line any more (the epsilon).
+pipedeck set-port <id> analog-output-headphones
+sleep 3 && wpctl get-volume <sink>              # expect 0.40 — below the cap, untouched
+journalctl --user -u pipedeckd -n 5             # and NO clamp line for this one
+
+# 18 — the cap can be turned off and back on
+pipedeck cap off && pipedeck cap                # expect: off
+grep -A2 '\[safety' ~/.config/pipedeck/config.toml   # port_switch_max_percent = 0
+pipedeck set-port <id> analog-output-lineout
+sleep 3 && wpctl get-volume <sink>              # expect 0.82, untouched
+pipedeck cap 60 && pipedeck cap                 # expect: 60% (cubic)
+systemctl --user restart pipedeckd && sleep 2 && pipedeck cap   # survives a restart
+
+# 19 — §9.1: a volume write does not clear a mute  (PASSED 2026-09-06, re-run as a regression)
+pipedeck mute <id> on
+pipedeck vol <id> 45
+wpctl get-volume <sink>                         # expect: Volume: 0.45 [MUTED]
+# ... and the other direction, which §9.3 does not spell out but is the same bug class:
+pipedeck vol <id> 70 && pipedeck mute <id> off && pipedeck mute <id> on
+wpctl get-volume <sink>                         # expect: Volume: 0.70 [MUTED]
+
+# 9.2 cancel path (new): the user taking over stops the clamp mid-window
+pipedeck set-port <id> analog-output-lineout && pipedeck vol <id> 90
+sleep 3 && wpctl get-volume <sink>              # expect 0.90 — the explicit level wins
+```
+
+**What can only be checked live** (1 and 2 are now *answered* by the first run; they stay here
+because the fix has not itself been proven live yet):
+1. ~~Whether the Route re-enumeration carries `props`~~ — **it does**, and promptly: the first run
+   clamped within ~0.4 s of the `SetPort`.
+2. ~~Whether WirePlumber writes the per-port restored level before or after the Route param the
+   daemon sees~~ — **after**. That was the §9.3 17 half-pass; the whole re-clamping rework above
+   exists for it. The open question is now whether re-clamping actually **wins** the exchange, or
+   whether WirePlumber keeps re-asserting past the 2 s window. Symptom of the latter: a burst of
+   `re-clamped` lines and `wpctl` back at 0.82 after ~2 s. The knob is
+   `PORT_SWITCH_CAP_WINDOW` in `route.rs`; if it needs to grow much past 2 s, the honest fix is
+   probably a WirePlumber-side `restore-props` opt-out rather than a longer arms race, so bring
+   that back rather than just raising the number.
+3. That the clamp's own volume-only Route write is honoured on this codec (SPEC §6.1 already
+   proved plain volume writes are; the new part is the pod carrying *no* `mute` key, which §9.1
+   assumes ACP applies partially). §9.3 19 passing on the first run is good evidence it does.
+4. Whether the codec quantises volume to steps coarser than the 0.5 cubic-percent epsilon — see
+   the residual note above. Shows up as more `re-clamped` lines than the one or two expected.
+5. §9.1 in the panel: move the GNOME slider while PipeDeck holds a mute, and vice-versa. The
+   whole point of the split is the millisecond-scale race between two writers, which no unit test
+   can reach.
+6. Whether the ~2 s window is comfortable in the panel: `_activatePort` does `setDefault` then
+   `setPort`, so a slow default switch eats into it.

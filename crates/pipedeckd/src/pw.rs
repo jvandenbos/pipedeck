@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use pipewire as pw;
 use pw::spa;
@@ -41,11 +42,11 @@ use crate::error::{Error, Result};
 use crate::matching::is_notification_stream;
 use crate::meta;
 use crate::route::{
-    self, ActiveRoute, Availability, DeviceRoutes, Port, Route as CardRoute, RouteDirection,
-    RouteProps,
+    self, ActiveRoute, Availability, DeviceRoutes, PendingPortSwitch, PendingPortSwitches, Port,
+    Route as CardRoute, RouteDirection, RouteProps,
 };
 use crate::state::{AlsaCard, Device, DeviceKind, State, Stream};
-use crate::volume::clamp_volume;
+use crate::volume::{clamp_volume, linear_to_percent, port_switch_clamp};
 
 /// Node property keys we read off registry globals.
 mod keys {
@@ -262,6 +263,9 @@ struct Inner {
     metadata: Option<Rc<MetadataEntry>>,
     /// Stream ids we have pointed at the notification sink, so we can undo it.
     routed: HashSet<u32>,
+    /// SPEC §9.2: port switches PipeDeck has issued and not yet seen take
+    /// effect, each carrying the level cap to apply when it does.
+    pending_port_caps: PendingPortSwitches,
     default_sink: Option<String>,
     default_source: Option<String>,
     revision: u64,
@@ -895,6 +899,7 @@ fn run(
         targets: HashMap::new(),
         metadata: None,
         routed: HashSet::new(),
+        pending_port_caps: PendingPortSwitches::default(),
         default_sink: None,
         default_source: None,
         revision: 0,
@@ -1264,6 +1269,10 @@ fn on_device_param(
         "device route param"
     );
 
+    // SPEC §9.2: `(route index, card.profile.device, props)` of an active-route
+    // arrival, carried out of the borrow so the cap's own write can take one.
+    let mut active_arrival: Option<(u32, i32, RouteProps)> = None;
+
     {
         let mut guard = inner.borrow_mut();
         let Some(entry) = guard.devices.get_mut(&id) else {
@@ -1293,19 +1302,101 @@ fn on_device_param(
                 entry.routes.active.clear();
             }
             if let (Some(route_index), Some(device)) = (raw.index, raw.device) {
+                let props = raw.props.unwrap_or_default();
                 entry.routes.active.insert(
                     device,
                     ActiveRoute {
                         index: route_index,
                         device,
-                        props: raw.props.unwrap_or_default(),
+                        props: props.clone(),
                     },
                 );
+                active_arrival = Some((route_index, device, props));
             }
         }
     }
 
+    if let Some((route_index, card_profile_device, props)) = active_arrival {
+        apply_port_switch_cap(inner, id, route_index, card_profile_device, &props);
+    }
+
     inner.borrow_mut().publish();
+}
+
+/// SPEC §9.2's port-switch level cap.
+///
+/// Runs on every active-`Route` arrival and does nothing unless that arrival
+/// matches a switch **PipeDeck itself** asked for, still inside the window,
+/// whose level is above the cap.
+///
+/// The pending entry is deliberately **not** consumed by the first clamp.
+/// Measured on chronos 2026-09-06: WirePlumber's own per-port restore reacts to
+/// the same `Route` change and writes the port's stored level *after* our
+/// clamp, so a one-shot clamp was logged and then silently overwritten. Every
+/// arrival inside the window is answered instead; the echo of our own clamp
+/// comes back at the cap and `port_switch_clamp`'s epsilon makes that a no-op,
+/// which is what stops the two of us ping-ponging.
+fn apply_port_switch_cap(
+    inner: &Rc<RefCell<Inner>>,
+    device_id: u32,
+    route_index: u32,
+    card_profile_device: i32,
+    props: &RouteProps,
+) {
+    // No props on this arrival means nothing to compare — leave the entry
+    // pending so a later enumeration inside the window can still act.
+    let Some(current) = props.volume else {
+        return;
+    };
+
+    let mut guard = inner.borrow_mut();
+    let Some((node_id, cap_linear)) = guard
+        .pending_port_caps
+        .matching(device_id, card_profile_device, route_index, Instant::now())
+        .map(|pending| (pending.node_id, pending.cap_linear))
+    else {
+        return;
+    };
+
+    // `RouteProps::volume` is already the loudest `channelVolumes` entry, which
+    // is the channel §9.2 compares against the cap.
+    let Some(capped) = port_switch_clamp(&[current as f32], Some(cap_linear as f32)) else {
+        return;
+    };
+
+    let channels = props.channels.unwrap_or(1).max(1);
+    let target = RouteTarget {
+        device_id,
+        card_profile_device,
+        index: route_index,
+        props: props.clone(),
+    };
+    let before = linear_to_percent(current);
+    let after = linear_to_percent(f64::from(capped));
+    match write_route_volume(&guard, &target, vec![capped; channels]) {
+        Ok(()) => {
+            // First clamp reads `clamped`; anything the session manager makes
+            // us redo reads `re-clamped`, so the journal tells the story.
+            let verb = if guard.pending_port_caps.note_clamp(node_id) > 1 {
+                "re-clamped"
+            } else {
+                "clamped"
+            };
+            info!(
+                node = node_id,
+                device = device_id,
+                port = route_index,
+                "port switch restored {before:.0}%, above the {:.0}% cap; {verb} to {after:.0}%",
+                linear_to_percent(cap_linear)
+            );
+        }
+        Err(e) => warn!(
+            node = node_id,
+            device = device_id,
+            port = route_index,
+            "could not cap the level after a port switch: {e}"
+        ),
+    }
 }
 
 fn on_metadata_global(
@@ -1382,6 +1473,8 @@ fn on_global_remove(inner: &Rc<RefCell<Inner>>, id: u32) {
     changed |= guard.links.remove(&id).is_some();
     guard.routed.remove(&id);
     guard.targets.remove(&id);
+    // SPEC §9.2: a node that went away can never confirm its switch.
+    guard.pending_port_caps.remove_node(id);
     if guard
         .metadata
         .as_ref()
@@ -1625,7 +1718,11 @@ fn set_default(inner: &Rc<RefCell<Inner>>, kind: DeviceKind, name: &str) -> Resu
 }
 
 fn set_volume(inner: &Rc<RefCell<Inner>>, id: u32, volume: f64) -> Result<()> {
-    let guard = inner.borrow();
+    let mut guard = inner.borrow_mut();
+    // SPEC §9.2: an explicit level for this node means the user is taking over,
+    // so a port switch still inside its window must stop clamping on top of it.
+    guard.pending_port_caps.remove_node(id);
+
     let entry = guard
         .nodes
         .get(&id)
@@ -1634,19 +1731,18 @@ fn set_volume(inner: &Rc<RefCell<Inner>>, id: u32, volume: f64) -> Result<()> {
 
     // SPEC §6.1: on a routed (ALSA) node the node's own `Props` write is
     // silently dropped — the card's `Route` param is the only thing that takes.
+    // SPEC §9.1: `mute` is deliberately absent, here and below. Carrying the
+    // daemon's cached value would undo a mute made a few ms ago by the keyboard
+    // key or the GNOME slider.
     if let Some(target) = guard.route_target(entry) {
         let channels = target.props.channels.unwrap_or(entry.channels).max(1);
-        let mute = target.props.mute.unwrap_or(entry.mute);
-        return write_route_props(&guard, &target, vec![volume as f32; channels], mute);
+        return write_route_volume(&guard, &target, vec![volume as f32; channels]);
     }
 
     let channels = entry.channels.max(1);
     let values = vec![volume as f32; channels];
-    let pod = props_pod(vec![Property::new(
-        spa::sys::SPA_PROP_channelVolumes,
-        Value::ValueArray(ValueArray::Float(values)),
-    )])
-    .ok_or_else(|| Error::pipewire("could not build the channelVolumes pod"))?;
+    let pod = props_pod(volume_properties(values))
+        .ok_or_else(|| Error::pipewire("could not build the channelVolumes pod"))?;
     let param = Pod::from_bytes(&pod)
         .ok_or_else(|| Error::pipewire("built an invalid channelVolumes pod"))?;
     entry.proxy.set_param(ParamType::Props, 0, param);
@@ -1654,23 +1750,23 @@ fn set_volume(inner: &Rc<RefCell<Inner>>, id: u32, volume: f64) -> Result<()> {
 }
 
 fn set_mute(inner: &Rc<RefCell<Inner>>, id: u32, mute: bool) -> Result<()> {
-    let guard = inner.borrow();
+    let mut guard = inner.borrow_mut();
+    // SPEC §9.2: same hand-off rule as `set_volume` — the user is driving now.
+    guard.pending_port_caps.remove_node(id);
+
     let entry = guard
         .nodes
         .get(&id)
         .ok_or_else(|| Error::not_found(format!("no node with id {id}")))?;
 
+    // SPEC §9.1: no `channelVolumes` rides along — a stale cached level would
+    // silently undo a volume change made elsewhere.
     if let Some(target) = guard.route_target(entry) {
-        let channels = target.props.channels.unwrap_or(entry.channels).max(1);
-        let volume = target.props.volume.unwrap_or(entry.volume);
-        return write_route_props(&guard, &target, vec![volume as f32; channels], mute);
+        return write_route_mute(&guard, &target, mute);
     }
 
-    let pod = props_pod(vec![Property::new(
-        spa::sys::SPA_PROP_mute,
-        Value::Bool(mute),
-    )])
-    .ok_or_else(|| Error::pipewire("could not build the mute pod"))?;
+    let pod = props_pod(mute_properties(mute))
+        .ok_or_else(|| Error::pipewire("could not build the mute pod"))?;
     let param =
         Pod::from_bytes(&pod).ok_or_else(|| Error::pipewire("built an invalid mute pod"))?;
     entry.proxy.set_param(ParamType::Props, 0, param);
@@ -1678,52 +1774,104 @@ fn set_mute(inner: &Rc<RefCell<Inner>>, id: u32, mute: bool) -> Result<()> {
 }
 
 /// SPEC §6.1's `SetPort`: select a card route for a node.
+///
+/// SPEC §9.2: a switch PipeDeck itself issued is also recorded as *pending*, so
+/// the `Route` re-enumeration that confirms it can clamp whatever level
+/// WirePlumber restored for the new port.
 fn set_port(inner: &Rc<RefCell<Inner>>, id: u32, index: u32) -> Result<()> {
-    let guard = inner.borrow();
-    let entry = guard
-        .nodes
-        .get(&id)
-        .ok_or_else(|| Error::not_found(format!("no node with id {id}")))?;
-    let kind = entry
-        .role
-        .device_kind()
-        .ok_or_else(|| Error::invalid(format!("node {id} is not a sink or source")))?;
-    let (device_id, card_profile_device, routes) = guard
-        .node_device(entry)
-        .ok_or_else(|| Error::invalid(route::SetPortError::NoPorts.message(id, index)))?;
+    let mut guard = inner.borrow_mut();
 
-    route::validate_set_port(routes, kind, card_profile_device, index)
-        .map_err(|e| Error::invalid(e.message(id, index)))?;
+    let (kind, device_id, card_profile_device) = {
+        let entry = guard
+            .nodes
+            .get(&id)
+            .ok_or_else(|| Error::not_found(format!("no node with id {id}")))?;
+        let kind = entry
+            .role
+            .device_kind()
+            .ok_or_else(|| Error::invalid(format!("node {id} is not a sink or source")))?;
+        let (device_id, card_profile_device, routes) = guard
+            .node_device(entry)
+            .ok_or_else(|| Error::invalid(route::SetPortError::NoPorts.message(id, index)))?;
 
-    let device = guard
-        .devices
-        .get(&device_id)
-        .ok_or_else(|| Error::pipewire(format!("device {device_id} is no longer bound")))?;
-    let bytes = route_pod(index, card_profile_device, None)
-        .ok_or_else(|| Error::pipewire("could not build the Route pod"))?;
-    let param =
-        Pod::from_bytes(&bytes).ok_or_else(|| Error::pipewire("built an invalid Route pod"))?;
-    device.proxy.set_param(ParamType::Route, 0, param);
+        route::validate_set_port(routes, kind, card_profile_device, index)
+            .map_err(|e| Error::invalid(e.message(id, index)))?;
+        (kind, device_id, card_profile_device)
+    };
+
+    {
+        let device = guard
+            .devices
+            .get(&device_id)
+            .ok_or_else(|| Error::pipewire(format!("device {device_id} is no longer bound")))?;
+        let bytes = route_pod(index, card_profile_device, None)
+            .ok_or_else(|| Error::pipewire("could not build the Route pod"))?;
+        let param =
+            Pod::from_bytes(&bytes).ok_or_else(|| Error::pipewire("built an invalid Route pod"))?;
+        device.proxy.set_param(ParamType::Route, 0, param);
+    }
+
+    // SPEC §9.2: outputs only. The rule is about never making an *output*
+    // louder than the user meant; silently pulling a capture level down would
+    // be a surprise, not a safety net. Nothing is recorded while the cap is
+    // off, so a switch made with `cap off` cannot be clamped by a
+    // `pipedeck cap 60` issued a moment later.
+    let cap = guard.config.port_switch_cap();
+    match (kind, cap) {
+        (DeviceKind::Sink, Some(cap_linear)) => guard.pending_port_caps.record(PendingPortSwitch {
+            node_id: id,
+            device_id,
+            card_profile_device,
+            route_index: index,
+            cap_linear,
+            issued: Instant::now(),
+            clamps: 0,
+        }),
+        // A fresh switch always supersedes an older pending one for this node.
+        _ => guard.pending_port_caps.remove_node(id),
+    }
     Ok(())
 }
 
-/// Write `channelVolumes` + `mute` through a card's active `Route`.
-fn write_route_props(
+/// SPEC §9.1: the `Props` body of a volume write — `channelVolumes` and
+/// nothing else, so a `mute` set elsewhere survives.
+fn volume_properties(channel_volumes: Vec<f32>) -> Vec<Property> {
+    vec![Property::new(
+        spa::sys::SPA_PROP_channelVolumes,
+        Value::ValueArray(ValueArray::Float(channel_volumes)),
+    )]
+}
+
+/// SPEC §9.1: the `Props` body of a mute write — `mute` and nothing else, so a
+/// level set elsewhere survives.
+fn mute_properties(mute: bool) -> Vec<Property> {
+    vec![Property::new(spa::sys::SPA_PROP_mute, Value::Bool(mute))]
+}
+
+/// Write `channelVolumes` — and only that — through a card's active `Route`.
+fn write_route_volume(
     inner: &Inner,
     target: &RouteTarget,
     channel_volumes: Vec<f32>,
-    mute: bool,
 ) -> Result<()> {
+    write_route_props(inner, target, volume_properties(channel_volumes))
+}
+
+/// Write `mute` — and only that — through a card's active `Route`.
+fn write_route_mute(inner: &Inner, target: &RouteTarget, mute: bool) -> Result<()> {
+    write_route_props(inner, target, mute_properties(mute))
+}
+
+/// Write one `Props` object through a card's active `Route`.
+///
+/// SPEC §9.1: PipeWire/ACP apply each Route property independently, so the
+/// object carries exactly the keys the caller is changing and never a cached
+/// value of anything else. Every caller goes through [`write_route_volume`] or
+/// [`write_route_mute`], which is what keeps that true.
+fn write_route_props(inner: &Inner, target: &RouteTarget, props: Vec<Property>) -> Result<()> {
     let device = inner.devices.get(&target.device_id).ok_or_else(|| {
         Error::pipewire(format!("device {} is no longer bound", target.device_id))
     })?;
-    let props = vec![
-        Property::new(
-            spa::sys::SPA_PROP_channelVolumes,
-            Value::ValueArray(ValueArray::Float(channel_volumes)),
-        ),
-        Property::new(spa::sys::SPA_PROP_mute, Value::Bool(mute)),
-    ];
     let bytes = route_pod(target.index, target.card_profile_device, Some(props))
         .ok_or_else(|| Error::pipewire("could not build the Route pod"))?;
     let param =
@@ -2241,6 +2389,86 @@ mod tests {
             .find(|p| p.key == spa::sys::SPA_PARAM_ROUTE_save)
             .expect("save property");
         assert_eq!(save.value, Value::Bool(true));
+    }
+
+    /// Every `SPA_PROP_*` key present in a pod's top-level `Props` object.
+    fn props_keys(bytes: &[u8]) -> Vec<u32> {
+        let (_rest, value) = PodDeserializer::deserialize_any_from(bytes).expect("deserialises");
+        let Value::Object(object) = value else {
+            panic!("not an object");
+        };
+        object.properties.iter().map(|p| p.key).collect()
+    }
+
+    /// Every `SPA_PROP_*` key inside a `Route` pod's nested `props` object.
+    fn route_props_keys(bytes: &[u8]) -> Vec<u32> {
+        let (_rest, value) = PodDeserializer::deserialize_any_from(bytes).expect("deserialises");
+        let Value::Object(object) = value else {
+            panic!("not an object");
+        };
+        let props = object
+            .properties
+            .iter()
+            .find(|p| p.key == spa::sys::SPA_PARAM_ROUTE_props)
+            .expect("props field");
+        let Value::Object(nested) = &props.value else {
+            panic!("props is not an object");
+        };
+        nested.properties.iter().map(|p| p.key).collect()
+    }
+
+    /// SPEC §9.1: a volume write through the card `Route` carries
+    /// `channelVolumes` and **no** `mute`, so it cannot undo a mute set by the
+    /// keyboard key or the GNOME slider a few milliseconds earlier.
+    #[test]
+    fn route_volume_write_carries_no_mute() {
+        let bytes =
+            route_pod(4, 4, Some(volume_properties(vec![0.216, 0.216]))).expect("pod builds");
+        assert_eq!(
+            route_props_keys(&bytes),
+            vec![spa::sys::SPA_PROP_channelVolumes]
+        );
+
+        // ... and it still parses as a route whose props carry only a volume.
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        let props = parse_route(pod).expect("parses").props.expect("props");
+        assert_eq!(props.mute, None);
+        assert_eq!(props.channels, Some(2));
+        assert!((props.volume.expect("volume") - 0.216).abs() < 1e-6);
+    }
+
+    /// SPEC §9.1, the other direction: a mute write carries `mute` and **no**
+    /// `channelVolumes`, so a stale cached level cannot undo a volume change.
+    #[test]
+    fn route_mute_write_carries_no_volume() {
+        let bytes = route_pod(4, 4, Some(mute_properties(true))).expect("pod builds");
+        assert_eq!(route_props_keys(&bytes), vec![spa::sys::SPA_PROP_mute]);
+
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        let props = parse_route(pod).expect("parses").props.expect("props");
+        assert_eq!(props.mute, Some(true));
+        assert_eq!(props.volume, None);
+        assert_eq!(props.channels, None);
+    }
+
+    /// SPEC §9.1 applies to the node-`Props` path too — streams and any sink
+    /// with no card route behind it.
+    #[test]
+    fn node_props_writes_are_independent_too() {
+        let volume = props_pod(volume_properties(vec![0.5, 0.5])).expect("pod builds");
+        assert_eq!(props_keys(&volume), vec![spa::sys::SPA_PROP_channelVolumes]);
+        let (_v, mute, channels) =
+            parse_props(Pod::from_bytes(&volume).expect("valid pod")).expect("parses");
+        assert_eq!(mute, None);
+        assert_eq!(channels, Some(2));
+
+        let muted = props_pod(mute_properties(false)).expect("pod builds");
+        assert_eq!(props_keys(&muted), vec![spa::sys::SPA_PROP_mute]);
+        let (volume, mute, channels) =
+            parse_props(Pod::from_bytes(&muted).expect("valid pod")).expect("parses");
+        assert_eq!(volume, None);
+        assert_eq!(mute, Some(false));
+        assert_eq!(channels, None);
     }
 
     /// `SetPort` sends no props at all (SPEC §6.1).

@@ -40,6 +40,10 @@ pub trait Daemon {
     #[zbus(property)]
     fn notification_sink(&self) -> zbus::Result<String>;
 
+    /// Port-switch level cap, cubic-scale percent; 0 means off (SPEC §9.2).
+    #[zbus(property)]
+    fn port_switch_cap(&self) -> zbus::Result<u32>;
+
     /// Daemon version.
     #[zbus(property)]
     fn version(&self) -> zbus::Result<String>;
@@ -67,6 +71,9 @@ pub trait Daemon {
 
     /// Turn ALSA `Auto-Mute Mode` on or off for the card behind an output device.
     fn set_auto_mute(&self, node_id: u32, enabled: bool) -> zbus::Result<()>;
+
+    /// Set the port-switch level cap, cubic-scale percent; 0 turns it off.
+    fn set_port_switch_cap(&self, percent: u32) -> zbus::Result<()>;
 
     /// Re-read the graph.
     fn refresh(&self) -> zbus::Result<()>;

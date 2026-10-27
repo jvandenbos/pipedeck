@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "pipedeck.bar",
+  "name": "PipeDeck",
+  "version": "1.4.0",
+  "author": "Jan Vandenbos",
+  "description": "Opens the PipeDeck routing window; shows the current output in its tooltip",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "PipeDeck",
+    "description": "Opens the PipeDeck routing window; shows the current output in its tooltip",
+    "category": "Audio",
+    "allowMultiple": false
+  }
+}

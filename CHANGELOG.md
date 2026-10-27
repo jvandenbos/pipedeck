@@ -5,6 +5,12 @@ milestones map to the numbered sections of `SPEC.md`.
 
 ## [Unreleased]
 
+### Added
+- Omarchy bar widget `pipedeck.bar` (`ui/omarchy-plugin/`): a 󰙪 glyph in the bar that opens
+  `pipedeck-ui` on click (right click: Omarchy's own audio panel) with the current output and
+  level in its tooltip. Installed by `ui/bin/install-user`; enable with
+  `omarchy plugin enable pipedeck.bar`.
+
 ## [1.4.0] — 2026-10-27
 
 ### Added

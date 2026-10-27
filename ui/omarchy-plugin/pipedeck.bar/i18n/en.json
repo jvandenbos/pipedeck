@@ -1,0 +1,5 @@
+{
+  "tooltip.output": "PipeDeck · %1 · %2 %",
+  "tooltip.muted": "PipeDeck · %1 · muted",
+  "tooltip.noOutput": "PipeDeck · no output device"
+}

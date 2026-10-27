@@ -23,3 +23,16 @@ command -v update-desktop-database >/dev/null && update-desktop-database "$APPS"
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "${ICONS%/scalable/apps}" || true
 
 echo "Installed $BIN/pipedeck-ui, $APPS/pipedeck-ui.desktop and $ICONS/pipedeck-ui.svg"
+
+# The Omarchy bar entry (SoundSource's menu-bar icon). Shell plugins are per
+# user and live under ~/.config/omarchy/plugins, so this is the one place a
+# package cannot put it. Enabling it is left to the user: `omarchy plugin
+# enable pipedeck.bar`.
+if command -v omarchy-shell >/dev/null; then
+  PLUGINS="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins"
+  mkdir -p "$PLUGINS"
+  rm -rf "$PLUGINS/pipedeck.bar"
+  cp -r "$ROOT/omarchy-plugin/pipedeck.bar" "$PLUGINS/pipedeck.bar"
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  echo "Installed the bar widget to $PLUGINS/pipedeck.bar (enable: omarchy plugin enable pipedeck.bar)"
+fi

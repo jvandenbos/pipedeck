@@ -82,6 +82,19 @@ o.window("^pipedeck-ui$", {
 Running `pipedeck-ui` while it is open brings the existing window forward
 instead of opening a second one.
 
+## Bar entry
+
+`omarchy-plugin/pipedeck.bar/` is an omarchy-shell bar widget — the menu-bar icon.
+`bin/install-user` copies it to `~/.config/omarchy/plugins/`; then:
+
+```sh
+omarchy plugin enable pipedeck.bar
+omarchy bar move pipedeck.bar --before omarchy.audio
+```
+
+Left click opens (or raises) the window, right click toggles Omarchy's own audio
+panel, and the tooltip shows the current output and its level.
+
 ## Layout
 
 ```text

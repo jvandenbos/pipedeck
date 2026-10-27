@@ -62,6 +62,8 @@ output/input pickers, per-app volume), the Microphone bar widget, Bluetooth conn
    in the Output row's FX panel where the card has one, and a per-row UI-local **Boost**
    toggle that widens that slider to 150 %. §4.6
 7. **Status** — daemon version/connection state, the last error, in the window. §5
+8. **Bar entry** — an omarchy-shell bar widget that opens the window (SoundSource's menu-bar
+   icon). §10 has the details; it is user-level only (shell plugins live in `~/.config`).
 
 ### 1.3 Non-goals (v1.0)
 Meters (v1.1), a device-switch level cap (v1.1, daemon work), AutoEq import in the window
@@ -436,8 +438,14 @@ pinned release source + `sha256sums`, every supported `arch`, a clean-chroot bui
   property in `AudioNodesModel.js` rather than impersonating `quickshell-peak-monitor`.
 - **`ImportEqPreset(path s) → id s`** on the daemon, then an Import button using the
   xdg-desktop-portal FileChooser (Omacut's `portalfilepicker` pattern).
-- Bar widget: a third-party omarchy-shell `bar-widget` plugin whose click runs `pipedeck-ui`
-  and whose tooltip shows EQ/routing state. Only after real use says it is wanted.
+- ~~Bar widget~~ **Done 2026-10-27** (Jan: "we need to get this on the menu bar"):
+  `ui/omarchy-plugin/pipedeck.bar/`, a third-party omarchy-shell `bar-widget` — left click
+  runs `pipedeck-ui` (single instance raises the window), right click toggles Omarchy's own
+  audio panel, tooltip = current output and level from Quickshell's Pipewire service (no
+  D-Bus from the shell). `ui/bin/install-user` copies it to `~/.config/omarchy/plugins/`;
+  enable with `omarchy plugin enable pipedeck.bar`, place with `omarchy bar move pipedeck.bar
+  --before omarchy.audio`. Daemon state (EQ on, routed streams) in the tooltip would need a
+  D-Bus bridge the shell does not have — a `pipedeck status --json` poll is the v1.1 route.
 - Persistent per-app rules (needs a stable identity policy — `application.name` +
   `binary`? decide with data from real clients first).
 

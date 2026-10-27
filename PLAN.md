@@ -131,6 +131,15 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
   0.5 s and 3.5 s; back to Headphones 0.40 untouched; `set-port` + `vol 70` inside the window → 0.70;
   `mute on` + `vol 45` → `0.45 [MUTED]`. One `clamped` journal line, no re-clamp needed on this card.
 
+## Phase 9 — Omarchy / Hyprland front end `pipedeck-ui` (SPEC-UI.md) — spec'd 2026-10-26 on gargoyle, not started
+- ☑ Daemon + CLI build unmodified on Arch (cargo 1.98, 69 s) and list the T14's graph (SPEC-UI §0).
+- ☑ EQ smart filter measured working on PipeWire 1.6.9 / WirePlumber 0.5.18 (null sink, +11.9 dB of a +12 dB shelf).
+- ☑ Design reviewed with Codex → `docs/2026-10-26-ui-design-review.md`; decisions in SPEC-UI §0.
+- ☐ Daemon additions, SPEC-UI §6: `StreamSinks`, manual-target precedence, Arch unit/activation paths.
+- ☐ `ui/` lane: qmake project, QtDBus proxy from the XML, model + lifecycle contract (§5), five sections (§4), fake-daemon Qt Tests (§8).
+- ☐ `ui/pkgbuild/PKGBUILD`, `makepkg -fsi` on gargoyle; acceptance 20–28 from the main session.
+- ☐ Release 1.4.0.
+
 ## v1.2 ideas (from first real use, 2026-09-05)
 - **ALSA Auto-Mute Mode.** On Realtek codecs, `Auto-Mute Mode = Enabled` hard-mutes Line Out while
   a headphone plug is present, so selecting the Line Out port produces silence. Not fixable via

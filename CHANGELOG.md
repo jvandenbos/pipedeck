@@ -3,6 +3,13 @@
 All notable changes to PipeDeck. Versions follow [Semantic Versioning](https://semver.org);
 milestones map to the numbered sections of `SPEC.md`.
 
+## [Unreleased]
+
+### Added
+- `SPEC-UI.md`: the Qt Quick front end for Omarchy / Hyprland (`pipedeck-ui`), reviewed with Codex
+  (`docs/2026-10-26-ui-design-review.md`). Daemon and CLI verified to build and run unmodified on Arch
+  (PipeWire 1.6.9, WirePlumber 0.5.18); the smart-filter EQ measured working there.
+
 ## [1.3.0] — 2026-09-07
 
 Loudness safety (SPEC §9).

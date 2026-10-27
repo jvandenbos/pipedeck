@@ -1,6 +1,6 @@
 # PipeDeck — Claude / agent instructions
 
-Read `SPEC.md` first; it is the contract. `PLAN.md` is the work log and the live-test notes.
+Read `SPEC.md` first; it is the contract — and `SPEC-UI.md` for the Qt front end (`ui/`, Omarchy/Hyprland). `PLAN.md` is the work log and the live-test notes.
 `CHANGELOG.md` is the release history.
 
 ## Rules
@@ -9,7 +9,8 @@ Read `SPEC.md` first; it is the contract. `PLAN.md` is the work log and the live
   out to `wpctl`/`pactl`/`pw-cli`; no other end-user audio project is a dependency.
 - **Subagents never SSH to the integration host.** They build and unit-test in the Docker image
   only; the maintainer's main session deploys and runs the live acceptance tests.
-- Lanes: `crates/` (daemon + CLI), `extension/` (GNOME Shell), `packaging/` + `install.sh` +
+- Lanes: `crates/` (daemon + CLI), `extension/` (GNOME Shell), `ui/` (Qt Quick front end, builds and
+  runs only on an Omarchy/Arch box — gargoyle, clone at `~/Work/pipedeck`), `packaging/` + `install.sh` +
   `Makefile` + `README.md` + `presets/`. Stay in your lane; leave cross-lane notes in
   `PLAN.md § Handoffs`.
 - Agents don't `git commit`; the main session does.

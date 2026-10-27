@@ -2,11 +2,23 @@
 
 ![pipedeck-ui with made-up devices, offscreen against a fake daemon](docs/pipedeck-ui.png)
 
-The PipeDeck window for Omarchy / Hyprland: every output and input with its
-ports, every playback stream with its own destination, where notification
-sounds go, an EQ preset per output, and the loudness-safety controls. It is a
-Qt Quick front end to `pipedeckd` over D-Bus; the daemon does the work with or
-without the window open. The contract is `../SPEC-UI.md`; the D-Bus interface
+The PipeDeck window for Omarchy / Hyprland, laid out like Rogue Amoeba's
+SoundSource: a **System** block (Output, Input, Sound Effects) and an
+**Applications** block with one row per playing stream. Each row has mute, a
+volume slider, Boost (that slider to 150 %) and a device menu: the output or
+input device (ports flattened into places — "Speaker", "Headphones"), where
+notification sounds go, or where a stream is redirected. The Output row's FX
+chevron opens the EQ preset and auto-mute switch; the gear opens Settings
+(port-switch cap, daemon status). It is a Qt Quick front end to `pipedeckd`
+over D-Bus; the daemon does the work with or without the window open.
+
+| Device menu | FX panel |
+|---|---|
+| ![the Output device menu](docs/pipedeck-ui-devices.png) | ![the Output row's effects panel](docs/pipedeck-ui-fx.png) |
+
+A ⚠ before a menu means a request the graph does not honour right now: a stream
+asked for one output and plays on another, or the chosen output is unplugged.
+Its tooltip says which. The contract is `../SPEC-UI.md`; the D-Bus interface
 is `../crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`.
 
 Omarchy's own audio panel (`SUPER+CTRL+A`) stays the quick volume popup; this
@@ -18,10 +30,12 @@ window is for routing.
 |---|---|
 | `?` | Show or hide the shortcut overlay |
 | `Q` | Quit (types a Q when a text field has focus) |
-| `Esc` | Close an open picker, then the window |
-| `Tab` / `Shift+Tab` | Move between controls (the view scrolls to follow) |
+| `,` | Open or close Settings |
+| `Esc` | Close the topmost: a menu, the shortcut overlay, the FX panel, Settings, then the window |
+| `Tab` / `Shift+Tab` | Move between controls (the Applications list scrolls to follow) |
 | `←` `→` | Change the focused slider |
-| `Space` | Press the focused button, radio, switch or picker |
+| `Space` | Press the focused button or switch, or open the focused device menu |
+| `↑` `↓` `Enter` | Move in an open device menu and pick |
 | `F5` | Ask the daemon to re-read the audio graph |
 
 ## Build, test, install
@@ -55,12 +69,12 @@ right, the rule under it (Omarchy 4.5's Lua helpers, as in
 -- SUPER+CTRL+SHIFT+A opens PipeDeck; SUPER+CTRL+A stays Omarchy's audio panel.
 o.bind("SUPER + CTRL + SHIFT + A", "PipeDeck", "pipedeck-ui")
 
--- Optional: a 420x720 floating panel, 12 px from the right edge, on every
--- workspace. Drop any line you don't want.
+-- Optional: floating, 12 px from the right edge, on every workspace. No size:
+-- the window is 560 px wide and as tall as its content (300-720 px). Drop any
+-- line you don't want.
 o.window("^pipedeck-ui$", {
   float = true,
-  size = { 420, 720 },
-  move = { "(monitor_w-432)", 40 },
+  move = { "(monitor_w-572)", 40 },
   pin = true,
 })
 ```

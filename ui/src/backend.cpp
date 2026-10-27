@@ -12,10 +12,10 @@ namespace {
 
 const QByteArrayList DeviceRoles{"nodeId",    "name",     "nick",       "description", "isDefault", "isVirtual",
                                  "percent", "mute",   "ports",      "showPorts",   "hasAutoMute", "autoMute",
-                                 "eqPreset", "eqName", "eqAvailable"};
+                                 "eqPreset", "eqName", "eqAvailable", "boost", "maxPercent"};
 const QByteArrayList StreamRoles{"nodeId",          "label",        "icon",        "percent",  "mute",
                                  "target",      "targetLabel",  "targetAbsent", "observed", "observedLabel",
-                                 "showObserved"};
+                                 "showObserved", "appLabel", "mediaLabel", "boost", "maxPercent"};
 
 // Half a cubic percent: below what the label shows, above f32 round-trips in
 // the daemon, so the echo of our own write is recognised as such.
@@ -27,13 +27,14 @@ Backend::Backend(const QDBusConnection &connection, const QString &settingsFile,
                  QObject *parent)
     : QObject(parent), m_connection(connection), m_icons(icons ? std::move(icons) : std::make_shared<AppIcons>()),
       m_outputs(new RowModel(DeviceRoles, "nodeId", this)), m_inputs(new RowModel(DeviceRoles, "nodeId", this)),
-      m_streams(new RowModel(StreamRoles, "nodeId", this)) {
+      m_streams(new RowModel(StreamRoles, "nodeId", this)), m_defaultOutput(new RowModel(DeviceRoles, "nodeId", this)),
+      m_defaultInput(new RowModel(DeviceRoles, "nodeId", this)) {
     m_clock.start();
     m_settings = settingsFile.isEmpty()
                      ? std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, "pipedeck-ui",
                                                    "pipedeck-ui")
                      : std::make_unique<QSettings>(settingsFile, QSettings::IniFormat);
-    m_allowOverdrive = m_settings->value("ui/allowOverdrive", false).toBool();
+    m_boosted = m_settings->value("ui/boost").toStringList();
 
     m_refreshTimer.setSingleShot(true);
     connect(&m_refreshTimer, &QTimer::timeout, this, &Backend::startRefresh);
@@ -281,7 +282,7 @@ void Backend::rebuildModels() {
         return it != m_holds.constEnd() ? it->percent : linearToPercent(linear);
     };
 
-    QList<QVariantMap> outputs, inputs, streams;
+    QList<QVariantMap> outputs, inputs, streams, defaultOutput, defaultInput;
     QString defaultSink;
     for (const auto &d : m_snapshot.devices) {
         if (d.kind == "sink" && d.isDefault)
@@ -326,11 +327,18 @@ void Backend::rebuildModels() {
             {"eqPreset", eqPreset},
             {"eqName", f.value("eq").toBool() ? eqName : QString()},
             {"eqAvailable", eqAvailable && !d.isVirtual},
+            {"boost", m_boosted.contains("node:" + d.name)},
+            {"maxPercent", m_boosted.contains("node:" + d.name) ? 150 : 100},
         };
-        if (d.kind == "sink")
+        if (d.kind == "sink") {
             outputs << row;
-        else if (d.kind == "source")
+            if (d.isDefault && defaultOutput.isEmpty())
+                defaultOutput << row;
+        } else if (d.kind == "source") {
             inputs << row;
+            if (d.isDefault && defaultInput.isEmpty())
+                defaultInput << row;
+        }
     }
 
     QHash<uint, QString> observed;
@@ -364,7 +372,12 @@ void Backend::rebuildModels() {
         // stream should be: its request, or the default when following it.
         const QString expected = s.targetName.isEmpty() ? defaultSink : s.targetName;
         const QString seenNick = sinkNick(seen);
+        const bool boost = m_boosted.contains(boostKey(s.id));
         streams << QVariantMap{
+            {"appLabel", !head.isEmpty() ? head : QStringLiteral("#%1").arg(s.id)},
+            {"mediaLabel", parts.size() > 1 ? parts.at(1) : QString()},
+            {"boost", boost},
+            {"maxPercent", boost ? 150 : 100},
             {"nodeId", s.id},
             {"label", label},
             {"icon", icon.isEmpty() ? QString() : QString::fromLatin1(QUrl::toPercentEncoding(icon))},
@@ -382,6 +395,8 @@ void Backend::rebuildModels() {
     m_outputs->setRows(outputs);
     m_inputs->setRows(inputs);
     m_streams->setRows(streams);
+    m_defaultOutput->setRows(defaultOutput);
+    m_defaultInput->setRows(defaultInput);
 }
 
 QVariantList Backend::eqPresets() const {
@@ -421,13 +436,92 @@ QVariantMap Backend::features() const {
     };
 }
 
-void Backend::setAllowOverdrive(bool on) {
-    if (on == m_allowOverdrive)
+QString Backend::glyphFor(const QString &kind, const QString &nodeName, const QString &portName,
+                          const QString &portDescription) {
+    const QString node = nodeName.toLower();
+    const QString port = (portName + ' ' + portDescription).toLower();
+    const QString all = node + ' ' + port;
+    if (node.startsWith("bluez") || all.contains("bluetooth"))
+        return "bluetooth";
+    if (kind == "source")
+        return node.contains("usb") ? "usb" : "mic";
+    if (all.contains("hdmi") || all.contains("displayport") || port.contains("[out] dp") || node.contains(".dp"))
+        return "monitor";
+    // The port decides when there is one: a speaker sink's headphone port is
+    // headphones, whatever the node is called.
+    if (port.contains("headphone") || port.contains("headset"))
+        return "headphones";
+    if (port.trimmed().isEmpty() && (node.contains("headphone") || node.contains("headset")))
+        return "headphones";
+    if (node.contains("usb"))
+        return "usb";
+    return "speaker";
+}
+
+QVariantList Backend::places(const QString &kind, bool withPorts) const {
+    const bool ports = withPorts && features().value("ports").toBool();
+    QVariantList list;
+    for (const auto &d : m_snapshot.devices) {
+        if (d.kind != kind)
+            continue;
+        const QString nick = !d.nick.isEmpty() ? d.nick : !d.description.isEmpty() ? d.description : d.name;
+        QList<const PortRow *> available;
+        for (const auto &p : m_snapshot.ports)
+            if (p.nodeId == d.id && p.available)
+                available << &p;
+        if (ports && available.size() >= 2) {
+            for (const PortRow *p : available)
+                list << QVariantMap{{"nodeId", d.id},
+                                    {"name", d.name},
+                                    {"route", int(p->routeIndex)},
+                                    {"label", p->description.isEmpty() ? p->name : p->description},
+                                    {"description", nick},
+                                    {"glyph", glyphFor(kind, d.name, p->name, p->description)},
+                                    {"current", d.isDefault && p->active}};
+            continue;
+        }
+        const PortRow *only = available.size() == 1 ? available.first() : nullptr;
+        list << QVariantMap{{"nodeId", d.id},
+                            {"name", d.name},
+                            {"route", -1},
+                            {"label", nick},
+                            {"description", d.description},
+                            {"glyph", glyphFor(kind, d.name, only ? only->name : QString(),
+                                               only ? only->description : QString())},
+                            {"current", d.isDefault}};
+    }
+    return list;
+}
+
+QString Backend::boostKey(uint id) const {
+    for (const auto &d : m_snapshot.devices)
+        if (d.id == id)
+            return "node:" + d.name;
+    for (const auto &s : m_snapshot.streams)
+        if (s.id == id) {
+            const QString app = !s.binary.isEmpty() ? s.binary : s.appName;
+            return app.isEmpty() ? QString() : "app:" + app;
+        }
+    return {};
+}
+
+bool Backend::boosted(uint id) const {
+    const QString key = boostKey(id);
+    return !key.isEmpty() && m_boosted.contains(key);
+}
+
+void Backend::setBoost(uint id, bool on) {
+    const QString key = boostKey(id);
+    if (key.isEmpty() || m_boosted.contains(key) == on)
         return;
-    m_allowOverdrive = on;
-    m_settings->setValue("ui/allowOverdrive", on);
+    if (on)
+        m_boosted << key;
+    else
+        m_boosted.removeAll(key);
+    m_settings->setValue("ui/boost", m_boosted);
     m_settings->sync();
-    emit allowOverdriveChanged();
+    rebuildModels();
+    emit boostChanged();
 }
 
 // ---- writes ---------------------------------------------------------------
@@ -481,11 +575,28 @@ void Backend::setDefault(const QString &kind, const QString &name) {
         track(m_proxy->setDefault(kind, name), "SetDefault");
 }
 
+void Backend::choosePlace(const QString &kind, uint nodeId, int route) {
+    if (!connected())
+        return;
+    for (const auto &d : m_snapshot.devices) {
+        if (d.id != nodeId || d.kind != kind)
+            continue;
+        if (!d.isDefault)
+            setDefault(kind, d.name);
+        if (route >= 0)
+            for (const auto &p : m_snapshot.ports)
+                if (p.nodeId == nodeId && int(p.routeIndex) == route && !p.active)
+                    setPort(nodeId, uint(route));
+        return;
+    }
+}
+
 void Backend::setVolume(uint id, double percent, bool dragging) {
     const auto observed = observedLinear(id);
     if (!connected() || !observed)
         return;
-    percent = std::clamp(percent, 0.0, double(maxPercent()));
+    const int maxPercent = maxPercentFor(id);
+    percent = std::clamp(percent, 0.0, double(maxPercent));
     const double linear = percentToLinear(percent);
     const auto write = m_volumeWrites.constFind(id);
     const bool queued = write != m_volumeWrites.constEnd() && write->queued;
@@ -496,7 +607,7 @@ void Backend::setVolume(uint id, double percent, bool dragging) {
     // without movement, and the clamp of a level above the slider's range
     // (shown at the end; never written back, SPEC-UI §4.1).
     if (hold == m_holds.end() && !queued) {
-        const double standing = std::min(linearToPercent(*observed), double(maxPercent()));
+        const double standing = std::min(linearToPercent(*observed), double(maxPercent));
         if (std::abs(standing - percent) < EchoTolerancePercent)
             return;
     }
@@ -519,9 +630,9 @@ void Backend::setVolume(uint id, double percent, bool dragging) {
 
 void Backend::showPercent(uint id, double percent) {
     // One role of one row: a 60 Hz drag must not rebuild three models.
-    for (RowModel *model : {m_outputs, m_inputs, m_streams})
-        if (model->setValue(QVariant::fromValue(id), "percent", percent))
-            return;
+    // The Output and Input rows show the default device's row a second time.
+    for (RowModel *model : {m_outputs, m_inputs, m_streams, m_defaultOutput, m_defaultInput})
+        model->setValue(QVariant::fromValue(id), "percent", percent);
 }
 
 void Backend::queueVolume(uint id, double linear) {

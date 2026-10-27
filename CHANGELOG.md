@@ -42,6 +42,12 @@ milestones map to the numbered sections of `SPEC.md`.
   sink is `StreamSinks`, shown separately by `pipedeck status`. The GNOME extension does not render
   the field.
 
+### Changed
+- pipedeck-ui follows SoundSource's layout (Jan, 2026-10-27): a System block (Output, Input,
+  Sound Effects) and an Applications block, each row with Volume · Boost · Device · FX, and an
+  icon-and-checkmark device menu; ports appear as entries of the device menu; the global
+  "allow up to 150 %" toggle became a per-row Boost.
+
 ### Fixed
 - **"Follow default" now follows the default for streams that picked a sink when they
   connected** (`pw-play --target`, `PULSE_SINK`). `SetStreamTarget(id, "")` used to delete the

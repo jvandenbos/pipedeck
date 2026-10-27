@@ -34,14 +34,25 @@ class Backend : public QObject {
     Q_PROPERTY(RowModel *outputs READ outputs CONSTANT)
     Q_PROPERTY(RowModel *inputs READ inputs CONSTANT)
     Q_PROPERTY(RowModel *streams READ streams CONSTANT)
+    // The default sink and source, as one-row (or empty) models with the
+    // device roles: the window's Output and Input rows (SPEC-UI §4.2).
+    Q_PROPERTY(RowModel *defaultOutput READ defaultOutput CONSTANT)
+    Q_PROPERTY(RowModel *defaultInput READ defaultInput CONSTANT)
     Q_PROPERTY(QVariantList eqPresets READ eqPresets NOTIFY snapshotChanged)
     // Every output as {value: node.name, text: nick}, for the pickers.
     Q_PROPERTY(QVariantList sinkChoices READ sinkChoices NOTIFY snapshotChanged)
+    // Places (SPEC-UI §4.3): what the device popups list. A device with two
+    // or more available ports is one place per port, named by the port;
+    // otherwise the device is one place, by its nick. Each entry is
+    // {nodeId, name, route (-1: the device as a whole), label, description,
+    // glyph, current}. sinkPlaces lists sinks only (streams target sinks,
+    // not ports), with current = the default sink.
+    Q_PROPERTY(QVariantList outputPlaces READ outputPlaces NOTIFY snapshotChanged)
+    Q_PROPERTY(QVariantList inputPlaces READ inputPlaces NOTIFY snapshotChanged)
+    Q_PROPERTY(QVariantList sinkPlaces READ sinkPlaces NOTIFY snapshotChanged)
     Q_PROPERTY(QString notificationSink READ notificationSink NOTIFY snapshotChanged)
     Q_PROPERTY(int portSwitchCap READ portSwitchCap NOTIFY snapshotChanged)
     Q_PROPERTY(QVariantMap features READ features NOTIFY featuresChanged)
-    Q_PROPERTY(bool allowOverdrive READ allowOverdrive WRITE setAllowOverdrive NOTIFY allowOverdriveChanged)
-    Q_PROPERTY(int maxPercent READ maxPercent NOTIFY allowOverdriveChanged)
 
 public:
     // Minimum gaps between writes and reads (SPEC-UI §4.1, §5).
@@ -67,20 +78,36 @@ public:
     RowModel *outputs() const { return m_outputs; }
     RowModel *inputs() const { return m_inputs; }
     RowModel *streams() const { return m_streams; }
+    RowModel *defaultOutput() const { return m_defaultOutput; }
+    RowModel *defaultInput() const { return m_defaultInput; }
     QVariantList eqPresets() const;
     QVariantList sinkChoices() const;
+    QVariantList outputPlaces() const { return places("sink", true); }
+    QVariantList inputPlaces() const { return places("source", true); }
+    QVariantList sinkPlaces() const { return places("sink", false); }
     QString notificationSink() const { return m_snapshot.notificationSink; }
     int portSwitchCap() const;
     QVariantMap features() const;
-    bool allowOverdrive() const { return m_allowOverdrive; }
-    void setAllowOverdrive(bool on);
-    int maxPercent() const { return m_allowOverdrive ? 150 : 100; }
+    // Boost (SPEC-UI §4.6): a per-row UI setting that widens that row's
+    // slider to 150 %. Kept per device node.name, and per app for streams
+    // (stream ids do not survive a restart), in QSettings ui/boost.
+    Q_INVOKABLE void setBoost(uint id, bool on);
+    bool boosted(uint id) const;
+    int maxPercentFor(uint id) const { return boosted(id) ? 150 : 100; }
+    // The glyph a device popup shows for a place (speaker, headphones,
+    // monitor, bluetooth, usb, mic), from node and port names.
+    static QString glyphFor(const QString &kind, const QString &nodeName, const QString &portName,
+                            const QString &portDescription);
 
     // §4.1 volume contract: the slider is cubic percent, the wire is linear.
     Q_INVOKABLE static double percentToLinear(double percent);
     Q_INVOKABLE static double linearToPercent(double linear);
 
     Q_INVOKABLE void setDefault(const QString &kind, const QString &name);
+    // Picks a place from a device popup: SetDefault unless the device is the
+    // default already, then SetPort when `route` is a port that is not
+    // active. Nothing at all for the current place.
+    Q_INVOKABLE void choosePlace(const QString &kind, uint nodeId, int route);
     // `dragging` is true while the slider is held; the release sends false.
     Q_INVOKABLE void setVolume(uint id, double percent, bool dragging);
     Q_INVOKABLE void setMute(uint id, bool mute);
@@ -105,7 +132,7 @@ signals:
     void snapshotChanged();
     void featuresChanged();
     void lastErrorChanged();
-    void allowOverdriveChanged();
+    void boostChanged();
     // Emitted as each SetVolume leaves, so the <= 20/s rule is measurable
     // where it is enforced rather than after bus jitter.
     void volumeSent(uint id, double linear);
@@ -151,6 +178,8 @@ private:
     void setLastError(const QString &text);
     bool nodeKnown(uint id) const;
     QString sinkNick(const QString &name) const;
+    QVariantList places(const QString &kind, bool withPorts) const;
+    QString boostKey(uint id) const;
     qint64 now() const { return m_clock.elapsed(); }
     qint64 nowNs() const { return m_clock.nsecsElapsed(); }
 
@@ -187,9 +216,11 @@ private:
     std::optional<uint> m_capPending;
     QTimer m_capTimer;
 
-    bool m_allowOverdrive = false;
+    QStringList m_boosted; // boost keys: "node:<node.name>" or "app:<binary|app name>"
 
     RowModel *m_outputs;
     RowModel *m_inputs;
     RowModel *m_streams;
+    RowModel *m_defaultOutput;
+    RowModel *m_defaultInput;
 };

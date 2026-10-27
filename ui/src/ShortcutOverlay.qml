@@ -12,7 +12,7 @@ Rectangle {
 
     Rectangle {
         anchors.centerIn: parent
-        width: Math.min(parent.width - 32, 400)
+        width: Math.min(parent.width - 32, 440)
         height: grid.implicitHeight + 40
         radius: theme.radius
         color: "#1c1c21"
@@ -38,10 +38,12 @@ Rectangle {
                 model: [
                     "?", qsTr("Show or hide these shortcuts"),
                     "Q", qsTr("Quit"),
-                    "Esc", qsTr("Close an open picker, then the window"),
+                    ",", qsTr("Open or close the settings"),
+                    "Esc", qsTr("Close a menu, this overlay, the effects panel or the settings, then the window"),
                     "Tab / Shift+Tab", qsTr("Move between controls"),
                     "← →", qsTr("Change the focused slider"),
-                    "Space", qsTr("Press the focused button, radio or switch"),
+                    "Space", qsTr("Press the focused button or switch, or open a device menu"),
+                    "↑ ↓  Enter", qsTr("Move in an open device menu and pick"),
                     "F5", qsTr("Ask the daemon to re-read the audio graph")
                 ]
                 delegate: Label {

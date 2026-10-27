@@ -3,8 +3,9 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 
+// What the main page shows instead of the blocks while there is nothing to
+// show: a spinner while connecting, the message and Start when absent.
 ColumnLayout {
-    visible: backend.state !== "connected"
     spacing: 10
 
     BusyIndicator {
@@ -28,6 +29,7 @@ ColumnLayout {
         opacity: 0.75
     }
     Button {
+        objectName: "start"
         visible: backend.state === "absent"
         enabled: !backend.starting
         text: qsTr("Start")

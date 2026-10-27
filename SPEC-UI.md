@@ -6,8 +6,12 @@ notification routing, ports, EQ and the loudness-safety controls — all served 
 `pipedeckd` over D-Bus. Target host first: **gargoyle** (ThinkPad T14 Gen 1 AMD, Omarchy
 4.5.0rc1, Hyprland 0.56, PipeWire 1.6.9, WirePlumber 0.5.18, Qt 6.12). Then any Omarchy box.
 
-The UI does **not** copy SoundSource's layout (Jan, 2026-10-26); it borrows the idea of one
-place for the whole audio graph and otherwise follows Omarchy's own app conventions.
+The UI **follows SoundSource's layout** (Jan, 2026-10-27, from screenshots: a System block —
+Output / Input / Sound Effects — and an Applications block, each row with Volume · Boost ·
+Device · FX, and an icon-and-checkmark device menu), rendered in Omarchy's dark Material
+register with the theme accent. An earlier draft with a stacked list of every device, and a
+proposed "hero card" layout, were both rejected. Everything else follows Omarchy's own app
+conventions.
 
 ## 0. Decisions and what is already verified
 
@@ -46,16 +50,17 @@ output/input pickers, per-app volume), the Microphone bar widget, Bluetooth conn
 `omarchy.bluetooth`, per-laptop speaker tunings (`omarchy-audio-tuning`, none match the T14).
 
 ### 1.2 v1.0 — what `pipedeck-ui` adds
-1. **Outputs** — one row per sink with volume, mute, default marker; **ports nested** under
-   the sink that owns them (a selector, not peer rows). §4.1
-2. **Inputs** — same shape for sources.
+1. **Output** — one row for the default sink (volume, mute, Boost, device menu, FX); the
+   device menu lists every sink, with a sink's ports flattened into separate entries. §4.1
+2. **Input** — the same row for the default source.
 3. **Playback streams** — every playback stream: label, volume, mute, and a **destination
    picker** (Follow default · each output). §4.3 defines the semantics.
 4. **Notifications** — which output `media.role=event` streams go to. §4.4
 5. **Equalizer** — per output: Off or one of the installed presets. §4.5 (import stays in
    the CLI: `pipedeck eq import`.)
-6. **Safety** — the port-switch cap (`PortSwitchCap`), the ALSA auto-mute switch where the
-   card has one, and a UI-local "allow up to 150 %" slider range toggle. §4.6
+6. **Safety** — the port-switch cap (`PortSwitchCap`) in Settings, the ALSA auto-mute switch
+   in the Output row's FX panel where the card has one, and a per-row UI-local **Boost**
+   toggle that widens that slider to 150 %. §4.6
 7. **Status** — daemon version/connection state, the last error, in the window. §5
 
 ### 1.3 Non-goals (v1.0)
@@ -126,73 +131,135 @@ device-preference engine. Consequences, decided now:
 
 ## 4. The window
 
-One `ApplicationWindow`, default 420×720, resizable, sections stacked in a `ListView`-free
-`ColumnLayout` inside a `Flickable` (few rows, no need for delegates). Section order as §1.2.
-Every row is reachable by Tab/arrow keys; `?` shows the shortcut overlay; `Q` quits unless a
-text field has focus; `Esc` closes an open picker first, then the shortcut overlay, then
-the window.
+Rogue Amoeba SoundSource's window, mapped onto PipeDeck's data (Jan, 2026-10-27, from two
+reference screenshots; this replaces the stacked list of every device of v1.0), drawn in
+Omarchy's dark Material register with the theme accent where SoundSource uses green.
+Screenshots: `ui/docs/pipedeck-ui{,-devices,-fx}.png`.
 
-### 4.1 Outputs
-- One row per `Devices` entry with `kind=sink`, hiding nothing the daemon shows (the daemon
-  already hides its own EQ nodes). Row: nick (description in the tooltip), default radio,
-  slider (cubic, `pos = vol^(1/3)`, 0–100 %, or 0–150 % with the §4.6 toggle), mute button,
-  EQ badge when a preset is active.
-- If `Ports` has ≥2 `available` rows for that node, the row grows a **port selector** (a
-  compact segmented control: "Speaker · Headphones"); selecting calls `SetPort`. ≤1 port →
-  no selector. Separate UCM headphone sinks are ordinary rows — nothing special to do.
-- Under a sink whose node has an `AutoMute` row: a switch "Auto-mute speakers when
-  headphones are plugged in" → `SetAutoMute`.
-- Default radio → `SetDefault("sink", name)`. Slider → `SetVolume` coalesced to ≤20/s while
-  dragging, final value on release; mute → `SetMute`. Volume and mute are independent writes
-  (SPEC §9.1 — the UI never sends a cached mute with a volume).
+- **Geometry**: one `ApplicationWindow`, 560 px wide (SoundSource's proportion), minimum
+  520×300. The window **hugs its content**: its height follows the blocks, from 300 px up to
+  720 px; past that the Applications list scrolls inside its block and nothing else moves.
+  Rows are 36 px. Blocks are rounded panels a shade lighter than the window, radius
+  `min(10, theme radius)`; buttons round to `min(height/2, theme radius)`, so Omarchy's
+  square default (`decoration:rounding 0`) gives square controls. Accent and radius follow
+  the theme live.
+- **Header**: "**Pipe**Deck" centred (bold, regular, like "**Sound**Source"); at the right a
+  daemon-state dot (accent = connected, grey = connecting, red = absent; tooltip = the version,
+  the state, or the last error) and a settings gear. No pin or window buttons — Hyprland owns
+  those.
+- **System block** (§4.1, §4.4) and **Applications block** (§4.3), each with a collapse chevron,
+  a title and dim column captions ("Volume · Boost · Device · FX" and "Volume · Boost ·
+  Redirect Audio To") that sit exactly over their columns: every cell after the title has a
+  fixed width, so all rows line up (§4.2).
+- **Footer**: one thin line with the last daemon error (§5), empty otherwise. SoundSource's
+  footer buttons have no PipeDeck equivalent and are not invented.
+- **Settings page** (gear or `,`; `Esc` or the gear returns): §4.6.
+- **Daemon absent**: the main page shows only "PipeDeck daemon not running", one line of help
+  and **Start** (§5). While reconnecting with an earlier snapshot the blocks stay, greyed.
+- **Keys**: Tab/Shift+Tab reach every control in reading order (header, System, Applications),
+  and the Applications list scrolls to keep the focused control wholly in view. `?` toggles the
+  shortcut overlay; `Q` quits unless a text field has focus; `,` toggles Settings (not in a
+  text field); `F5` asks the daemon to re-read the graph (`Refresh`). **`Esc` closes the
+  topmost thing**: an open menu or picker, then the shortcut overlay, then the effects panel,
+  then Settings, then the window. (The overlay comes before the effects panel because it covers
+  it: closing something hidden under it would look like a dead key.)
+- Right-to-left languages mirror the window. Every string is translated (`src/i18n/`).
+
+### 4.1 System block: Output and Input
+- **Output row**: speaker glyph · "Output" · mute · slider · % · Boost · device menu · FX
+  chevron. The row drives the **default sink** (`Devices` with `kind=sink` and `is_default`):
+  slider and mute write to that node, and when the default changes — here, from Omarchy's
+  panel, or because WirePlumber picked a hotplugged device (§3) — the row follows it. No
+  default sink → one dim line "No output device".
+- **Input row**: the same for the default source, with a microphone glyph, and no FX.
+- **Device menu — places.** The menu lists *places*, not raw nodes: a device with ≥2
+  `available` ports (`Ports`) is one place per port, named by the port's description
+  ("Speaker", "Headphones"); a device with ≤1 port is one place named by its nick (fallback:
+  description, then node name). Separate UCM headphone sinks are therefore ordinary places.
+  Without the `Ports` property or `SetPort` (older daemon) every device is one place.
+- **Choosing a place**: `SetDefault(kind, name)` unless the device is already the default,
+  then `SetPort(node, route)` only when the place is a port that is not active. The current
+  place sends nothing. The menu's check mark and the button's label follow the next snapshot,
+  never the click, so a rejected `SetDefault` leaves the old place shown (§5).
+- **Glyphs**, from node and port names (`Backend::glyphFor`): bluetooth for `bluez*`; for a
+  sink, monitor for HDMI/DisplayPort, headphones for a headphone/headset port (or a portless
+  node named so), USB for a `usb` node, speaker otherwise; for a source, USB or microphone.
+
+### 4.2 Row anatomy and the volume contract
+- Columns, left to right: glyph or app icon (20 px) · title (takes the rest) · mute (28) ·
+  slider (112) · percentage (42) · Boost (30) · device or redirect menu (134; Applications
+  rows add the FX column's 30 to it) · FX (26). A row without a level (Sound Effects) gives
+  its mute/slider/%/Boost cells to the title instead of drawing empty controls.
+- Slider → `SetVolume` coalesced to ≤20/s while dragging, final value on release; mute →
+  `SetMute`. Volume and mute are independent writes (SPEC §9.1 — the UI never sends a cached
+  mute with a volume). A press and release without movement sends nothing.
 - **Volume contract**: the daemon speaks linear volume (`Devices.volume`, `SetVolume` take
   `d`, 1.0 = 100 %). The slider position is `pos = (vol)^(1/3)` and a write is
-  `vol = (percent/100)^3` — 50 % → 0.125, 100 % → 1.0, 150 % → 3.375. An observed volume
-  above the slider's range (overdrive set elsewhere while the §4.6 toggle is off) is shown
-  at the slider's end with the real percentage in the label; the UI never writes a clamp
-  back on its own.
+  `vol = (percent/100)^3` — 50 % → 0.125, 100 % → 1.0, 150 % → 3.375. The slider spans 0–100 %,
+  or 0–150 % with that row's Boost on (§4.6). An observed volume above the slider's range is
+  shown at the slider's end with the real percentage in the label; the UI never writes a
+  clamp back on its own.
+- Controls show only what the daemon reports: radio-like state (current place, switch
+  positions, EQ preset) moves on the next snapshot, never optimistically.
 
-### 4.2 Inputs
-Same row shape for `kind=source`, no EQ badge, no auto-mute switch.
+### 4.3 Applications block (playback streams)
+- One row per `Streams` entry: app icon (desktop entry matching `binary`/`app_name`, generic
+  glyph otherwise) · app name (`app_name`, fallback `binary`, then `#<id>`) with the media name
+  after it in dim text, elided first · mute · slider · % · Boost · **Redirect** menu. No FX
+  column and no favourites. pipewire-pulse and Flatpak clients differ only in metadata
+  quality, never in control. Empty: one dim line "No applications are playing audio."
+- **Semantics, in the block title's tooltip**: rows are *streams*, not apps. One app may own
+  several rows; a restarted stream is a new row. A redirect lasts for that stream's lifetime.
+- **Redirect menu**: "No Redirect" (= follow the default, `SetStreamTarget(id, "")`) + one entry
+  per sink, by the same display name as a place (sinks only: streams target sinks, ports are
+  not destinations) → `SetStreamTarget(id, name)`. The current entry is the **request**
+  (`target_name`); a request for a sink that is gone stays the current entry as
+  "<name> (absent)" instead of snapping elsewhere.
+- **Requested vs observed**: a ⚠ before the menu when the observed sink (`StreamSinks`, §6.1)
+  differs from where the stream should be (its request, or the default when following it), or
+  the request is absent. Tooltip: "Asked for X, playing on Y" (X = "the default output" when
+  following it; "X (absent)" when gone), or "Asked for X, which is not present" with no link.
+- **Older daemon** (no `StreamSinks`, ≤1.3.0): `target_name` is the linked sink, not a request;
+  the menu shows it as current, `pipedeck.eq.<sink>` as `<sink>`, never absent, no ⚠.
+- **Precedence**: an explicit redirect beats notification routing for that stream; the daemon
+  only re-targets `event` streams it has not seen a manual target for (§6.2). Said in the Sound
+  Effects tooltip too.
 
-### 4.3 Playback streams
-- **Semantics, stated in the section header's help text**: rows are *streams*, not apps. One
-  app may own several rows; a restarted stream is a new row. A destination you pick lasts
-  for that stream's lifetime. "Follow default" = `SetStreamTarget(id, "")`.
-- Label: `app_name` — `media_name` (either may be empty; fall back to `binary`, then
-  `#<id>`). Icon from the desktop entry matching `binary`/`app_name` when found; otherwise a
-  generic glyph. pipewire-pulse and Flatpak clients differ only in metadata quality, never in
-  control.
-- Destination picker: "Follow default" + one entry per output (ports are not destinations).
-  Shows **requested** (`target_name` from `Streams`) and, when it differs, **observed**
-  (`StreamSinks`, §6.1): "→ Headphones · playing on Speaker".
-- **Precedence**: an explicit destination set here beats notification routing for that
-  stream; the daemon only re-targets `event` streams it has not seen a manual target for
-  (§6.2). Documented in the Notifications section too.
-- Slider/mute as in §4.1 via node `Props` (the daemon picks the path).
+### 4.4 Sound Effects (notification routing)
+The System block's third row: bell glyph · "Sound Effects" · no level controls (the daemon
+routes notification sounds, it does not own their level, so nothing is faked) · device menu:
+"Follow Output" + each sink → `SetNotificationSink(""|name)`. When the chosen sink is not
+present, a ⚠ before the menu ("…plays on the default output until it returns") and the menu
+keeps it as "<name> (absent)". The title's tooltip says which streams count (`media.role`
+event/Notification, plus `notification_apps`) and the precedence rule of §4.3.
 
-### 4.4 Notifications
-Radio list: "Follow default output" + each output → `SetNotificationSink(name|"")`. One line
-of help: which streams count (`media.role` event/Notification, plus `notification_apps`).
+### 4.5 Effects panel (FX)
+The Output row's FX chevron discloses a panel under the row, SoundSource-style; the row gets
+the accent-tinted background while it is open. It acts on the current default sink:
+- **Equalizer**: "Off" + each `EqPresets` entry → `SetEq(node, id|"")`. With no presets, or for
+  a virtual sink, or a sink the daemon offers no EQ for, the picker is replaced by one line
+  saying why (and, for no presets, where they live and the import command). The daemon rejects
+  EQ on anything but real sinks with `InvalidArgument`, which the footer shows (§5).
+- **Auto-mute**: when the sink's node has an `AutoMute` row, a switch "Auto-mute speakers when
+  headphones are plugged in" → `SetAutoMute`.
+Without `Eq`/`SetEq` and without auto-mute the panel says the daemon has no effects for it.
 
-### 4.5 Equalizer
-Per output row (or a dedicated section listing outputs — implementer's call, one of the two):
-"Off" + each `EqPresets` entry → `SetEq(node, id|"")`. Hidden when `EqPresets` is empty, with
-one line telling the user where presets live and the import command. Applies to real sinks
-only; the daemon rejects the rest with `InvalidArgument`, which the UI shows (§5).
-
-### 4.6 Safety
-- **Port-switch cap**: a spin box 0–150 % / Off bound to `PortSwitchCap` / `SetPortSwitchCap`
-  — `u`, an integer **percentage**, 0 = off (unlike `SetVolume`, which is linear `d`).
-- **Allow up to 150 %**: UI-only toggle (QSettings `ui/allowOverdrive`) that widens sliders
-  from 100 % to 150 % (linear 3.375). It enforces nothing in the daemon.
+### 4.6 Safety and Settings
+- **Boost** (per row, UI-only): the toggle in each row's Boost column widens *that* slider from
+  100 % to 150 % (linear 3.375). It enforces nothing in the daemon and changing it writes
+  nothing. Persisted in QSettings `ui/boost` as a list of keys: `node:<node.name>` for devices,
+  `app:<binary|app_name>` for streams (stream ids do not survive a restart). Replaces v1.0's
+  global "Allow up to 150 %" (`ui/allowOverdrive`, no longer read).
+- **Settings page**: the daemon's state and version (with **Start** when absent); the
+  **port-switch cap**, a spin box 0–150 % / Off bound to `PortSwitchCap` / `SetPortSwitchCap`
+  — `u`, an integer **percentage**, 0 = off (unlike `SetVolume`, which is linear `d`), hidden
+  on a daemon without it; one line on where EQ presets live and the import command.
 
 ### 4.7 Window placement (documented, not installed)
-README snippet for `~/.config/hypr/` (Omarchy 4.5 uses Lua bindings; the README gives both
-the Lua `o.bind` form for the keybind `SUPER + CTRL + SHIFT + A` → `pipedeck-ui` (decided by Jan
-2026-10-26; the stock panel keeps `SUPER+CTRL+A`), and
-the window rules `float`, `size 420 720`, `move 100%-w-12 40`, `pin` as optional lines). The
-app never writes these.
+README snippet for `~/.config/hypr/` (Omarchy 4.5 uses Lua bindings): the keybind
+`SUPER + CTRL + SHIFT + A` → `pipedeck-ui` (decided by Jan 2026-10-26; the stock panel keeps
+`SUPER+CTRL+A`), and the optional window rules `float`, `move` to the top right, `pin`. No
+`size` rule: the window sizes itself to its content (§4). The app never writes these.
 
 ## 5. Client lifecycle contract
 - All D-Bus calls **asynchronous** (`QDBusPendingCallWatcher`); errors surface in a status

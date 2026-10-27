@@ -132,15 +132,36 @@ struct Window {
                 return found;
         return nullptr;
     }
+    // The visible item of that name: popups are walked too (their items
+    // live in the window's overlay), and a closed one's items are invisible.
     QQuickItem *find(const QString &name) const {
-        return walk(window->contentItem(), [&](QQuickItem *i) { return i->objectName() == name; });
+        QQuickItem *root = window->contentItem();
+        while (root->parentItem())
+            root = root->parentItem();
+        return walk(root, [&](QQuickItem *i) { return i->objectName() == name && i->isVisible(); });
     }
-    QQuickItem *flickable() const {
-        return walk(window->contentItem(), [](QQuickItem *i) {
-            return i->inherits("QQuickFlickable") && !i->inherits("QQuickListView") && i->height() > 100;
-        });
+    QQuickItem *flickable() const { return find("applications"); }
+    // The MixerRow a control sits in.
+    static QQuickItem *rowOf(QQuickItem *item) {
+        while (item && !item->property("warningTip").isValid())
+            item = item->parentItem();
+        return item;
     }
+    // Opens a device menu and picks the entry with that label.
+    void pick(const QString &button, const QString &label) const {
+        click(find(button));
+        QTest::qWait(150);
+        QQuickItem *entry = find("entry:" + label);
+        QVERIFY2(entry, qPrintable(button + " has no entry " + label));
+        click(entry);
+        // Until the menu's exit transition is over it still takes clicks.
+        QTRY_VERIFY(!find("entry:" + label));
+    }
+    QString text(const QString &name) const { return find(name)->property("text").toString(); }
     void click(QQuickItem *item, QPointF at = {}) const {
+        // A frame first: the window hugs its content, and a layout that
+        // grew or moved is only polished on the next frame.
+        QTest::qWait(60);
         if (at.isNull())
             at = QPointF(item->width() / 2, item->height() / 2);
         QTest::mouseClick(window, Qt::LeftButton, {}, item->mapToScene(at).toPoint());
@@ -452,7 +473,7 @@ private slots:
         auto backend = connectedBackend(fake);
         // Shown as 150 % even with the slider capped at 100 %; nothing is
         // written back to clamp it.
-        QCOMPARE(backend->maxPercent(), 100);
+        QCOMPARE(backend->maxPercentFor(71), 100);
         QVERIFY(qAbs(field(backend->outputs(), 71, "percent").toDouble() - 150) < 1e-6);
         settle(200);
         QCOMPARE(fake.calls("SetVolume").size(), 0);
@@ -460,16 +481,17 @@ private slots:
         backend->setVolume(58, 50, false);
         QTRY_COMPARE(fake.calls("SetVolume").size(), 1);
         QCOMPARE(fake.calls("SetVolume").last().args.at(1).toDouble(), 0.125);
-        backend->setAllowOverdrive(true);
-        QCOMPARE(backend->maxPercent(), 150);
+        backend->setBoost(58, true);
+        QCOMPARE(backend->maxPercentFor(58), 150);
         settle(60);
         backend->setVolume(58, 150, false);
         QTRY_COMPARE(fake.calls("SetVolume").size(), 2);
         QCOMPARE(fake.calls("SetVolume").last().args.at(1).toDouble(), 3.375);
         QCOMPARE(fake.calls("SetVolume").last().signature, QString("ud"));
-        // The toggle is a UI setting that survives a restart.
-        QCOMPARE(QSettings(settingsFile(), QSettings::IniFormat).value("ui/allowOverdrive").toBool(), true);
-        backend->setAllowOverdrive(false);
+        // Boost is a UI setting that survives a restart.
+        QVERIFY(QSettings(settingsFile(), QSettings::IniFormat)
+                    .value("ui/boost").toStringList().contains("node:alsa_output.pci-0000_07_00.6.HiFi__Speaker__sink"));
+        backend->setBoost(58, false);
     }
 
     void sliderDragIsCoalescedAndNeverWritesMute() {
@@ -639,7 +661,7 @@ private slots:
         fake.populateDemo();
         fake.edit([](FakeState &s) { s.devices[1].volume = 3.375; }); // 150 %, set elsewhere
         auto backend = connectedBackend(fake);
-        QCOMPARE(backend->maxPercent(), 100);
+        QCOMPARE(backend->maxPercentFor(71), 100);
         settle(150);
         backend->setVolume(71, 100, false); // where the slider draws 150 %
         backend->setVolume(71, 100, true);
@@ -935,6 +957,104 @@ private slots:
                  qPrintable(backend.lastError()));
     }
 
+    // ---- places and Boost (SPEC-UI §4.3, §4.6) --------------------------------
+
+    void placesFlattenPortsIntoEntries() {
+        FakeDaemon fake;
+        fake.populateDemo();
+        fake.edit([](FakeState &s) { s.devices[2].nick = ""; }); // Dell: no nick, description stands in
+        auto backend = connectedBackend(fake);
+        const auto places = backend->outputPlaces();
+        QCOMPARE(places.size(), 4);
+        auto at = [&](int i) { return places.at(i).toMap(); };
+        // Two available ports: one entry per port, named by the port.
+        QCOMPARE(at(0).value("label").toString(), QString("Speaker"));
+        QCOMPARE(at(0).value("route").toInt(), 0);
+        QCOMPARE(at(0).value("glyph").toString(), QString("speaker"));
+        QVERIFY(at(0).value("current").toBool());
+        QCOMPARE(at(1).value("label").toString(), QString("Headphones"));
+        QCOMPARE(at(1).value("route").toInt(), 1);
+        QCOMPARE(at(1).value("glyph").toString(), QString("headphones"));
+        QVERIFY(!at(1).value("current").toBool());
+        // One port or none: the device, by nick (or its description).
+        QCOMPARE(at(2).value("label").toString(), QString("FiiO K3"));
+        QCOMPARE(at(2).value("route").toInt(), -1);
+        QCOMPARE(at(2).value("glyph").toString(), QString("usb"));
+        QCOMPARE(at(3).value("label").toString(), QString("Radeon HDMI / DisplayPort 1"));
+        QCOMPARE(at(3).value("route").toInt(), -1);
+        QCOMPARE(at(3).value("glyph").toString(), QString("monitor"));
+
+        // Streams target sinks: no ports in that list.
+        const auto sinks = backend->sinkPlaces();
+        QCOMPARE(sinks.size(), 3);
+        QCOMPARE(sinks.at(0).toMap().value("label").toString(), QString("Laptop speakers"));
+        QCOMPARE(sinks.at(0).toMap().value("route").toInt(), -1);
+        QCOMPARE(backend->inputPlaces().size(), 2);
+        QCOMPARE(backend->inputPlaces().at(0).toMap().value("glyph").toString(), QString("mic"));
+        QCOMPARE(Backend::glyphFor("sink", "bluez_output.AA_BB.1", "", ""), QString("bluetooth"));
+        QCOMPARE(Backend::glyphFor("sink", "alsa_output.pci.HiFi__Headphones__sink", "", ""), QString("headphones"));
+        QCOMPARE(Backend::glyphFor("sink", "alsa_output.pci.HiFi__HDMI1__sink", "[Out] HDMI1", "HDMI / DisplayPort 1"),
+                 QString("monitor"));
+    }
+
+    void choosingAPlaceSendsOnlyWhatIsNeeded() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        auto current = [&](int i) { return backend->outputPlaces().at(i).toMap().value("current").toBool(); };
+        // The current place: nothing at all.
+        backend->choosePlace("sink", 58, 0);
+        // The default sink's other port: SetPort only.
+        backend->choosePlace("sink", 58, 1);
+        QTRY_COMPARE(fake.calls("SetPort").size(), 1);
+        QCOMPARE(fake.calls("SetPort").last().args, (QVariantList{58u, 1u}));
+        QTRY_VERIFY(current(1)); // Headphones
+        QCOMPARE(fake.calls("SetDefault").size(), 0);
+        // Another device as a whole: SetDefault only.
+        backend->choosePlace("sink", 71, -1);
+        QTRY_COMPARE(fake.calls("SetDefault").size(), 1);
+        QCOMPARE(fake.calls("SetDefault").last().args, (QVariantList{"sink", "alsa_output.usb-Fiio_K3-00.analog-stereo"}));
+        QTRY_VERIFY(current(2)); // FiiO K3
+        QCOMPARE(fake.calls("SetPort").size(), 1);
+        // An inactive port of a device that is not the default: SetDefault,
+        // then SetPort, in that order.
+        fake.clearCalls();
+        backend->choosePlace("sink", 58, 0);
+        QTRY_COMPARE(fake.calls("SetPort").size(), 1);
+        QStringList order;
+        for (const auto &c : fake.calls())
+            if (c.member == "SetDefault" || c.member == "SetPort")
+                order << c.member;
+        QCOMPARE(order, (QStringList{"SetDefault", "SetPort"}));
+        QCOMPARE(fake.calls("SetDefault").last().args, (QVariantList{"sink", "alsa_output.pci-0000_07_00.6.HiFi__Speaker__sink"}));
+        QCOMPARE(fake.calls("SetPort").last().args, (QVariantList{58u, 0u}));
+        QTRY_VERIFY(current(0));
+    }
+
+    void boostIsPerRowAndPersists() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        QSignalSpy changed(backend.get(), &Backend::boostChanged);
+        backend->setBoost(58, true);
+        QCOMPARE(changed.size(), 1);
+        QCOMPARE(field(backend->outputs(), 58, "maxPercent").toInt(), 150);
+        QVERIFY(field(backend->outputs(), 58, "boost").toBool());
+        QCOMPARE(field(backend->outputs(), 71, "maxPercent").toInt(), 100);
+        QCOMPARE(field(backend->streams(), 118, "maxPercent").toInt(), 100);
+        QCOMPARE(backend->defaultOutput()->rows().value(0).value("maxPercent").toInt(), 150);
+        // Streams are kept per app: a restarted Spotify keeps its Boost.
+        backend->setBoost(118, true);
+        QVERIFY(field(backend->streams(), 118, "boost").toBool());
+        QVERIFY(!field(backend->streams(), 103, "boost").toBool());
+        backend.reset();
+        auto again = connectedBackend(fake);
+        QCOMPARE(field(again->outputs(), 58, "maxPercent").toInt(), 150);
+        QCOMPARE(field(again->streams(), 118, "maxPercent").toInt(), 150);
+        QCOMPARE(field(again->outputs(), 71, "maxPercent").toInt(), 100);
+        again->setBoost(58, false);
+        again->setBoost(118, false);
+        QCOMPARE(field(again->outputs(), 58, "maxPercent").toInt(), 100);
+    }
+
     // ---- the window -------------------------------------------------------------
 
     // Opus 6: a choice the daemon rejects does not stay selected.
@@ -943,46 +1063,230 @@ private slots:
         auto backend = connectedBackend(fake);
         Window w(m_dir.path(), backend.get());
         QVERIFY(w.window);
-        w.window->resize(420, int(w.flickable()->property("contentHeight").toReal()) + 80);
         QTest::qWait(200);
 
         const QString speaker = "alsa_output.pci-0000_07_00.6.HiFi__Speaker__sink";
-        const QString fiio = "alsa_output.usb-Fiio_K3-00.analog-stereo";
-        auto checked = [&](const QString &name) { return w.find(name)->property("checked").toBool(); };
-        QVERIFY(checked("default:" + speaker));
-        QVERIFY(!checked("default:" + fiio));
-        QVERIFY(checked("notify:"));
-        QVERIFY(!checked("autoMute:" + speaker));
+        QCOMPARE(w.text("device:output"), QString("Speaker"));
+        QCOMPARE(w.text("device:effects"), QString("Follow Output"));
+        w.click(w.find("fx:output"));
+        QTRY_VERIFY(w.find("autoMute:" + speaker));
+        QVERIFY(!w.find("autoMute:" + speaker)->property("checked").toBool());
 
         fake.failCalls("SetDefault", "dev.pipedeck.Error.InvalidArgument");
         fake.failCalls("SetNotificationSink", "dev.pipedeck.Error.InvalidArgument");
         fake.failCalls("SetAutoMute", "dev.pipedeck.Error.PipeWire");
-        w.click(w.find("default:" + fiio));
+        w.pick("device:output", "FiiO K3");
         QTRY_COMPARE(fake.calls("SetDefault").size(), 1);
-        w.click(w.find("notify:" + fiio));
+        w.pick("device:effects", "FiiO K3");
         QTRY_COMPARE(fake.calls("SetNotificationSink").size(), 1);
         w.click(w.find("autoMute:" + speaker));
         QTRY_COMPARE(fake.calls("SetAutoMute").size(), 1);
         QTRY_VERIFY(backend->lastError().startsWith("dev.pipedeck.Error.PipeWire"));
+        QCOMPARE(w.find("lastError")->property("text").toString(), backend->lastError());
         settle(150);
-        QVERIFY(checked("default:" + speaker));
-        QVERIFY(!checked("default:" + fiio));
-        QVERIFY(checked("notify:"));
-        QVERIFY(!checked("notify:" + fiio));
-        QVERIFY(!checked("autoMute:" + speaker));
+        QCOMPARE(w.text("device:output"), QString("Speaker"));
+        QCOMPARE(w.text("device:effects"), QString("Follow Output"));
+        QVERIFY(!w.find("autoMute:" + speaker)->property("checked").toBool());
 
-        // Accepted, the same clicks move the controls once the snapshot says so.
+        // Accepted, the same choices move the controls once the snapshot
+        // says so; the Output row follows the new default.
         fake.failCalls("SetDefault", {});
         fake.failCalls("SetNotificationSink", {});
         fake.failCalls("SetAutoMute", {});
-        w.click(w.find("default:" + fiio));
-        w.click(w.find("notify:" + fiio));
         w.click(w.find("autoMute:" + speaker));
-        QTRY_VERIFY(checked("default:" + fiio));
-        QVERIFY(!checked("default:" + speaker));
-        QTRY_VERIFY(checked("notify:" + fiio));
-        QVERIFY(!checked("notify:"));
-        QTRY_VERIFY(checked("autoMute:" + speaker));
+        QTRY_VERIFY(w.find("autoMute:" + speaker)->property("checked").toBool());
+        w.pick("device:effects", "FiiO K3");
+        QTRY_COMPARE(w.text("device:effects"), QString("FiiO K3"));
+        w.pick("device:output", "FiiO K3");
+        QTRY_COMPARE(w.text("device:output"), QString("FiiO K3"));
+        QTRY_VERIFY(w.find("volume:71"));
+        QVERIFY(!w.find("volume:58"));
+        QCOMPARE(backend->lastError(), QString());
+    }
+
+    void windowOutputRowFollowsAnObservedDefault() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        Window w(m_dir.path(), backend.get());
+        QVERIFY(w.window);
+        QTRY_VERIFY(w.find("volume:58"));
+        // Another controller (Omarchy's panel, a hotplug) moves the default.
+        fake.edit([](FakeState &s) {
+            for (auto &d : s.devices)
+                if (d.kind == "sink")
+                    d.isDefault = d.id == 74;
+        });
+        fake.emitChanged();
+        QTRY_COMPARE(w.text("device:output"), QString("Dell U2723QE"));
+        QVERIFY(w.find("volume:74"));
+        QVERIFY(!w.find("volume:58"));
+        QCOMPARE(w.find("volume:74")->property("value").toDouble(), 100.0);
+        QCOMPARE(fake.calls("SetDefault").size(), 0);
+    }
+
+    void windowBoostWidensOnlyItsSlider() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        Window w(m_dir.path(), backend.get());
+        QVERIFY(w.window);
+        QTRY_VERIFY(w.find("boost:58"));
+        QCOMPARE(w.find("volume:58")->property("to").toDouble(), 100.0);
+        w.click(w.find("boost:58"));
+        QTRY_COMPARE(w.find("volume:58")->property("to").toDouble(), 150.0);
+        for (const uint id : {60u, 103u, 118u, 121u})
+            QCOMPARE(w.find(QStringLiteral("volume:%1").arg(id))->property("to").toDouble(), 100.0);
+        QCOMPARE(fake.calls("SetVolume").size(), 0); // a range change is not a write
+        w.click(w.find("boost:58"));
+        QTRY_COMPARE(w.find("volume:58")->property("to").toDouble(), 100.0);
+    }
+
+    void windowRedirectMenuShowsRequestAndWarning() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        Window w(m_dir.path(), backend.get());
+        QVERIFY(w.window);
+        QTRY_VERIFY(w.find("redirect:121"));
+        QCOMPARE(w.text("redirect:103"), QString("No Redirect"));
+        QCOMPARE(w.text("redirect:118"), QString("FiiO K3"));
+        QCOMPARE(w.text("redirect:121"), QString("Dell U2723QE"));
+        // Sinks only, by display name, the request current.
+        QStringList labels, current;
+        for (const auto &e : w.find("redirect:121")->property("entries").toList()) {
+            labels << e.toMap().value("label").toString();
+            if (e.toMap().value("current").toBool())
+                current << e.toMap().value("label").toString();
+        }
+        QCOMPARE(labels, (QStringList{"No Redirect", "Laptop speakers", "FiiO K3", "Dell U2723QE"}));
+        QCOMPARE(current, QStringList{"Dell U2723QE"});
+        // Asked for HDMI, playing on the speakers: the warning says both.
+        QQuickItem *mpv = Window::rowOf(w.find("redirect:121"));
+        QVERIFY(mpv->property("warning").toBool());
+        QCOMPARE(mpv->property("warningTip").toString(), QString("Asked for Dell U2723QE, playing on Laptop speakers"));
+        QVERIFY(!Window::rowOf(w.find("redirect:103"))->property("warning").toBool());
+        QVERIFY(!Window::rowOf(w.find("redirect:118"))->property("warning").toBool());
+
+        w.pick("redirect:121", "No Redirect");
+        QTRY_COMPARE(fake.calls("SetStreamTarget").size(), 1);
+        QCOMPARE(fake.calls("SetStreamTarget").last().args, (QVariantList{121u, QString()}));
+        w.pick("redirect:103", "FiiO K3");
+        QTRY_COMPARE(fake.calls("SetStreamTarget").size(), 2);
+        QCOMPARE(fake.calls("SetStreamTarget").last().args, (QVariantList{103u, "alsa_output.usb-Fiio_K3-00.analog-stereo"}));
+
+        // The requested sink is unplugged: still the current entry, marked absent.
+        fake.edit([](FakeState &s) {
+            s.devices.removeAt(1);
+            s.streamSinks[1].sink = "alsa_output.pci-0000_07_00.6.HiFi__Speaker__sink";
+        });
+        fake.emitChanged();
+        QQuickItem *spotify = Window::rowOf(w.find("redirect:118"));
+        QTRY_VERIFY(spotify->property("warning").toBool());
+        QCOMPARE(spotify->property("warningTip").toString(),
+                 QString("Asked for alsa_output.usb-Fiio_K3-00.analog-stereo (absent), playing on Laptop speakers"));
+        const auto entries = w.find("redirect:118")->property("entries").toList();
+        QCOMPARE(entries.last().toMap().value("label").toString(), QString("alsa_output.usb-Fiio_K3-00.analog-stereo (absent)"));
+        QVERIFY(entries.last().toMap().value("current").toBool());
+    }
+
+    void windowSoundEffectsMenuRoutesNotifications() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        Window w(m_dir.path(), backend.get());
+        QVERIFY(w.window);
+        QTRY_VERIFY(w.find("device:effects"));
+        QQuickItem *row = Window::rowOf(w.find("device:effects"));
+        QVERIFY(!w.find("volume:0") && !row->property("hasLevel").toBool());
+        w.pick("device:effects", "Dell U2723QE");
+        QTRY_COMPARE(fake.calls("SetNotificationSink").size(), 1);
+        QCOMPARE(fake.calls("SetNotificationSink").last().args, (QVariantList{"alsa_output.pci-0000_07_00.1.hdmi-stereo"}));
+        QTRY_COMPARE(w.text("device:effects"), QString("Dell U2723QE"));
+        QVERIFY(!row->property("warning").toBool());
+        w.pick("device:effects", "Follow Output");
+        QTRY_COMPARE(fake.calls("SetNotificationSink").last().args, (QVariantList{QString()}));
+        // A chosen sink that is gone: the warning, and the choice kept.
+        fake.edit([](FakeState &s) { s.notificationSink = "alsa_output.gone"; });
+        fake.emitChanged();
+        QTRY_VERIFY(row->property("warning").toBool());
+        QCOMPARE(w.text("device:effects"), QString("alsa_output.gone"));
+    }
+
+    void windowFxPanelPicksEqAndEscCloses() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        Window w(m_dir.path(), backend.get());
+        QVERIFY(w.window);
+        w.window->requestActivate();
+        const QString speaker = "alsa_output.pci-0000_07_00.6.HiFi__Speaker__sink";
+        QTRY_VERIFY(w.find("fx:output"));
+        QVERIFY(!w.find("eq:" + speaker));
+        QVERIFY(!Window::rowOf(w.find("fx:output"))->property("selected").toBool());
+        w.click(w.find("fx:output"));
+        QTRY_VERIFY(w.find("eq:" + speaker));
+        QVERIFY(w.window->property("fxOpen").toBool());
+        QVERIFY(Window::rowOf(w.find("fx:output"))->property("selected").toBool());
+        QCOMPARE(w.find("eq:" + speaker)->property("displayText").toString(), QString("Off"));
+
+        // The picker's own list, by mouse: an EQ choice is a SetEq.
+        w.click(w.find("eq:" + speaker));
+        QTest::qWait(250);
+        QQuickItem *bass = nullptr;
+        QQuickItem *root = w.window->contentItem();
+        while (root->parentItem())
+            root = root->parentItem();
+        bass = Window::walk(root, [](QQuickItem *i) {
+            return i->inherits("QQuickAbstractButton") && i->isVisible() && i->property("text").toString() == "Bass lift";
+        });
+        QVERIFY(bass);
+        w.click(bass);
+        QTRY_COMPARE(fake.calls("SetEq").size(), 1);
+        QCOMPARE(fake.calls("SetEq").last().args, (QVariantList{58u, "bass-lift"}));
+        QTRY_COMPARE(w.find("eq:" + speaker)->property("displayText").toString(), QString("Bass lift"));
+
+        // Esc: the help overlay first, then the panel, then the window.
+        QTest::keyClick(w.window, Qt::Key_Question, Qt::ShiftModifier);
+        QTRY_VERIFY(w.window->property("helpVisible").toBool());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.window->property("helpVisible").toBool());
+        QVERIFY(w.window->property("fxOpen").toBool());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.window->property("fxOpen").toBool());
+        QVERIFY(w.window->isVisible());
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(!w.window->isVisible());
+    }
+
+    void windowSettingsPageByKey() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        Window w(m_dir.path(), backend.get());
+        QVERIFY(w.window);
+        w.window->requestActivate();
+        QTRY_VERIFY(w.find("device:output"));
+        QVERIFY(!w.find("portSwitchCap"));
+        QTest::keyClick(w.window, Qt::Key_Comma);
+        QTRY_VERIFY(w.find("portSwitchCap"));
+        QVERIFY(!w.find("device:output"));
+        QCOMPARE(w.find("portSwitchCap")->property("value").toInt(), 60);
+        QCOMPARE(w.find("daemonStatus")->property("text").toString(), QString("Connected to pipedeckd 1.4.0"));
+        // Esc goes back to the blocks; the window stays.
+        QTest::keyClick(w.window, Qt::Key_Escape);
+        QTRY_VERIFY(w.find("device:output"));
+        QVERIFY(w.window->isVisible());
+        // The gear does the same as the key.
+        w.click(w.find("settings"));
+        QTRY_VERIFY(w.find("portSwitchCap"));
+        w.click(w.find("settings"));
+        QTRY_VERIFY(w.find("device:output"));
+    }
+
+    void windowAbsentDaemonShowsOnlyStart() {
+        Backend backend(QDBusConnection::sessionBus(), settingsFile());
+        Window w(m_dir.path(), &backend);
+        QVERIFY(w.window);
+        QTRY_COMPARE(backend.state(), QString("absent"));
+        QTRY_VERIFY(w.find("start"));
+        QVERIFY(!w.find("device:output"));
+        QVERIFY(!w.find("applications"));
+        QVERIFY(w.window->height() >= 300 && w.window->height() <= 720);
     }
 
     // Opus 5 in the window: a click on the handle of a slider drawn at its
@@ -990,13 +1294,16 @@ private slots:
     void windowClickOnASliderHandleSendsNothing() {
         FakeDaemon fake;
         fake.populateDemo();
-        fake.edit([](FakeState &s) { s.devices[1].volume = 3.375; });
+        fake.edit([](FakeState &s) {
+            s.devices[1].volume = 3.375;
+            s.devices[0].isDefault = false;
+            s.devices[1].isDefault = true; // the Output row shows 71, at 150 %
+        });
         auto backend = connectedBackend(fake);
         Window w(m_dir.path(), backend.get());
         QVERIFY(w.window);
-        w.window->resize(420, int(w.flickable()->property("contentHeight").toReal()) + 80);
         QTest::qWait(200);
-        for (const uint id : {71u, 58u}) {
+        for (const uint id : {71u, 118u}) {
             QQuickItem *slider = w.find(QStringLiteral("volume:%1").arg(id));
             QVERIFY(slider);
             auto *handle = slider->property("handle").value<QQuickItem *>();
@@ -1009,22 +1316,30 @@ private slots:
         QVERIFY(qAbs(field(backend->outputs(), 71, "percent").toDouble() - 150) < 1e-6);
     }
 
-    // Codex 6: Tab never leaves the focused control clipped by the viewport.
+    // Codex 6: Tab reaches every control, and never leaves one clipped by
+    // the scrolling Applications list.
     void windowKeepsTheFocusedControlInView() {
         FakeDaemon fake;
+        fake.populateDemo();
+        fake.edit([](FakeState &s) {
+            for (uint i = 0; i < 14; ++i)
+                s.streams << StreamRow{200 + i, "Player", "player", QStringLiteral("Track %1").arg(i), "", 0.5, false};
+        });
         auto backend = connectedBackend(fake);
         Window w(m_dir.path(), backend.get());
         QVERIFY(w.window);
         w.window->show();
         w.window->requestActivate();
         QTest::qWait(200);
+        QCOMPARE(w.window->height(), 720); // grew to the cap; the list scrolls
         QQuickItem *flick = w.flickable();
+        QVERIFY(flick->property("contentHeight").toReal() > flick->height());
         QQuickItem *contentItem = flick->property("contentItem").value<QQuickItem *>();
         QSet<QQuickItem *> visited;
         int checkedItems = 0;
-        for (int i = 0; i < 120; ++i) {
+        for (int i = 0; i < 150; ++i) {
             QTest::keyClick(w.window, Qt::Key_Tab);
-            QTest::qWait(20);
+            QTest::qWait(15);
             QQuickItem *item = w.window->activeFocusItem();
             if (!item || visited.contains(item))
                 continue;
@@ -1032,18 +1347,30 @@ private slots:
             bool inside = false;
             for (QQuickItem *p = item; p; p = p->parentItem())
                 inside = inside || p == contentItem;
-            if (!inside || item->height() > flick->height())
+            if (!inside)
                 continue;
             const QPointF top = item->mapToItem(flick, QPointF(0, 0));
             QVERIFY2(top.y() >= -0.5 && top.y() + item->height() <= flick->height() + 0.5,
                      qPrintable(QString("%1 at %2..%3 in a %4 px viewport")
-                                    .arg(item->metaObject()->className())
+                                    .arg(item->objectName())
                                     .arg(top.y())
                                     .arg(top.y() + item->height())
                                     .arg(flick->height())));
             ++checkedItems;
         }
-        QVERIFY2(checkedItems > 20, qPrintable(QString::number(checkedItems)));
+        // 17 streams x (mute, slider, boost, redirect), all reached.
+        QCOMPARE(checkedItems, 17 * 4);
+        // And the System block's controls, the collapse buttons and the gear.
+        for (const QString name : {"settings", "collapse:system", "mute:58", "volume:58", "boost:58", "device:output",
+                                   "fx:output", "mute:60", "device:input", "device:effects", "collapse:applications"}) {
+            QQuickItem *item = w.find(name);
+            QVERIFY2(item, qPrintable(name));
+            bool reached = false;
+            for (QQuickItem *v : visited)
+                for (QQuickItem *p = v; p && !reached; p = p->parentItem())
+                    reached = p == item;
+            QVERIFY2(reached, qPrintable(name + " never had focus"));
+        }
     }
 
     // ---- small pieces ---------------------------------------------------------

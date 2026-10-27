@@ -21,16 +21,16 @@ ComboBox {
     }
     Material.roundedScale: theme.radius
     font.pixelSize: 13
-    implicitHeight: 40
+    implicitHeight: 36
     topInset: 0
     bottomInset: 0
 
     Connections {
         target: box.popup
-        function onOpened() { box.ApplicationWindow.window.activePicker = box }
-        function onClosed() {
-            if (box.ApplicationWindow.window && box.ApplicationWindow.window.activePicker === box)
-                box.ApplicationWindow.window.activePicker = null
+        function onOpened() { box.ApplicationWindow.window.activePopup = box.popup }
+        function onAboutToHide() {
+            if (box.ApplicationWindow.window && box.ApplicationWindow.window.activePopup === box.popup)
+                box.ApplicationWindow.window.activePopup = null
         }
     }
 }

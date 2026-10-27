@@ -49,6 +49,7 @@ milestones map to the numbered sections of `SPEC.md`.
   "allow up to 150 %" toggle became a per-row Boost.
 
 ### Fixed
+- `pipedeck status | head` no longer panics with a broken-pipe backtrace: the CLI resets SIGPIPE to its default.
 - **"Follow default" now follows the default for streams that picked a sink when they
   connected** (`pw-play --target`, `PULSE_SINK`). `SetStreamTarget(id, "")` used to delete the
   `target.object` metadata, and WirePlumber then fell back to the stream's own request, so it

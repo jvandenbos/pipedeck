@@ -15,6 +15,8 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+# Only to reset SIGPIPE: Rust ignores it, so `pipedeck status | head` panicked on EPIPE.
+libc = "0.2"
 pipedeckd = { path = "../pipedeckd" }
 tokio.workspace = true
 zbus.workspace = true

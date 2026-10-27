@@ -131,6 +131,13 @@ enum EqCmd {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Rust starts with SIGPIPE ignored and println! panics on EPIPE, so
+    // `pipedeck status | head -3` printed a backtrace. Die quietly like any
+    // other CLI tool when the reader goes away.
+    // SAFETY: setting a signal disposition before any thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let connection = zbus::Connection::session()
         .await

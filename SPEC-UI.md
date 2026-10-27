@@ -167,7 +167,8 @@ only; the daemon rejects the rest with `InvalidArgument`, which the UI shows (§
 
 ### 4.7 Window placement (documented, not installed)
 README snippet for `~/.config/hypr/` (Omarchy 4.5 uses Lua bindings; the README gives both
-the Lua `o.bind` form for a keybind such as `SUPER + CTRL + SHIFT + A` → `pipedeck-ui`, and
+the Lua `o.bind` form for the keybind `SUPER + CTRL + SHIFT + A` → `pipedeck-ui` (decided by Jan
+2026-10-26; the stock panel keeps `SUPER+CTRL+A`), and
 the window rules `float`, `size 420 720`, `move 100%-w-12 40`, `pin` as optional lines). The
 app never writes these.
 
@@ -273,7 +274,7 @@ Everything else the UI needs exists in 1.3.0 (`Devices`, `Streams`, `Ports`, `Eq
   `binary`? decide with data from real clients first).
 
 ## 11. Open for Jan
-- Keybind: a new chord (`SUPER+CTRL+SHIFT+A`?) or take over `SUPER+CTRL+A` from the stock panel.
+- ~~Keybind~~ **Decided 2026-10-26: `SUPER+CTRL+SHIFT+A`**; the stock panel keeps `SUPER+CTRL+A` (§4.7).
 - One package `pipedeck` (daemon + CLI + UI) or split `pipedeck-ui` — §7 assumes one.
 - Later, as agreed on 2026-10-26: a review session of the Arch/Linux audio chain itself
   (PipeWire → WirePlumber → UCM/ALSA on the ALC257, Omarchy's tuning host, where EQ and

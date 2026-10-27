@@ -26,7 +26,7 @@ install=pipedeck.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # The v1.4.0 tag does not exist yet; the release step runs `updpkgsums` once
 # the GitHub release is out, and the omarchy-pkgs PR carries the real sum.
-sha256sums=('SKIP')
+sha256sums=('dacf0f69db114550f20d4aca1c8e26fc0315aa232bf1095e3e5644e065ba7f54')
 
 prepare() {
   cd "$pkgname-$pkgver"

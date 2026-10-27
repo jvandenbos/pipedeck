@@ -10,6 +10,7 @@ Slider {
     id: slider
     property int nodeId
     property real percent
+    objectName: "volume:" + nodeId
 
     // Material's 48 px touch height doubles every row on a desktop window.
     implicitHeight: 28
@@ -23,6 +24,18 @@ Slider {
     // eat that and change a level by accident.
     wheelEnabled: false
 
-    onMoved: backend.setVolume(nodeId, value, pressed)
-    onPressedChanged: if (!pressed) backend.setVolume(nodeId, value, false)
+    // A press and release without movement sends nothing: the release only
+    // finishes a gesture that moved. (The backend applies the same rule, so a
+    // clamped level is never written back from either path.)
+    property bool movedSincePress: false
+    onMoved: {
+        movedSincePress = pressed
+        backend.setVolume(nodeId, value, pressed)
+    }
+    onPressedChanged: {
+        if (pressed)
+            movedSincePress = false
+        else if (movedSincePress)
+            backend.setVolume(nodeId, value, false)
+    }
 }

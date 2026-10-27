@@ -56,6 +56,17 @@ milestones map to the numbered sections of `SPEC.md`.
   longer hides a valid bundled preset of the same id, and a file named `Bass Boost.toml` is
   found as `bass-boost`. A preset rescan that cannot read a preset directory (permissions)
   now keeps the previous preset list instead of emptying it.
+- pipedeck-ui: against a daemon without `StreamSinks`, a stream's `target_name` is shown as the sink it plays on (EQ chains collapsed to their sink), never as an absent request or "playing on".
+- pipedeck-ui: controls hidden because one daemon lacked a method come back when a new daemon takes the name.
+- pipedeck-ui: a click on a slider without moving it sends nothing, and a level above the slider's range is never written back as the clamp.
+- pipedeck-ui: default-device and notification radios and the auto-mute switch show only what the daemon reports, so a rejected change no longer stays selected.
+- pipedeck-ui: a failed snapshot is retried (0.5 s doubling to 8 s) instead of leaving the window on "Connecting…"; a successful snapshot clears the status-line error.
+- pipedeck-ui: setting a level again after another controller changed it (50 → media key 80 → 50) is sent instead of being swallowed as a duplicate.
+- pipedeck-ui: calls go to the daemon's unique bus name with auto-start off, so a call cannot reach a restarted daemon that reuses node ids, and a trailing read cannot re-activate a stopped one.
+- pipedeck-ui: Tab no longer leaves a focused control clipped at the bottom of the window.
+- pipedeck-ui: a second launch that gets no answer takes over once the first instance is gone instead of exiting with no window; the first instance answers only once its window exists.
+- pipedeck-ui: a slider drag updates one row instead of rebuilding every list; queued volume timers are stopped before they are deleted.
+- pipedeck-ui tests: the private test bus has no service directories, so nothing (portal, pipedeckd) can be activated during a run; the fake daemon encodes replies independently of the client's decoders.
 
 ## [1.3.0] — 2026-09-07
 

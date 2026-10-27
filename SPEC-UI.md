@@ -85,13 +85,15 @@ fallback, and anything that touches Omarchy's own config or `/usr/share/omarchy-
   coalescing, reconnection, error text. **QML owns layout and keys only.**
 - **D-Bus proxy is hand-written** (`daemon.h/.cpp`, a `QDBusAbstractInterface` subclass):
   the build host has no `qt6-tools`, so no `qdbusxml2cpp`, and the interface is small
-  (9 methods, 10 properties, 1 signal). `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`
+  (10 methods, 11 properties, 1 signal). `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`
   stays the contract: a unit test parses it and asserts every method, property and signal
   is covered with the same signature. Every struct-array property (`a(usssbbdbs)` etc.) gets
   a registered tuple type with `QDBusArgument` stream operators, and the fake-daemon tests
   round-trip each one at wire level — signature coverage alone does not prove decoding.
   Property reads go through `org.freedesktop.DBus.Properties` `GetAll`/`Get`,
-  asynchronously. qmake: `QT += quick quickcontrols2 dbus network svg`.
+  asynchronously. Every call except `StartServiceByName` goes to the owner's **unique**
+  name with auto-start off, so a call issued against one daemon generation can never reach
+  its replacement. qmake: `QT += quick quickcontrols2 dbus network svg`.
 - `QGuiApplication`, `setDesktopFileName("pipedeck-ui")`, Material dark style, accent and
   corner radius from the Omarchy theme with the guide's fallbacks, strings through `qsTr`,
   language from `~/.config/omarchy/language`. Never modify Omarchy's config.
@@ -99,8 +101,10 @@ fallback, and anything that touches Omarchy's own config or `/usr/share/omarchy-
   The one exception is `hyprctl getoption decoration:rounding` via `QProcess`, as the guide
   prescribes for the corner radius.
 - **Single instance**: a `QLocalServer` on `$XDG_RUNTIME_DIR/pipedeck-ui.sock`, guarded by
-  a `QLockFile` (`pipedeck-ui.lock`) for primary election: the lock holder listens; a second
-  launch connects, sends `show`, waits ≤1 s for `ok`, and exits. A stale socket is removed
+  a `QLockFile` (`pipedeck-ui.lock`) for primary election: the lock holder takes the lock at
+  start but listens only once its window is loaded, so `ok` means a window was shown. A
+  second launch sends `show` and waits ≤1 s for `ok`; if nothing answers it tries for the
+  lock again (5 rounds) and runs as the primary once the lock is free, else exits 1. A stale socket is removed
   **only** after the lock was acquired (Qt warns never to unlink a running instance's socket
   just because `listen()` failed). `show` = restore from minimised, `requestActivate()`,
   raise. Launcher and keybind both go through this.
@@ -125,7 +129,8 @@ device-preference engine. Consequences, decided now:
 One `ApplicationWindow`, default 420×720, resizable, sections stacked in a `ListView`-free
 `ColumnLayout` inside a `Flickable` (few rows, no need for delegates). Section order as §1.2.
 Every row is reachable by Tab/arrow keys; `?` shows the shortcut overlay; `Q` quits unless a
-text field has focus; `Esc` closes an open picker first, then the window.
+text field has focus; `Esc` closes an open picker first, then the shortcut overlay, then
+the window.
 
 ### 4.1 Outputs
 - One row per `Devices` entry with `kind=sink`, hiding nothing the daemon shows (the daemon
@@ -197,7 +202,8 @@ app never writes these.
   `org.freedesktop.DBus.Properties.PropertiesChanged` (one per changed property) and its own
   `Changed` after each coalesced graph update (`service.rs`). The client subscribes to both
   **before** the initial `GetAll` snapshot, funnels them into one coalescer with **one refresh
-  in flight and a trailing dirty flag**, and re-reads only the properties it uses (≤10/s).
+  in flight and a trailing dirty flag**, and re-reads with a full `GetAll` (≤10/s). A failed read is retried after 0.5 s, doubling
+  to 8 s, while the owner is unchanged; a successful read clears the error line.
   Every reply is tagged with an **owner generation** (bumped on each `NameOwnerChanged`,
   including direct owner replacement) and dropped when stale.
 - Daemon absent: show "PipeDeck daemon not running" + a **Start** button that calls
@@ -207,7 +213,11 @@ app never writes these.
   queued slider writes across a reconnect** — node ids are new.
 - A pending write for a node that vanished is discarded, with no error shown.
 - Older daemon: a missing property or method (`UnknownProperty`/`UnknownMethod`) hides that
-  control instead of failing the window; `Version` is shown in Status.
+  control (after the first call returns `UnknownMethod`) until the daemon owner changes,
+  instead of failing the window; `Version` is shown in Status. Without `StreamSinks`
+  (≤1.3.0) `target_name` is the sink the stream is linked to, not a request: the picker shows
+  it as the current value, `pipedeck.eq.<sink>` as `<sink>`, never flagged absent, no
+  "playing on".
 - Sliders: while dragging, show the local value; on release send the final value and keep
   showing it until either its echo arrives in a snapshot or 300 ms pass with no local input
   — an *older* observed value arriving in between must not overwrite the final request.

@@ -128,6 +128,13 @@ public:
 
     explicit DaemonProxy(const QDBusConnection &connection, QObject *parent = nullptr);
 
+    // Every call goes to this unique name (":1.42"), the owner the client
+    // tracks, never to the well-known name: a call issued for one daemon
+    // can then never be delivered to its replacement, whose node ids mean
+    // something else. Empty until an owner is known; calls then fail locally.
+    void setDestination(const QString &uniqueName) { m_destination = uniqueName; }
+    QString destination() const { return m_destination; }
+
     QDBusPendingCall getAll() const;
     QDBusPendingCall setDefault(const QString &kind, const QString &name);
     QDBusPendingCall setNotificationSink(const QString &name);
@@ -153,4 +160,8 @@ signals:
 
 private slots:
     void onPropertiesChanged(const QString &interface, const QVariantMap &changed, const QStringList &invalidated);
+
+private:
+    QDBusPendingCall send(const QString &interface, const QString &method, const QVariantList &args) const;
+    QString m_destination;
 };

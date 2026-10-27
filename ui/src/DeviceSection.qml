@@ -23,13 +23,10 @@ ColumnLayout {
         opacity: 0.6
     }
 
-    ButtonGroup { id: defaults }
-
     Repeater {
         model: section.rows
         delegate: DeviceEntry {
             kind: section.kind
-            group: defaults
         }
     }
 }

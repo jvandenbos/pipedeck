@@ -30,3 +30,6 @@ SOURCES += \
     ../src/singleinstance.cpp \
     ../src/theme.cpp \
     ../src/translator.cpp
+
+# The window tests load the real Main.qml.
+RESOURCES += ../src/resources.qrc

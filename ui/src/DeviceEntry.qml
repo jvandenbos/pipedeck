@@ -7,7 +7,6 @@ ColumnLayout {
     id: entry
     required property var model
     property string kind
-    property ButtonGroup group
 
     Layout.fillWidth: true
     spacing: 0
@@ -21,9 +20,13 @@ ColumnLayout {
             Layout.fillWidth: true
             Layout.preferredHeight: 36
             text: entry.model.nick
+            objectName: "default:" + entry.model.name
+            // Not checkable: a click asks the daemon, and only the model
+            // (the next snapshot) moves the dot. A rejected SetDefault then
+            // leaves the radios where the daemon has them.
+            checkable: false
             checked: entry.model.isDefault
             enabled: backend.features.defaults === true
-            ButtonGroup.group: entry.group
             Accessible.name: entry.kind === "sink" ? qsTr("Default output: %1").arg(entry.model.nick)
                                                    : qsTr("Default input: %1").arg(entry.model.nick)
             ToolTip.visible: hovered && entry.model.description.length > 0
@@ -87,9 +90,13 @@ ColumnLayout {
             font.pixelSize: 12
         }
         Switch {
+            objectName: "autoMute:" + entry.model.name
+            // Shows the model only, as the radios do, so a rejected call
+            // leaves the switch where the daemon has it.
+            checkable: false
             checked: entry.model.autoMute
             Accessible.name: qsTr("Auto-mute speakers when headphones are plugged in")
-            onToggled: backend.setAutoMute(entry.model.nodeId, checked)
+            onClicked: backend.setAutoMute(entry.model.nodeId, !entry.model.autoMute)
         }
     }
 }

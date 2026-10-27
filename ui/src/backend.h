@@ -49,6 +49,9 @@ public:
     static constexpr int RefreshIntervalMs = 100; // <= 10 GetAll/s
     static constexpr int HoldMs = 300;            // final slider value outlives older echoes
     static constexpr int CapDebounceMs = 300;
+    // A failed GetAll is retried while the owner stays the same.
+    static constexpr int RetryFirstMs = 500;
+    static constexpr int RetryMaxMs = 8000;
 
     explicit Backend(const QDBusConnection &connection = QDBusConnection::sessionBus(),
                      const QString &settingsFile = {}, std::shared_ptr<AppIcons> icons = {},
@@ -94,6 +97,7 @@ public:
     // For tests: how many GetAll calls went out, and the owner generation.
     int refreshCount() const { return m_refreshCount; }
     quint64 generation() const { return m_generation; }
+    QString owner() const { return m_owner; } // the unique name calls go to
     const Snapshot &snapshot() const { return m_snapshot; }
 
 signals:
@@ -113,13 +117,18 @@ private:
         double linear = 0;
         bool queued = false;
         qint64 lastSentNs = -1;
-        double lastSentLinear = -1;
         QTimer *timer = nullptr;
     };
+    // One slider gesture: from the first input until its echo arrives or
+    // HoldMs pass after the release.
     struct Hold {
         double percent = 0;
         bool dragging = false;
         qint64 lastInputMs = 0;
+        // The last value this gesture sent; forgotten when an observed value
+        // other than it arrives, so it never suppresses a write after
+        // something else changed the level.
+        double sentLinear = -1;
     };
 
     void lookUpOwner();
@@ -130,6 +139,9 @@ private:
     void applySnapshot(const Snapshot &snapshot);
     void rebuildModels();
     void dropUnsentWrites();
+    void discardWrite(QHash<uint, VolumeWrite>::iterator it);
+    std::optional<double> observedLinear(uint id) const;
+    void showPercent(uint id, double percent);
     void queueVolume(uint id, double linear);
     void flushVolume(uint id);
     void flushCap();
@@ -163,6 +175,8 @@ private:
     qint64 m_lastRefreshMs = -1;
     int m_refreshCount = 0;
     QTimer m_refreshTimer;
+    QTimer m_retryTimer;
+    int m_retryDelayMs = RetryFirstMs;
 
     QHash<uint, VolumeWrite> m_volumeWrites;
     QHash<uint, Hold> m_holds;

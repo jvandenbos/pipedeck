@@ -24,14 +24,32 @@ SingleInstance::~SingleInstance() {
     m_server.close();
 }
 
-bool SingleInstance::becomePrimary() {
-    if (!m_lock->tryLock(0))
+bool SingleInstance::acquire() {
+    return m_lock->isLocked() || m_lock->tryLock(0);
+}
+
+bool SingleInstance::listen() {
+    if (!m_lock->isLocked())
         return false;
+    if (m_server.isListening())
+        return true;
     // We hold the lock, so whatever socket is there belongs to a dead
     // instance. Removing it before that would cut off a live one.
     QLocalServer::removeServer(m_socketPath);
     m_server.setSocketOptions(QLocalServer::UserAccessOption);
     return m_server.listen(m_socketPath);
+}
+
+SingleInstance::Claim SingleInstance::claim(int rounds, int timeoutMs) {
+    if (acquire())
+        return Claim::Primary;
+    for (int round = 0; round < rounds; ++round) {
+        if (signalPrimary(timeoutMs))
+            return Claim::Signalled;
+        if (acquire())
+            return Claim::Primary;
+    }
+    return Claim::Failed;
 }
 
 bool SingleInstance::signalPrimary(int timeoutMs) {

@@ -159,43 +159,52 @@ void DaemonProxy::onPropertiesChanged(const QString &interface, const QVariantMa
     emit propertiesChanged(changed.keys() + invalidated);
 }
 
-QDBusPendingCall DaemonProxy::getAll() const {
-    auto message = QDBusMessage::createMethodCall(Service, Path, "org.freedesktop.DBus.Properties", "GetAll");
-    message << QString::fromLatin1(Interface);
+QDBusPendingCall DaemonProxy::send(const QString &interface, const QString &method, const QVariantList &args) const {
+    if (m_destination.isEmpty())
+        return QDBusPendingCall::fromError(QDBusError(QDBusError::Disconnected, "no pipedeckd owner"));
+    auto message = QDBusMessage::createMethodCall(m_destination, Path, interface, method);
+    message.setArguments(args);
+    // Only the Start button may activate the daemon (StartServiceByName);
+    // a trailing read after `systemctl --user stop pipedeckd` must not.
+    message.setAutoStartService(false);
     return connection().asyncCall(message);
 }
 
+QDBusPendingCall DaemonProxy::getAll() const {
+    return send("org.freedesktop.DBus.Properties", "GetAll", {QString::fromLatin1(Interface)});
+}
+
 QDBusPendingCall DaemonProxy::setDefault(const QString &kind, const QString &name) {
-    return asyncCall("SetDefault", kind, name);
+    return send(Interface, "SetDefault", {kind, name});
 }
 QDBusPendingCall DaemonProxy::setNotificationSink(const QString &name) {
-    return asyncCall("SetNotificationSink", name);
+    return send(Interface, "SetNotificationSink", {name});
 }
 QDBusPendingCall DaemonProxy::setVolume(uint id, double linearVolume) {
     // (u, d) and nothing else: a volume write never carries a mute
     // (SPEC §9.1), and the signature makes that structural.
-    return asyncCall("SetVolume", id, linearVolume);
+    return send(Interface, "SetVolume", {id, linearVolume});
 }
 QDBusPendingCall DaemonProxy::setMute(uint id, bool mute) {
-    return asyncCall("SetMute", id, mute);
+    return send(Interface, "SetMute", {id, mute});
 }
 QDBusPendingCall DaemonProxy::setStreamTarget(uint id, const QString &name) {
-    return asyncCall("SetStreamTarget", id, name);
+    return send(Interface, "SetStreamTarget", {id, name});
 }
 QDBusPendingCall DaemonProxy::setPort(uint nodeId, uint routeIndex) {
-    return asyncCall("SetPort", nodeId, routeIndex);
+    return send(Interface, "SetPort", {nodeId, routeIndex});
 }
 QDBusPendingCall DaemonProxy::setAutoMute(uint nodeId, bool enabled) {
-    return asyncCall("SetAutoMute", nodeId, enabled);
+    return send(Interface, "SetAutoMute", {nodeId, enabled});
 }
 QDBusPendingCall DaemonProxy::setEq(uint nodeId, const QString &preset) {
-    return asyncCall("SetEq", nodeId, preset);
+    return send(Interface, "SetEq", {nodeId, preset});
 }
 QDBusPendingCall DaemonProxy::setPortSwitchCap(uint percent) {
-    return asyncCall("SetPortSwitchCap", percent);
+    return send(Interface, "SetPortSwitchCap", {percent});
 }
 QDBusPendingCall DaemonProxy::refresh() {
-    return asyncCall("Refresh");
+    return send(Interface, "Refresh", {});
 }
 
 namespace {

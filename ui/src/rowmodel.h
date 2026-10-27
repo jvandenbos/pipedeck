@@ -23,6 +23,9 @@ public:
     const QList<QVariantMap> &rows() const { return m_rows; }
     Q_INVOKABLE QVariantMap get(int row) const;
     int indexOf(const QVariant &id) const;
+    // One field of one row, with a dataChanged for that role only. False
+    // when no row has that key.
+    bool setValue(const QVariant &id, const QByteArray &role, const QVariant &value);
 
 signals:
     void countChanged();

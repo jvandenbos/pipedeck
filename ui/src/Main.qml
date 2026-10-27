@@ -42,11 +42,20 @@ ApplicationWindow {
     Shortcut { sequence: "F5"; context: Qt.ApplicationShortcut; onActivated: backend.refresh() }
 
     // Keyboard navigation scrolls the focused control into view.
+    // Bounds are compared in flick.contentItem's coordinates, the space
+    // contentY is in: the column sits 16 px into it, so content-local
+    // numbers left a control in the last 16 px clipped.
     onActiveFocusItemChanged: {
         const item = activeFocusItem
-        if (!item || !content.contains(content.mapFromItem(item, 0, 0)))
+        let inside = false
+        for (let p = item; p; p = p.parent)
+            if (p === flick.contentItem) {
+                inside = true
+                break
+            }
+        if (!inside)
             return
-        const top = item.mapToItem(content, 0, 0).y
+        const top = item.mapToItem(flick.contentItem, 0, 0).y
         const bottom = top + item.height
         if (top < flick.contentY + 8)
             flick.contentY = Math.max(0, top - 8)

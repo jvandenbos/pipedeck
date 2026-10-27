@@ -27,7 +27,7 @@
   "Mute": "Stummschalten",
   "No inputs": "Keine Eingänge",
   "No outputs": "Keine Ausgänge",
-  "No presets installed. Presets live in ~/.config/pipedeck/eq/; import an AutoEq file with: pipedeck eq import <file>": "Keine Voreinstellungen installiert. Sie liegen in ~/.config/pipedeck/eq/; eine AutoEq-Datei importieren mit: pipedeck eq import <Datei>",
+  "No presets installed. Presets live in ~/.config/pipedeck/eq/ and /usr/share/pipedeck/presets/; import an AutoEq file with: pipedeck eq import <file>": "Keine Voreinstellungen installiert. Sie liegen in ~/.config/pipedeck/eq/ und /usr/share/pipedeck/presets/; eine AutoEq-Datei importieren mit: pipedeck eq import <Datei>",
   "Nothing is playing": "Nichts wird abgespielt",
   "Notifications": "Benachrichtigungen",
   "Off": "Aus",

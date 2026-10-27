@@ -16,10 +16,30 @@
 #include <QSemaphore>
 #include <QThread>
 #include <QVariantList>
+#include <QHash>
 #include <atomic>
 #include <memory>
+#include <tuple>
 
 #include "daemon.h"
+
+// What the fake puts on the wire: plain tuples, filled field by field in the
+// order of the Rust daemon's to_dbus() (crates/pipedeckd/src/state.rs,
+// route.rs, eq.rs) and marshalled by QtDBus's own std::tuple operators. The
+// proxy's row operators are never used to encode, so a field swapped in one
+// of its operator>> reads back wrong and the decode test fails.
+using WireDevice = std::tuple<uint, QString, QString, QString, bool, bool, double, bool, QString>;
+using WireStream = std::tuple<uint, QString, QString, QString, QString, double, bool>;
+using WirePort = std::tuple<uint, uint, QString, QString, bool, bool>;
+using WireIdString = std::tuple<uint, QString>; // Eq, StreamSinks
+using WirePreset = std::tuple<QString, QString>;
+using WireAutoMute = std::tuple<uint, bool>;
+using WireDevices = QList<WireDevice>;
+using WireStreams = QList<WireStream>;
+using WirePorts = QList<WirePort>;
+using WireIdStrings = QList<WireIdString>;
+using WirePresets = QList<WirePreset>;
+using WireAutoMutes = QList<WireAutoMute>;
 
 struct FakeState {
     QList<DeviceRow> devices;
@@ -54,6 +74,8 @@ struct FakeShared {
     std::atomic<bool> delayVolumeReplies{false};
     QSemaphore gate;
     QDBusConnection connection{QString()};
+    // Method name -> D-Bus error name the next calls get instead.
+    QHash<QString, QString> failures;
 };
 
 // QtDBus sets the call context on the registered object, not on its
@@ -80,6 +102,13 @@ public:
 
     bool claim();   // take dev.pipedeck.Daemon
     void release(); // give it up, as a daemon exiting would
+    // This connection's unique name, the one the client must address.
+    QString uniqueName() const { return m_shared->connection.baseService(); }
+    // Unexports the object (every call, GetAll included, then fails with
+    // UnknownObject) or exports it again, while keeping the name.
+    void setServing(bool serving);
+    // `member` replies with `errorName` from now on; an empty name stops it.
+    void failCalls(const QString &member, const QString &errorName);
 
     template <typename F> void edit(F &&f) {
         QMutexLocker lock(&m_shared->mutex);
@@ -114,29 +143,29 @@ private:
 class FakeAdaptor : public QDBusAbstractAdaptor {
     Q_OBJECT
     Q_CLASSINFO("D-Bus Interface", "dev.pipedeck.Daemon1")
-    Q_PROPERTY(QList<AutoMuteRow> AutoMute READ autoMute)
-    Q_PROPERTY(QList<DeviceRow> Devices READ devices)
-    Q_PROPERTY(QList<EqRow> Eq READ eq)
-    Q_PROPERTY(QList<PresetRow> EqPresets READ eqPresets)
+    Q_PROPERTY(WireAutoMutes AutoMute READ autoMute)
+    Q_PROPERTY(WireDevices Devices READ devices)
+    Q_PROPERTY(WireIdStrings Eq READ eq)
+    Q_PROPERTY(WirePresets EqPresets READ eqPresets)
     Q_PROPERTY(QString NotificationSink READ notificationSink)
     Q_PROPERTY(uint PortSwitchCap READ portSwitchCap)
-    Q_PROPERTY(QList<PortRow> Ports READ ports)
-    Q_PROPERTY(QList<StreamSinkRow> StreamSinks READ streamSinks)
-    Q_PROPERTY(QList<StreamRow> Streams READ streams)
+    Q_PROPERTY(WirePorts Ports READ ports)
+    Q_PROPERTY(WireIdStrings StreamSinks READ streamSinks)
+    Q_PROPERTY(WireStreams Streams READ streams)
     Q_PROPERTY(QString Version READ version)
 
 public:
     explicit FakeAdaptor(FakeObject *parent);
 
-    QList<AutoMuteRow> autoMute() const;
-    QList<DeviceRow> devices() const;
-    QList<EqRow> eq() const;
-    QList<PresetRow> eqPresets() const;
+    WireAutoMutes autoMute() const;
+    WireDevices devices() const;
+    WireIdStrings eq() const;
+    WirePresets eqPresets() const;
     QString notificationSink() const;
     uint portSwitchCap() const;
-    QList<PortRow> ports() const;
-    QList<StreamSinkRow> streamSinks() const;
-    QList<StreamRow> streams() const;
+    WirePorts ports() const;
+    WireIdStrings streamSinks() const;
+    WireStreams streams() const;
     QString version() const;
 
 public slots:
@@ -158,6 +187,8 @@ signals:
 
 private:
     void record(const char *member, const char *signature, const QVariantList &args);
+    // True when the call was answered with an injected error.
+    bool rejected(const char *member);
     void changed();
     FakeObject *object() const { return static_cast<FakeObject *>(parent()); }
     std::shared_ptr<FakeShared> m_shared;
@@ -167,16 +198,16 @@ private:
 class LegacyAdaptor : public QDBusAbstractAdaptor {
     Q_OBJECT
     Q_CLASSINFO("D-Bus Interface", "dev.pipedeck.Daemon1")
-    Q_PROPERTY(QList<DeviceRow> Devices READ devices)
+    Q_PROPERTY(WireDevices Devices READ devices)
     Q_PROPERTY(QString NotificationSink READ notificationSink)
-    Q_PROPERTY(QList<StreamRow> Streams READ streams)
+    Q_PROPERTY(WireStreams Streams READ streams)
     Q_PROPERTY(QString Version READ version)
 
 public:
     explicit LegacyAdaptor(FakeObject *parent);
-    QList<DeviceRow> devices() const;
+    WireDevices devices() const;
     QString notificationSink() const;
-    QList<StreamRow> streams() const;
+    WireStreams streams() const;
     QString version() const;
 
 public slots:

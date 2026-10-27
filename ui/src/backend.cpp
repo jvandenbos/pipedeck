@@ -42,6 +42,8 @@ Backend::Backend(const QDBusConnection &connection, const QString &settingsFile,
     m_capTimer.setSingleShot(true);
     m_capTimer.setInterval(CapDebounceMs);
     connect(&m_capTimer, &QTimer::timeout, this, &Backend::flushCap);
+    m_retryTimer.setSingleShot(true);
+    connect(&m_retryTimer, &QTimer::timeout, this, &Backend::requestRefresh);
 
     // Order matters (SPEC-UI §5): the owner watch and both change signals are
     // subscribed before the first snapshot is asked for.
@@ -89,6 +91,7 @@ void Backend::lookUpOwner() {
     auto message = QDBusMessage::createMethodCall("org.freedesktop.DBus", "/org/freedesktop/DBus",
                                                   "org.freedesktop.DBus", "GetNameOwner");
     message << QString::fromLatin1(DaemonProxy::Service);
+    message.setAutoStartService(false);
     auto *watcher = new QDBusPendingCallWatcher(m_connection.asyncCall(message), this);
     const quint64 generation = m_generation;
     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, generation](QDBusPendingCallWatcher *w) {
@@ -107,11 +110,21 @@ void Backend::setOwner(const QString &owner) {
     // one, so in-flight replies are ignored and unsent writes are dropped.
     ++m_generation;
     m_owner = owner;
+    m_proxy->setDestination(owner);
     dropUnsentWrites();
     m_refreshInFlight = false;
     m_refreshDirty = false;
     m_refreshTimer.stop();
+    m_retryTimer.stop();
+    m_retryDelayMs = RetryFirstMs;
     m_lastRefreshMs = -1;
+    // What one daemon lacked says nothing about the next (an upgrade and
+    // restart is the usual way a method appears).
+    if (!m_missingMethods.isEmpty()) {
+        m_missingMethods.clear();
+        rebuildModels();
+        emit featuresChanged();
+    }
     if (owner.isEmpty()) {
         setState(State::Absent);
         return;
@@ -121,11 +134,19 @@ void Backend::setOwner(const QString &owner) {
     requestRefresh();
 }
 
+void Backend::discardWrite(QHash<uint, VolumeWrite>::iterator it) {
+    // Stopped first: deleteLater() alone leaves a timeout that may already
+    // be queued, and it would flush a write re-created for a reused id.
+    if (it->timer) {
+        it->timer->stop();
+        it->timer->deleteLater();
+    }
+    m_volumeWrites.erase(it);
+}
+
 void Backend::dropUnsentWrites() {
-    for (auto &write : m_volumeWrites)
-        if (write.timer)
-            write.timer->deleteLater();
-    m_volumeWrites.clear();
+    while (!m_volumeWrites.isEmpty())
+        discardWrite(m_volumeWrites.begin());
     m_holds.clear();
     m_holdSweep.stop();
     m_capPending.reset();
@@ -165,10 +186,21 @@ void Backend::startRefresh() {
             return; // a reply from a daemon that has since gone or been replaced
         m_refreshInFlight = false;
         QDBusPendingReply<QVariantMap> reply = *w;
-        if (reply.isError())
+        if (reply.isError()) {
             setLastError(QStringLiteral("%1: %2").arg(reply.error().name(), reply.error().message()));
-        else
+            // Without a retry a failed first read leaves the window on
+            // "connecting" for as long as the graph stays idle. Doubling
+            // from 0.5 s to 8 s, for this owner only (setOwner resets it).
+            m_retryTimer.start(m_retryDelayMs);
+            m_retryDelayMs = std::min(m_retryDelayMs * 2, int(RetryMaxMs));
+        } else {
+            m_retryTimer.stop();
+            m_retryDelayMs = RetryFirstMs;
+            // A successful call clears the status line (SPEC-UI §5); a
+            // NotFound judged by this snapshot may set it again below.
+            setLastError({});
             applySnapshot(DaemonProxy::decode(reply.value()));
+        }
         if (m_refreshDirty) {
             m_refreshDirty = false;
             requestRefresh();
@@ -181,33 +213,25 @@ void Backend::applySnapshot(const Snapshot &snapshot) {
     m_hasData = true;
 
     // A queued write for a node that vanished goes nowhere, silently.
-    for (auto it = m_volumeWrites.begin(); it != m_volumeWrites.end();) {
-        if (!nodeKnown(it.key())) {
-            if (it->timer)
-                it->timer->deleteLater();
-            it = m_volumeWrites.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    QList<uint> vanished;
+    for (auto it = m_volumeWrites.cbegin(); it != m_volumeWrites.cend(); ++it)
+        if (!nodeKnown(it.key()))
+            vanished << it.key();
+    for (const uint id : vanished)
+        discardWrite(m_volumeWrites.find(id));
 
     // §5 slider rule: a released slider keeps its final value until that
     // value comes back. An older observed value in between is ignored.
-    auto observedPercent = [this](uint id) -> std::optional<double> {
-        for (const auto &d : m_snapshot.devices)
-            if (d.id == id)
-                return linearToPercent(d.volume);
-        for (const auto &s : m_snapshot.streams)
-            if (s.id == id)
-                return linearToPercent(s.volume);
-        return std::nullopt;
-    };
     for (auto it = m_holds.begin(); it != m_holds.end();) {
-        const auto observed = observedPercent(it.key());
-        if (!observed || (!it->dragging && std::abs(*observed - it->percent) < EchoTolerancePercent))
+        const auto linear = observedLinear(it.key());
+        const auto observed = linear ? std::optional(linearToPercent(*linear)) : std::nullopt;
+        if (!observed || (!it->dragging && std::abs(*observed - it->percent) < EchoTolerancePercent)) {
             it = m_holds.erase(it);
-        else
-            ++it;
+            continue;
+        }
+        if (it->sentLinear >= 0 && std::abs(*observed - linearToPercent(it->sentLinear)) >= EchoTolerancePercent)
+            it->sentLinear = -1;
+        ++it;
     }
 
     // Only a NotFound for a node that is still there is worth showing.
@@ -221,6 +245,16 @@ void Backend::applySnapshot(const Snapshot &snapshot) {
     emit stateChanged(); // hasData may have flipped without a state change
     emit snapshotChanged();
     emit featuresChanged();
+}
+
+std::optional<double> Backend::observedLinear(uint id) const {
+    for (const auto &d : m_snapshot.devices)
+        if (d.id == id)
+            return d.volume;
+    for (const auto &s : m_snapshot.streams)
+        if (s.id == id)
+            return s.volume;
+    return std::nullopt;
 }
 
 bool Backend::nodeKnown(uint id) const {
@@ -303,6 +337,13 @@ void Backend::rebuildModels() {
     for (const auto &s : m_snapshot.streamSinks)
         observed.insert(s.streamId, s.sink);
     const bool haveObserved = f.value("streamSinks").toBool();
+    // Before StreamSinks (1.3.0) the daemon reported the live link in
+    // target_name, not the request: with EQ on, that is the chain's own
+    // node. Shown as where the stream plays, the EQ node as its sink.
+    auto liveSink = [](const QString &name) {
+        static const QString eqPrefix = QStringLiteral("pipedeck.eq.");
+        return name.startsWith(eqPrefix) && name.size() > eqPrefix.size() ? name.mid(eqPrefix.size()) : name;
+    };
     for (const auto &s : m_snapshot.streams) {
         QString head = !s.appName.isEmpty() ? s.appName : s.binary;
         QStringList parts;
@@ -313,8 +354,11 @@ void Backend::rebuildModels() {
         const QString label = parts.isEmpty() ? QStringLiteral("#%1").arg(s.id) : parts.join(QStringLiteral(" — "));
         const QString icon = m_icons->iconFor(s.binary, s.appName);
 
-        const QString targetNick = s.targetName.isEmpty() ? QString() : sinkNick(s.targetName);
-        const bool absent = !s.targetName.isEmpty() && targetNick.isEmpty();
+        const QString target = haveObserved ? s.targetName : liveSink(s.targetName);
+        const QString targetNick = target.isEmpty() ? QString() : sinkNick(target);
+        // "Absent" is a request whose sink is gone; an observed link names a
+        // sink that exists by definition, so it is never flagged.
+        const bool absent = haveObserved && !target.isEmpty() && targetNick.isEmpty();
         const QString seen = observed.value(s.id);
         // "playing on" only says something when it differs from where the
         // stream should be: its request, or the default when following it.
@@ -326,8 +370,8 @@ void Backend::rebuildModels() {
             {"icon", icon.isEmpty() ? QString() : QString::fromLatin1(QUrl::toPercentEncoding(icon))},
             {"percent", shown(s.id, s.volume)},
             {"mute", s.mute},
-            {"target", s.targetName},
-            {"targetLabel", absent ? s.targetName : targetNick},
+            {"target", target},
+            {"targetLabel", targetNick.isEmpty() ? target : targetNick},
             {"targetAbsent", absent},
             {"observed", haveObserved ? seen : QString()},
             {"observedLabel", haveObserved ? (seenNick.isEmpty() ? seen : seenNick) : QString()},
@@ -438,23 +482,50 @@ void Backend::setDefault(const QString &kind, const QString &name) {
 }
 
 void Backend::setVolume(uint id, double percent, bool dragging) {
-    if (!connected() || !nodeKnown(id))
+    const auto observed = observedLinear(id);
+    if (!connected() || !observed)
         return;
     percent = std::clamp(percent, 0.0, double(maxPercent()));
-    Hold &hold = m_holds[id];
-    hold.percent = percent;
-    hold.dragging = dragging;
-    hold.lastInputMs = now();
+    const double linear = percentToLinear(percent);
+    const auto write = m_volumeWrites.constFind(id);
+    const bool queued = write != m_volumeWrites.constEnd() && write->queued;
+    auto hold = m_holds.find(id);
+
+    // Nothing of ours in flight: only a value that differs from where the
+    // slider already stands is a change. That drops a press and release
+    // without movement, and the clamp of a level above the slider's range
+    // (shown at the end; never written back, SPEC-UI §4.1).
+    if (hold == m_holds.end() && !queued) {
+        const double standing = std::min(linearToPercent(*observed), double(maxPercent()));
+        if (std::abs(standing - percent) < EchoTolerancePercent)
+            return;
+    }
+
+    if (hold == m_holds.end())
+        hold = m_holds.insert(id, Hold{});
+    hold->percent = percent;
+    hold->dragging = dragging;
+    hold->lastInputMs = now();
     if (!m_holdSweep.isActive())
         m_holdSweep.start();
-    rebuildModels();
-    queueVolume(id, percentToLinear(percent));
+    showPercent(id, percent);
+    // Within one gesture, a value already sent and not since contradicted by
+    // an observed one (a release on the value the drag last sent) is not
+    // sent twice.
+    if (!queued && hold->sentLinear == linear)
+        return;
+    queueVolume(id, linear);
+}
+
+void Backend::showPercent(uint id, double percent) {
+    // One role of one row: a 60 Hz drag must not rebuild three models.
+    for (RowModel *model : {m_outputs, m_inputs, m_streams})
+        if (model->setValue(QVariant::fromValue(id), "percent", percent))
+            return;
 }
 
 void Backend::queueVolume(uint id, double linear) {
     VolumeWrite &write = m_volumeWrites[id];
-    if (!write.queued && write.lastSentLinear == linear)
-        return; // a release on the value the drag already sent
     write.linear = linear;
     write.queued = true;
     // Nanoseconds and a precise timer: millisecond truncation and a coarse
@@ -491,7 +562,8 @@ void Backend::flushVolume(uint id) {
         return;
     it->queued = false;
     it->lastSentNs = nowNs();
-    it->lastSentLinear = it->linear;
+    if (const auto hold = m_holds.find(id); hold != m_holds.end())
+        hold->sentLinear = it->linear;
     track(m_proxy->setVolume(id, it->linear), "SetVolume", id);
     emit volumeSent(id, it->linear);
 }

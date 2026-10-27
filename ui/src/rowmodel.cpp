@@ -32,6 +32,19 @@ int RowModel::indexOf(const QVariant &id) const {
     return -1;
 }
 
+bool RowModel::setValue(const QVariant &id, const QByteArray &role, const QVariant &value) {
+    const int row = indexOf(id);
+    const int column = int(m_roles.indexOf(role));
+    if (row < 0 || column < 0)
+        return false;
+    const QString key = QString::fromLatin1(role);
+    if (m_rows.at(row).value(key) != value) {
+        m_rows[row].insert(key, value);
+        emit dataChanged(index(row), index(row), {Qt::UserRole + column});
+    }
+    return true;
+}
+
 void RowModel::setRows(const QList<QVariantMap> &rows) {
     const int before = int(m_rows.size());
 

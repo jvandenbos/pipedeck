@@ -13,14 +13,15 @@ ColumnLayout {
         help: qsTr("Where notification sounds play: streams with the event or Notification role, and the apps listed in notification_apps. A destination picked for a stream above wins over this.")
     }
 
-    ButtonGroup { id: notifyGroup }
-
+    // The radios are not checkable: the dot follows NotificationSink only,
+    // so one the daemon rejected never stays selected (see DeviceEntry).
     RadioButton {
         Layout.fillWidth: true
         Layout.preferredHeight: 36
+        objectName: "notify:"
+        checkable: false
         text: qsTr("Follow default output")
         checked: backend.notificationSink === ""
-        ButtonGroup.group: notifyGroup
         onClicked: if (backend.notificationSink !== "") backend.setNotificationSink("")
     }
     Repeater {
@@ -29,9 +30,10 @@ ColumnLayout {
             required property var modelData
             Layout.fillWidth: true
             Layout.preferredHeight: 36
+            objectName: "notify:" + modelData.value
+            checkable: false
             text: modelData.text
             checked: backend.notificationSink === modelData.value
-            ButtonGroup.group: notifyGroup
             onClicked: if (backend.notificationSink !== modelData.value) backend.setNotificationSink(modelData.value)
         }
     }

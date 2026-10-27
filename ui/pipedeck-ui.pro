@@ -12,7 +12,19 @@ for(line, CARGO_TOML) {
     }
 }
 isEmpty(PIPEDECK_VERSION): PIPEDECK_VERSION = 0.0.0
-DEFINES += PIPEDECK_UI_VERSION=\\\"$$PIPEDECK_VERSION\\\"
+
+# The version goes in a generated header rather than DEFINES: make does not
+# rebuild an object when only a define changes, so a bump in Cargo.toml left
+# main.o with the old version. The header is rewritten only when the version
+# differs, so an unchanged version rebuilds nothing.
+VERSION_HEADER = $$OUT_PWD/pipedeck_version.h
+VERSION_OLD = $$cat($$VERSION_HEADER, lines)
+VERSION_OLD = $$section(VERSION_OLD, '"', 1, 1)
+!equals(VERSION_OLD, $$PIPEDECK_VERSION) {
+    VERSION_LINE = "$${LITERAL_HASH}define PIPEDECK_UI_VERSION \"$$PIPEDECK_VERSION\""
+    write_file($$VERSION_HEADER, VERSION_LINE)|error("cannot write $$VERSION_HEADER")
+}
+INCLUDEPATH += $$OUT_PWD
 
 HEADERS += \
     src/appicons.h \

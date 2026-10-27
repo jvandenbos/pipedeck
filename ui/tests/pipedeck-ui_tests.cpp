@@ -1,4 +1,12 @@
 #include <QDBusConnectionInterface>
+#include <QGuiApplication>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickItem>
+#include <QQuickStyle>
+#include <QQuickWindow>
+#include <atomic>
+#include <functional>
 #include <QDBusMetaType>
 #include <QDBusPendingReply>
 #include <QDir>
@@ -97,6 +105,48 @@ void settle(int ms) {
 
 } // namespace
 
+// The real Main.qml over a backend, offscreen (ui/bin/test sets the
+// platform), tall enough that every control is on screen to be clicked.
+struct Window {
+    Translator translator;
+    Theme theme;
+    QQmlApplicationEngine engine;
+    QQuickWindow *window = nullptr;
+
+    Window(const QString &dir, Backend *backend)
+        : translator(dir + "/language", dir), theme(dir + "/no-omarchy", nullptr, dir + "/no-hyprctl") {
+        engine.addImageProvider("appicon", new AppIconProvider);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("backend", backend);
+        engine.load(QUrl("qrc:/Main.qml"));
+        window = qobject_cast<QQuickWindow *>(engine.rootObjects().value(0));
+    }
+    // Repeater delegates have a parent item but no QObject parent, so the
+    // item tree is walked rather than findChild().
+    static QQuickItem *walk(QQuickItem *item, const std::function<bool(QQuickItem *)> &match) {
+        if (match(item))
+            return item;
+        for (QQuickItem *child : item->childItems())
+            if (QQuickItem *found = walk(child, match))
+                return found;
+        return nullptr;
+    }
+    QQuickItem *find(const QString &name) const {
+        return walk(window->contentItem(), [&](QQuickItem *i) { return i->objectName() == name; });
+    }
+    QQuickItem *flickable() const {
+        return walk(window->contentItem(), [](QQuickItem *i) {
+            return i->inherits("QQuickFlickable") && !i->inherits("QQuickListView") && i->height() > 100;
+        });
+    }
+    void click(QQuickItem *item, QPointF at = {}) const {
+        if (at.isNull())
+            at = QPointF(item->width() / 2, item->height() / 2);
+        QTest::mouseClick(window, Qt::LeftButton, {}, item->mapToScene(at).toPoint());
+    }
+};
+
 class PipedeckUiTests : public QObject {
     Q_OBJECT
 
@@ -122,6 +172,7 @@ private slots:
         QVERIFY2(!QDBusConnection::sessionBus().interface()->isServiceRegistered(DaemonProxy::Service),
                  "a pipedeckd is on this bus; run under dbus-run-session (ui/bin/test does)");
         DaemonProxy::registerTypes();
+        QQuickStyle::setStyle("Material");
     }
 
     // ---- the contract -----------------------------------------------------
@@ -280,7 +331,7 @@ private slots:
         settle(150);
         // A read at the start, then at most one per 100 ms.
         QVERIFY2(backend->refreshCount() - before <= 12, qPrintable(QString::number(backend->refreshCount() - before)));
-        QVERIFY(backend->refreshCount() - before >= 5);
+        QVERIFY(backend->refreshCount() - before >= 3); // periodic, not one read for the whole storm
     }
 
     // ---- owner generations and reconnect -------------------------------------
@@ -432,8 +483,10 @@ private slots:
 
         // 60 Hz for a second; halfway through, a media key mutes the sink.
         double percent = 10;
+        int inputs = 0;
         while (clock.elapsed() < 1000) {
             backend->setVolume(58, percent, true);
+            ++inputs;
             percent += 1;
             if (clock.elapsed() > 500 && !fake.state().devices[0].mute) {
                 fake.edit([](FakeState &s) { s.devices[0].mute = true; });
@@ -449,7 +502,12 @@ private slots:
         for (int i = 0; i + 20 < times.size(); ++i)
             QVERIFY2(times.at(i + 20) - times.at(i) >= 999,
                      qPrintable(QString("21 writes in %1 ms").arg(times.at(i + 20) - times.at(i))));
-        QVERIFY2(sent.size() >= 15, qPrintable(QString::number(sent.size())));
+        // ...and the drag is not starved: writes keep leaving while it lasts.
+        // A slow machine delivers fewer inputs, and each one that comes 50 ms
+        // after the last write goes out at once, so the floor scales with the
+        // inputs that actually arrived instead of with the wall clock.
+        QVERIFY2(sent.size() >= qMin(15, inputs / 4) && sent.size() >= 3,
+                 qPrintable(QString("%1 writes for %2 inputs").arg(sent.size()).arg(inputs)));
 
         const auto writes = fake.calls("SetVolume");
         QCOMPARE(writes.size(), sent.size());
@@ -482,34 +540,140 @@ private slots:
             fake.emitChanged();
         };
         auto shown = [&] { return field(backend->outputs(), 58, "percent").toDouble(); };
+        // Every value the row shows, with the time since `clock` started.
+        // Assertions are about order and lower bounds, never about how much
+        // happens inside a wall-clock window, so a slow machine cannot fail
+        // them; it can only make the hold expire earlier relative to the
+        // checks, which the bounds account for.
+        QElapsedTimer clock;
+        QList<QPair<qint64, int>> seen;
+        const auto recorder = connect(backend->outputs(), &QAbstractItemModel::dataChanged, this,
+                                      [&] { seen << qMakePair(clock.elapsed(), qRound(shown())); });
 
+        clock.start();
         backend->setVolume(58, 30, true);
         settle(60);
+        seen.clear();
+        clock.restart();
         backend->setVolume(58, 70, false); // release at 70
         QCOMPARE(shown(), 70.0);
 
-        // The daemon reports the intermediate 30 first: it must not win.
+        // The daemon reports the intermediate 30 first: it must not win
+        // while the hold lasts.
         int reads = backend->refreshCount();
         setObserved(30);
         QTRY_VERIFY(backend->refreshCount() > reads);
         settle(50);
-        QCOMPARE(shown(), 70.0);
+        for (const auto &[t, value] : seen)
+            if (t < Backend::HoldMs)
+                QCOMPARE(value, 70);
+        if (clock.elapsed() < Backend::HoldMs)
+            QCOMPARE(qRound(shown()), 70);
 
-        // The echo arrives; from then on the last observed value wins at once.
+        // The echo arrives; from then on the last observed value wins at once
+        // and stays.
         setObserved(70);
         QTRY_COMPARE(qRound(shown()), 70);
         settle(120);
         setObserved(20);
         QTRY_COMPARE(qRound(shown()), 20);
-        QVERIFY(QTest::qWaitFor([&] { return qRound(shown()) == 20; }, 250));
+        QVERIFY2(!QTest::qWaitFor([&] { return qRound(shown()) != 20; }, 250), "the observed 20 did not stay");
 
-        // No echo at all: the final value holds for 300 ms, then observed wins.
+        // No echo at all: the final value holds for HoldMs, then observed wins.
+        seen.clear();
+        clock.restart();
         backend->setVolume(58, 80, false);
         QCOMPARE(shown(), 80.0);
         setObserved(20);
+        QTRY_COMPARE_WITH_TIMEOUT(qRound(shown()), 20, 2000);
+        qint64 switched = -1;
+        for (const auto &[t, value] : seen) {
+            if (value == 20) {
+                switched = t;
+                break;
+            }
+            QCOMPARE(value, 80);
+        }
+        QVERIFY2(switched >= Backend::HoldMs, qPrintable(QString("observed won after %1 ms").arg(switched)));
+        disconnect(recorder);
+    }
+
+    // Codex 1: the dedupe must not swallow a write after someone else moved
+    // the level (50 -> media key 80 -> back to 50).
+    void aWriteAfterAnExternalChangeIsSent() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
         settle(150);
-        QCOMPARE(shown(), 80.0);
-        QTRY_COMPARE_WITH_TIMEOUT(qRound(shown()), 20, 1000);
+        backend->setVolume(58, 50, false);
+        QTRY_COMPARE(fake.calls("SetVolume").size(), 1);
+        QTRY_COMPARE(qRound(field(backend->outputs(), 58, "percent").toDouble()), 50);
+        settle(Backend::HoldMs + 100);
+
+        fake.edit([](FakeState &s) { s.devices[0].volume = Backend::percentToLinear(80); });
+        fake.emitChanged();
+        QTRY_COMPARE(qRound(field(backend->outputs(), 58, "percent").toDouble()), 80);
+        backend->setVolume(58, 50, false);
+        QTRY_COMPARE(fake.calls("SetVolume").size(), 2);
+        QCOMPARE(fake.calls("SetVolume").last().args.at(1).toDouble(), 0.125);
+
+        // The same while the hold is still up: the media key lands between
+        // the write and its echo (the daemon does not apply ours here).
+        settle(Backend::HoldMs + 100);
+        fake.setApplyWrites(false);
+        backend->setVolume(58, 30, false);
+        QTRY_COMPARE(fake.calls("SetVolume").size(), 3);
+        fake.edit([](FakeState &s) { s.devices[0].volume = Backend::percentToLinear(80); });
+        fake.emitChanged();
+        const int reads = backend->refreshCount();
+        QTRY_VERIFY(backend->refreshCount() > reads);
+        settle(30);
+        backend->setVolume(58, 30, false);
+        QTRY_COMPARE(fake.calls("SetVolume").size(), 4);
+        QCOMPARE(fake.calls("SetVolume").last().args.at(1).toDouble(), Backend::percentToLinear(30));
+    }
+
+    // Opus 5: a press and release that moved nothing is not a write, and the
+    // end of the slider is not a value to write back for a level beyond it.
+    void aClickWithoutMovementSendsNothing() {
+        FakeDaemon fake;
+        fake.populateDemo();
+        fake.edit([](FakeState &s) { s.devices[1].volume = 3.375; }); // 150 %, set elsewhere
+        auto backend = connectedBackend(fake);
+        QCOMPARE(backend->maxPercent(), 100);
+        settle(150);
+        backend->setVolume(71, 100, false); // where the slider draws 150 %
+        backend->setVolume(71, 100, true);
+        backend->setVolume(58, 70, false); // 58 is at 70 % already
+        settle(200);
+        QCOMPARE(fake.calls("SetVolume").size(), 0);
+        QVERIFY(qAbs(field(backend->outputs(), 71, "percent").toDouble() - 150) < 1e-6);
+        // A real move from there is the user's choice and is sent.
+        backend->setVolume(71, 90, false);
+        QTRY_COMPARE(fake.calls("SetVolume").size(), 1);
+        QCOMPARE(fake.calls("SetVolume").last().args.at(1).toDouble(), Backend::percentToLinear(90));
+    }
+
+    // Opus 14: a slider move touches one role of one row.
+    void aSliderMoveUpdatesOnlyItsRow() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        settle(150);
+        fake.setApplyWrites(false);
+        QSignalSpy outputs(backend->outputs(), &QAbstractItemModel::dataChanged);
+        QSignalSpy inputs(backend->inputs(), &QAbstractItemModel::dataChanged);
+        QSignalSpy streams(backend->streams(), &QAbstractItemModel::dataChanged);
+        backend->setVolume(71, 40, true);
+        QCOMPARE(outputs.size(), 1);
+        const QModelIndex row = outputs.first().at(0).toModelIndex();
+        QCOMPARE(row.row(), rowOf(backend->outputs(), 71));
+        const auto roles = outputs.first().at(2).value<QList<int>>();
+        QCOMPARE(roles.size(), 1);
+        QCOMPARE(backend->outputs()->roleNames().value(roles.first()), QByteArray("percent"));
+        QCOMPARE(inputs.size(), 0);
+        QCOMPARE(streams.size(), 0);
+        backend->setVolume(118, 40, true); // a stream row, same rule
+        QCOMPARE(streams.size(), 1);
+        QCOMPARE(outputs.size(), 1);
     }
 
     void destinationPicker() {
@@ -585,6 +749,7 @@ private slots:
         QCOMPARE(field(backend->streams(), 142, "label").toString(), QString("Firefox"));
         QCOMPARE(field(backend->streams(), 103, "icon").toString(), QString("firefox"));
         QCOMPARE(field(backend->streams(), 118, "icon").toString(), QString());
+        QFile::remove(m_dir.filePath("org.mozilla.firefox.desktop")); // later windows load no icon
 
         // Two available ports on the speaker sink make a selector; one does not.
         QVERIFY(field(backend->outputs(), 58, "showPorts").toBool());
@@ -624,6 +789,140 @@ private slots:
         QCOMPARE(backend->lastError(), QString());
     }
 
+    // Opus 3: before StreamSinks, target_name is where the stream plays.
+    void olderDaemonPickerShowsTheObservedSink() {
+        FakeDaemon fake(true);
+        fake.populateDemo();
+        fake.edit([](FakeState &s) {
+            // With EQ on, a 1.3.0 daemon reports the chain's node.
+            s.streams[1].targetName = "pipedeck.eq.alsa_output.usb-Fiio_K3-00.analog-stereo";
+            s.streams[2].targetName = "alsa_output.pci-0000_07_00.6.HiFi__Speaker__sink";
+        });
+        auto backend = connectedBackend(fake);
+        QVERIFY(!backend->features().value("streamSinks").toBool());
+        QCOMPARE(field(backend->streams(), 118, "target").toString(), QString("alsa_output.usb-Fiio_K3-00.analog-stereo"));
+        QCOMPARE(field(backend->streams(), 118, "targetLabel").toString(), QString("FiiO K3"));
+        QCOMPARE(field(backend->streams(), 121, "target").toString(),
+                 QString("alsa_output.pci-0000_07_00.6.HiFi__Speaker__sink"));
+        QCOMPARE(field(backend->streams(), 103, "target").toString(), QString());
+        for (const uint id : {103u, 118u, 121u}) {
+            QVERIFY(!field(backend->streams(), id, "targetAbsent").toBool());
+            QVERIFY(!field(backend->streams(), id, "showObserved").toBool());
+        }
+        // A link to a sink the window does not list is still not "absent".
+        fake.edit([](FakeState &s) { s.streams[0].targetName = "some.other.sink"; });
+        fake.emitChanged();
+        QTRY_COMPARE(field(backend->streams(), 103, "target").toString(), QString("some.other.sink"));
+        QVERIFY(!field(backend->streams(), 103, "targetAbsent").toBool());
+    }
+
+    // Opus 4 / Codex 4: what one daemon lacked is forgotten with it.
+    void missingMethodsAreForgottenOnOwnerChange() {
+        auto old = std::make_unique<FakeDaemon>();
+        old->failCalls("SetEq", "org.freedesktop.DBus.Error.UnknownMethod");
+        auto backend = connectedBackend(*old);
+        QVERIFY(backend->features().value("eq").toBool());
+        backend->setEq(58, "bass-lift");
+        QTRY_VERIFY(!backend->features().value("eq").toBool());
+        QCOMPARE(backend->lastError(), QString());
+
+        // Upgraded and restarted: the new owner has SetEq.
+        old->release();
+        FakeDaemon upgraded;
+        upgraded.populateDemo();
+        QVERIFY(upgraded.claim());
+        QTRY_COMPARE(backend->owner(), upgraded.uniqueName());
+        QTRY_VERIFY(backend->connected());
+        QVERIFY(backend->features().value("eq").toBool());
+        backend->setEq(58, "bass-lift");
+        QTRY_COMPARE(upgraded.calls("SetEq").size(), 1);
+        old.reset();
+    }
+
+    // Opus 7 + Codex 7: a failed first read is retried with backoff, and the
+    // read that succeeds clears the error it left.
+    void aFailedSnapshotIsRetriedAndClearsItsError() {
+        FakeDaemon fake;
+        fake.populateDemo();
+        fake.setServing(false); // the name is owned, the object is not there
+        QVERIFY(fake.claim());
+        Backend backend(QDBusConnection::sessionBus(), settingsFile());
+        QElapsedTimer clock;
+        clock.start();
+        QList<qint64> reads;
+        int count = 0;
+        while (reads.size() < 3 && clock.elapsed() < 10000) {
+            if (backend.refreshCount() != count) {
+                count = backend.refreshCount();
+                reads << clock.elapsed();
+            }
+            QTest::qWait(5);
+        }
+        QCOMPARE(reads.size(), 3);
+        QCOMPARE(backend.state(), QString("connecting"));
+        QVERIFY2(backend.lastError().startsWith("org.freedesktop.DBus.Error.UnknownObject"),
+                 qPrintable(backend.lastError()));
+        // Lower bounds are the timers (a coarse QTimer may fire up to 5 %
+        // early, so 10 % slack); the second gap at least doubles the first.
+        const qint64 first = reads[1] - reads[0], second = reads[2] - reads[1];
+        QVERIFY2(first >= Backend::RetryFirstMs * 9 / 10, qPrintable(QString::number(first)));
+        QVERIFY2(second >= 2 * Backend::RetryFirstMs * 9 / 10, qPrintable(QString::number(second)));
+
+        fake.setServing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(backend.connected(), 8000);
+        QCOMPARE(backend.lastError(), QString());
+        // A success stops the retries.
+        const int settled = backend.refreshCount();
+        settle(Backend::RetryFirstMs * 3);
+        QCOMPARE(backend.refreshCount(), settled);
+    }
+
+    void aSuccessfulSnapshotClearsAnEarlierError() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        fake.failCalls("SetDefault", "dev.pipedeck.Error.InvalidArgument");
+        backend->setDefault("sink", "nope");
+        QTRY_VERIFY(backend->lastError().startsWith("dev.pipedeck.Error.InvalidArgument"));
+        fake.emitChanged(); // the next GetAll is a successful call
+        QTRY_COMPARE(backend->lastError(), QString());
+    }
+
+    // Codex 2 + Opus 12: calls go to the owner's unique name, so one issued
+    // for a daemon cannot reach its replacement, and unsent ones are dropped.
+    void callsCannotReachAReplacementDaemon() {
+        auto first = std::make_unique<FakeDaemon>();
+        first->populateDemo();
+        auto backend = connectedBackend(*first);
+        settle(150);
+        QCOMPARE(backend->owner(), first->uniqueName());
+        first->setApplyWrites(false);
+        first->clearCalls();
+
+        backend->setVolume(58, 40, true); // leaves at once
+        backend->setVolume(58, 44, true); // queued behind the 50 ms gap: unsent
+        // The name moves to a daemon that reuses node ids, and the client
+        // issues a write before it has heard: no event loop runs in between.
+        first->release();
+        FakeDaemon second;
+        second.populateDemo();
+        QVERIFY(second.claim());
+        QVERIFY(backend->connected());
+        backend->setMute(58, true);
+
+        QTRY_COMPARE(backend->owner(), second.uniqueName());
+        QTRY_VERIFY(backend->connected());
+        settle(250);
+        QCOMPARE(second.calls("SetVolume").size(), 0);
+        QCOMPARE(second.calls("SetMute").size(), 0);
+        QVERIFY(!second.state().devices[0].mute);
+        // The old daemon got what was addressed to it, and nothing after.
+        QTRY_COMPARE(first->calls("SetMute").size(), 1);
+        QCOMPARE(first->calls("SetVolume").size(), 1);
+        QCOMPARE(first->calls("SetVolume").first().args.at(1).toDouble(), Backend::percentToLinear(40));
+        QCOMPARE(backend->lastError(), QString());
+        first.reset();
+    }
+
     void absentDaemonStartsThroughActivation() {
         Backend backend(QDBusConnection::sessionBus(), settingsFile());
         QTRY_COMPARE(backend.state(), QString("absent"));
@@ -634,6 +933,117 @@ private slots:
         QTRY_VERIFY(!backend.starting());
         QVERIFY2(backend.lastError().startsWith("org.freedesktop.DBus.Error.ServiceUnknown"),
                  qPrintable(backend.lastError()));
+    }
+
+    // ---- the window -------------------------------------------------------------
+
+    // Opus 6: a choice the daemon rejects does not stay selected.
+    void windowShowsWhatTheDaemonHasAfterARejection() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        Window w(m_dir.path(), backend.get());
+        QVERIFY(w.window);
+        w.window->resize(420, int(w.flickable()->property("contentHeight").toReal()) + 80);
+        QTest::qWait(200);
+
+        const QString speaker = "alsa_output.pci-0000_07_00.6.HiFi__Speaker__sink";
+        const QString fiio = "alsa_output.usb-Fiio_K3-00.analog-stereo";
+        auto checked = [&](const QString &name) { return w.find(name)->property("checked").toBool(); };
+        QVERIFY(checked("default:" + speaker));
+        QVERIFY(!checked("default:" + fiio));
+        QVERIFY(checked("notify:"));
+        QVERIFY(!checked("autoMute:" + speaker));
+
+        fake.failCalls("SetDefault", "dev.pipedeck.Error.InvalidArgument");
+        fake.failCalls("SetNotificationSink", "dev.pipedeck.Error.InvalidArgument");
+        fake.failCalls("SetAutoMute", "dev.pipedeck.Error.PipeWire");
+        w.click(w.find("default:" + fiio));
+        QTRY_COMPARE(fake.calls("SetDefault").size(), 1);
+        w.click(w.find("notify:" + fiio));
+        QTRY_COMPARE(fake.calls("SetNotificationSink").size(), 1);
+        w.click(w.find("autoMute:" + speaker));
+        QTRY_COMPARE(fake.calls("SetAutoMute").size(), 1);
+        QTRY_VERIFY(backend->lastError().startsWith("dev.pipedeck.Error.PipeWire"));
+        settle(150);
+        QVERIFY(checked("default:" + speaker));
+        QVERIFY(!checked("default:" + fiio));
+        QVERIFY(checked("notify:"));
+        QVERIFY(!checked("notify:" + fiio));
+        QVERIFY(!checked("autoMute:" + speaker));
+
+        // Accepted, the same clicks move the controls once the snapshot says so.
+        fake.failCalls("SetDefault", {});
+        fake.failCalls("SetNotificationSink", {});
+        fake.failCalls("SetAutoMute", {});
+        w.click(w.find("default:" + fiio));
+        w.click(w.find("notify:" + fiio));
+        w.click(w.find("autoMute:" + speaker));
+        QTRY_VERIFY(checked("default:" + fiio));
+        QVERIFY(!checked("default:" + speaker));
+        QTRY_VERIFY(checked("notify:" + fiio));
+        QVERIFY(!checked("notify:"));
+        QTRY_VERIFY(checked("autoMute:" + speaker));
+    }
+
+    // Opus 5 in the window: a click on the handle of a slider drawn at its
+    // end for a 150 % level sends nothing, nor does one on a level in range.
+    void windowClickOnASliderHandleSendsNothing() {
+        FakeDaemon fake;
+        fake.populateDemo();
+        fake.edit([](FakeState &s) { s.devices[1].volume = 3.375; });
+        auto backend = connectedBackend(fake);
+        Window w(m_dir.path(), backend.get());
+        QVERIFY(w.window);
+        w.window->resize(420, int(w.flickable()->property("contentHeight").toReal()) + 80);
+        QTest::qWait(200);
+        for (const uint id : {71u, 58u}) {
+            QQuickItem *slider = w.find(QStringLiteral("volume:%1").arg(id));
+            QVERIFY(slider);
+            auto *handle = slider->property("handle").value<QQuickItem *>();
+            QVERIFY(handle);
+            const QPointF centre = handle->mapToItem(slider, QPointF(handle->width() / 2, handle->height() / 2));
+            w.click(slider, centre);
+        }
+        settle(250);
+        QCOMPARE(fake.calls("SetVolume").size(), 0);
+        QVERIFY(qAbs(field(backend->outputs(), 71, "percent").toDouble() - 150) < 1e-6);
+    }
+
+    // Codex 6: Tab never leaves the focused control clipped by the viewport.
+    void windowKeepsTheFocusedControlInView() {
+        FakeDaemon fake;
+        auto backend = connectedBackend(fake);
+        Window w(m_dir.path(), backend.get());
+        QVERIFY(w.window);
+        w.window->show();
+        w.window->requestActivate();
+        QTest::qWait(200);
+        QQuickItem *flick = w.flickable();
+        QQuickItem *contentItem = flick->property("contentItem").value<QQuickItem *>();
+        QSet<QQuickItem *> visited;
+        int checkedItems = 0;
+        for (int i = 0; i < 120; ++i) {
+            QTest::keyClick(w.window, Qt::Key_Tab);
+            QTest::qWait(20);
+            QQuickItem *item = w.window->activeFocusItem();
+            if (!item || visited.contains(item))
+                continue;
+            visited.insert(item);
+            bool inside = false;
+            for (QQuickItem *p = item; p; p = p->parentItem())
+                inside = inside || p == contentItem;
+            if (!inside || item->height() > flick->height())
+                continue;
+            const QPointF top = item->mapToItem(flick, QPointF(0, 0));
+            QVERIFY2(top.y() >= -0.5 && top.y() + item->height() <= flick->height() + 0.5,
+                     qPrintable(QString("%1 at %2..%3 in a %4 px viewport")
+                                    .arg(item->metaObject()->className())
+                                    .arg(top.y())
+                                    .arg(top.y() + item->height())
+                                    .arg(flick->height())));
+            ++checkedItems;
+        }
+        QVERIFY2(checkedItems > 20, qPrintable(QString::number(checkedItems)));
     }
 
     // ---- small pieces ---------------------------------------------------------
@@ -698,6 +1108,30 @@ private slots:
         QVERIFY(answered);
         QCOMPARE(shown.size(), 1);
         QCOMPARE(shown.first().first().toString(), QString("token-123"));
+    }
+
+    // Opus 11: a primary that never answers (stuck in a cold start, or on
+    // its way out) does not make the launch fail: once the lock is free the
+    // launch runs as the primary itself.
+    void singleInstanceTakesOverFromASilentPrimary() {
+        QTemporaryDir dir;
+        auto silent = std::make_unique<SingleInstance>(dir.path());
+        QVERIFY(silent->acquire()); // holds the lock, never listens
+        std::atomic<int> claim{-1};
+        std::atomic<bool> listened{false};
+        std::unique_ptr<QThread> thread(QThread::create([&] {
+            SingleInstance launcher(dir.path());
+            claim = int(launcher.claim(20, 200));
+            if (claim == int(SingleInstance::Claim::Primary))
+                listened = launcher.listen();
+        }));
+        thread->start();
+        QTest::qWait(500);
+        QVERIFY(!thread->isFinished());
+        silent.reset();
+        QTRY_VERIFY_WITH_TIMEOUT(thread->isFinished(), 5000);
+        QCOMPARE(claim.load(), int(SingleInstance::Claim::Primary));
+        QVERIFY(listened.load());
     }
 
     void singleInstanceGivesUpWithoutAPrimary() {

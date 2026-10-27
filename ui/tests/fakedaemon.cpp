@@ -1,10 +1,55 @@
 #include "fakedaemon.h"
 
 #include <QDBusConnectionInterface>
+#include <QDBusMetaType>
 #include <QDBusVariant>
 #include <QUuid>
 
 namespace {
+
+// One function per Rust to_dbus(), fields in its tuple order.
+WireDevice wire(const DeviceRow &d) { // state.rs Device::to_dbus
+    return {d.id, d.name, d.description, d.kind, d.isDefault, d.isVirtual, d.volume, d.mute, d.nick};
+}
+WireStream wire(const StreamRow &s) { // state.rs Stream::to_dbus
+    return {s.id, s.appName, s.binary, s.mediaName, s.targetName, s.volume, s.mute};
+}
+WirePort wire(const PortRow &p) { // route.rs Port::to_dbus
+    return {p.nodeId, p.routeIndex, p.name, p.description, p.available, p.active};
+}
+WireIdString wire(const EqRow &e) { // state.rs EqTuple (node id, preset)
+    return {e.nodeId, e.preset};
+}
+WireIdString wire(const StreamSinkRow &s) { // state.rs stream_sinks_dbus (id, observed sink)
+    return {s.streamId, s.sink};
+}
+WirePreset wire(const PresetRow &p) { // eq.rs Preset::to_dbus (id, name)
+    return {p.id, p.name};
+}
+WireAutoMute wire(const AutoMuteRow &a) { // state.rs AutoMuteTuple (node id, enabled)
+    return {a.nodeId, a.enabled};
+}
+template <typename Row> auto wireList(const QList<Row> &rows) {
+    QList<decltype(wire(std::declval<Row>()))> out;
+    for (const auto &r : rows)
+        out << wire(r);
+    return out;
+}
+
+void registerWireTypes() {
+    qDBusRegisterMetaType<WireDevice>();
+    qDBusRegisterMetaType<WireDevices>();
+    qDBusRegisterMetaType<WireStream>();
+    qDBusRegisterMetaType<WireStreams>();
+    qDBusRegisterMetaType<WirePort>();
+    qDBusRegisterMetaType<WirePorts>();
+    qDBusRegisterMetaType<WireIdString>();
+    qDBusRegisterMetaType<WireIdStrings>();
+    qDBusRegisterMetaType<WirePreset>();
+    qDBusRegisterMetaType<WirePresets>();
+    qDBusRegisterMetaType<WireAutoMute>();
+    qDBusRegisterMetaType<WireAutoMutes>();
+}
 
 void sendChanged(const QDBusConnection &connection) {
     auto signal = QDBusMessage::createSignal(DaemonProxy::Path, DaemonProxy::Interface, "Changed");
@@ -22,6 +67,7 @@ FakeObject::FakeObject(std::shared_ptr<FakeShared> s, bool legacy) : shared(std:
 
 FakeDaemon::FakeDaemon(bool legacy) : m_shared(std::make_shared<FakeShared>()) {
     DaemonProxy::registerTypes();
+    registerWireTypes();
     m_shared->clock.start();
     m_connectionName = "fake-pipedeckd-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
     m_shared->connection = QDBusConnection::connectToBus(QDBusConnection::SessionBus, m_connectionName);
@@ -52,6 +98,21 @@ void FakeDaemon::release() {
     m_shared->connection.unregisterService(DaemonProxy::Service);
 }
 
+void FakeDaemon::setServing(bool serving) {
+    if (serving)
+        m_shared->connection.registerObject(DaemonProxy::Path, m_object, QDBusConnection::ExportAdaptors);
+    else
+        m_shared->connection.unregisterObject(DaemonProxy::Path);
+}
+
+void FakeDaemon::failCalls(const QString &member, const QString &errorName) {
+    QMutexLocker lock(&m_shared->mutex);
+    if (errorName.isEmpty())
+        m_shared->failures.remove(member);
+    else
+        m_shared->failures.insert(member, errorName);
+}
+
 FakeState FakeDaemon::state() const {
     QMutexLocker lock(&m_shared->mutex);
     return m_shared->state;
@@ -67,13 +128,13 @@ void FakeDaemon::emitPropertiesChanged(const QStringList &names) {
     const FakeState s = state();
     QVariantMap changed;
     for (const auto &name : names) {
-        if (name == "Devices") changed[name] = QVariant::fromValue(s.devices);
-        else if (name == "Streams") changed[name] = QVariant::fromValue(s.streams);
-        else if (name == "Ports") changed[name] = QVariant::fromValue(s.ports);
-        else if (name == "Eq") changed[name] = QVariant::fromValue(s.eq);
-        else if (name == "EqPresets") changed[name] = QVariant::fromValue(s.eqPresets);
-        else if (name == "AutoMute") changed[name] = QVariant::fromValue(s.autoMute);
-        else if (name == "StreamSinks") changed[name] = QVariant::fromValue(s.streamSinks);
+        if (name == "Devices") changed[name] = QVariant::fromValue(wireList(s.devices));
+        else if (name == "Streams") changed[name] = QVariant::fromValue(wireList(s.streams));
+        else if (name == "Ports") changed[name] = QVariant::fromValue(wireList(s.ports));
+        else if (name == "Eq") changed[name] = QVariant::fromValue(wireList(s.eq));
+        else if (name == "EqPresets") changed[name] = QVariant::fromValue(wireList(s.eqPresets));
+        else if (name == "AutoMute") changed[name] = QVariant::fromValue(wireList(s.autoMute));
+        else if (name == "StreamSinks") changed[name] = QVariant::fromValue(wireList(s.streamSinks));
         else if (name == "NotificationSink") changed[name] = s.notificationSink;
         else if (name == "PortSwitchCap") changed[name] = s.portSwitchCap;
     }
@@ -155,30 +216,31 @@ FakeAdaptor::FakeAdaptor(FakeObject *parent) : QDBusAbstractAdaptor(parent), m_s
     setAutoRelaySignals(false);
 }
 
-#define FAKE_GET(type, name, field)                                                                                     \
+#define FAKE_GET(type, name, expr)                                                                                      \
     type FakeAdaptor::name() const {                                                                                   \
         QMutexLocker lock(&m_shared->mutex);                                                                           \
-        return m_shared->state.field;                                                                                  \
+        const FakeState &s = m_shared->state;                                                                          \
+        return expr;                                                                                                   \
     }
-FAKE_GET(QList<AutoMuteRow>, autoMute, autoMute)
-FAKE_GET(QList<EqRow>, eq, eq)
-FAKE_GET(QList<PresetRow>, eqPresets, eqPresets)
-FAKE_GET(QString, notificationSink, notificationSink)
-FAKE_GET(uint, portSwitchCap, portSwitchCap)
-FAKE_GET(QList<PortRow>, ports, ports)
-FAKE_GET(QList<StreamSinkRow>, streamSinks, streamSinks)
-FAKE_GET(QList<StreamRow>, streams, streams)
-FAKE_GET(QString, version, version)
+FAKE_GET(WireAutoMutes, autoMute, wireList(s.autoMute))
+FAKE_GET(WireIdStrings, eq, wireList(s.eq))
+FAKE_GET(WirePresets, eqPresets, wireList(s.eqPresets))
+FAKE_GET(QString, notificationSink, s.notificationSink)
+FAKE_GET(uint, portSwitchCap, s.portSwitchCap)
+FAKE_GET(WirePorts, ports, wireList(s.ports))
+FAKE_GET(WireIdStrings, streamSinks, wireList(s.streamSinks))
+FAKE_GET(WireStreams, streams, wireList(s.streams))
+FAKE_GET(QString, version, s.version)
 #undef FAKE_GET
 
-QList<DeviceRow> FakeAdaptor::devices() const {
+WireDevices FakeAdaptor::devices() const {
     // GetAll reads every property once, so this getter counts snapshots and
     // is where a test can hold one open.
     ++m_shared->getAllCount;
     if (m_shared->holdGetAll)
         m_shared->gate.acquire();
     QMutexLocker lock(&m_shared->mutex);
-    return m_shared->state.devices;
+    return wireList(m_shared->state.devices);
 }
 
 void FakeAdaptor::record(const char *member, const char *signature, const QVariantList &args) {
@@ -188,12 +250,26 @@ void FakeAdaptor::record(const char *member, const char *signature, const QVaria
     m_shared->calls << FakeCall{QString::fromLatin1(member), wire, args, m_shared->clock.elapsed()};
 }
 
+bool FakeAdaptor::rejected(const char *member) {
+    QString error;
+    {
+        QMutexLocker lock(&m_shared->mutex);
+        error = m_shared->failures.value(QString::fromLatin1(member));
+    }
+    if (error.isEmpty())
+        return false;
+    object()->replyError(error, QStringLiteral("%1 refused by the fake").arg(QString::fromLatin1(member)));
+    return true;
+}
+
 void FakeAdaptor::changed() {
     sendChanged(m_shared->connection);
 }
 
 void FakeAdaptor::SetDefault(const QString &kind, const QString &name) {
     record("SetDefault", "ss", {kind, name});
+    if (rejected("SetDefault"))
+        return;
     if (!m_shared->applyWrites)
         return;
     {
@@ -207,6 +283,8 @@ void FakeAdaptor::SetDefault(const QString &kind, const QString &name) {
 
 void FakeAdaptor::SetNotificationSink(const QString &name) {
     record("SetNotificationSink", "s", {name});
+    if (rejected("SetNotificationSink"))
+        return;
     if (!m_shared->applyWrites)
         return;
     {
@@ -218,6 +296,8 @@ void FakeAdaptor::SetNotificationSink(const QString &name) {
 
 void FakeAdaptor::SetVolume(uint id, double volume) {
     record("SetVolume", "ud", {id, volume});
+    if (rejected("SetVolume"))
+        return;
     if (m_shared->delayVolumeReplies) {
         object()->delayReply();
         QMutexLocker lock(&m_shared->mutex);
@@ -250,6 +330,8 @@ void FakeAdaptor::SetVolume(uint id, double volume) {
 
 void FakeAdaptor::SetMute(uint id, bool mute) {
     record("SetMute", "ub", {id, mute});
+    if (rejected("SetMute"))
+        return;
     if (!m_shared->applyWrites)
         return;
     {
@@ -266,6 +348,8 @@ void FakeAdaptor::SetMute(uint id, bool mute) {
 
 void FakeAdaptor::SetStreamTarget(uint id, const QString &name) {
     record("SetStreamTarget", "us", {id, name});
+    if (rejected("SetStreamTarget"))
+        return;
     if (!m_shared->applyWrites)
         return;
     {
@@ -287,6 +371,8 @@ void FakeAdaptor::SetStreamTarget(uint id, const QString &name) {
 
 void FakeAdaptor::SetPort(uint node_id, uint route_index) {
     record("SetPort", "uu", {node_id, route_index});
+    if (rejected("SetPort"))
+        return;
     if (!m_shared->applyWrites)
         return;
     {
@@ -300,6 +386,8 @@ void FakeAdaptor::SetPort(uint node_id, uint route_index) {
 
 void FakeAdaptor::SetAutoMute(uint node_id, bool enabled) {
     record("SetAutoMute", "ub", {node_id, enabled});
+    if (rejected("SetAutoMute"))
+        return;
     if (!m_shared->applyWrites)
         return;
     {
@@ -313,6 +401,8 @@ void FakeAdaptor::SetAutoMute(uint node_id, bool enabled) {
 
 void FakeAdaptor::SetEq(uint node_id, const QString &preset) {
     record("SetEq", "us", {node_id, preset});
+    if (rejected("SetEq"))
+        return;
     if (!m_shared->applyWrites)
         return;
     {
@@ -326,6 +416,8 @@ void FakeAdaptor::SetEq(uint node_id, const QString &preset) {
 
 void FakeAdaptor::SetPortSwitchCap(uint percent) {
     record("SetPortSwitchCap", "u", {percent});
+    if (rejected("SetPortSwitchCap"))
+        return;
     if (!m_shared->applyWrites)
         return;
     {
@@ -346,18 +438,18 @@ LegacyAdaptor::LegacyAdaptor(FakeObject *parent) : QDBusAbstractAdaptor(parent),
     setAutoRelaySignals(false);
 }
 
-QList<DeviceRow> LegacyAdaptor::devices() const {
+WireDevices LegacyAdaptor::devices() const {
     ++m_shared->getAllCount;
     QMutexLocker lock(&m_shared->mutex);
-    return m_shared->state.devices;
+    return wireList(m_shared->state.devices);
 }
 QString LegacyAdaptor::notificationSink() const {
     QMutexLocker lock(&m_shared->mutex);
     return m_shared->state.notificationSink;
 }
-QList<StreamRow> LegacyAdaptor::streams() const {
+WireStreams LegacyAdaptor::streams() const {
     QMutexLocker lock(&m_shared->mutex);
-    return m_shared->state.streams;
+    return wireList(m_shared->state.streams);
 }
 QString LegacyAdaptor::version() const {
     return "1.0.0";

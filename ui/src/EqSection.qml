@@ -15,7 +15,7 @@ ColumnLayout {
     Label {
         Layout.fillWidth: true
         visible: backend.eqPresets.length === 0
-        text: qsTr("No presets installed. Presets live in ~/.config/pipedeck/eq/; import an AutoEq file with: pipedeck eq import <file>")
+        text: qsTr("No presets installed. Presets live in ~/.config/pipedeck/eq/ and /usr/share/pipedeck/presets/; import an AutoEq file with: pipedeck eq import <file>")
         wrapMode: Text.WordWrap
         font.pixelSize: 12
         opacity: 0.65

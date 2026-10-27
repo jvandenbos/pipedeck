@@ -13,5 +13,26 @@ make -j"$(nproc)"
 # environment, and with Qt's portal lookups off, nothing that bus activates
 # (xdg-desktop-portal and its backends) reaches the live desktop either; the
 # GTK platform theme goes too, since it exits the process without a display.
-exec dbus-run-session -- env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_IM_MODULE \
+#
+# The bus runs on its own config, with no service directories at all: the
+# stock session config reads ~/.local/share/dbus-1/services/ and
+# /usr/share/dbus-1/services/, so an installed dev.pipedeck.Daemon.service
+# would let the Start test activate a real pipedeckd (or install-user's stub)
+# instead of getting ServiceUnknown, and nothing else can be activated either.
+cat > bus.conf <<'CONF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <keep_umask/>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+CONF
+exec dbus-run-session --config-file="$PWD/bus.conf" -- env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_IM_MODULE \
     QT_QPA_PLATFORM=offscreen QT_NO_XDG_DESKTOP_PORTAL=1 ./pipedeck-ui_tests "$@"

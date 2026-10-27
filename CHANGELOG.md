@@ -5,7 +5,7 @@ milestones map to the numbered sections of `SPEC.md`.
 
 ## [Unreleased]
 
-## [1.4.0] — 2026-10-26
+## [1.4.0] — 2026-10-27
 
 ### Added
 - **`pipedeck-ui`**, the Qt Quick window for Omarchy / Hyprland (`ui/`), and the Arch package

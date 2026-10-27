@@ -131,14 +131,20 @@ Status legend: ☐ todo · ◐ in progress · ☑ done · ✗ blocked
   0.5 s and 3.5 s; back to Headphones 0.40 untouched; `set-port` + `vol 70` inside the window → 0.70;
   `mute on` + `vol 45` → `0.45 [MUTED]`. One `clamped` journal line, no re-clamp needed on this card.
 
-## Phase 9 — Omarchy / Hyprland front end `pipedeck-ui` (SPEC-UI.md) — spec'd 2026-10-26 on gargoyle, not started
-- ☑ Daemon + CLI build unmodified on Arch (cargo 1.98, 69 s) and list the T14's graph (SPEC-UI §0).
-- ☑ EQ smart filter measured working on PipeWire 1.6.9 / WirePlumber 0.5.18 (null sink, +11.9 dB of a +12 dB shelf).
-- ☑ Design reviewed with Codex → `docs/2026-10-26-ui-design-review.md`; decisions in SPEC-UI §0.
-- ☐ Daemon additions, SPEC-UI §6: `StreamSinks`, manual-target precedence, Arch unit/activation paths.
-- ☐ `ui/` lane: qmake project, QtDBus proxy from the XML, model + lifecycle contract (§5), five sections (§4), fake-daemon Qt Tests (§8).
-- ☐ `ui/pkgbuild/PKGBUILD`, `makepkg -fsi` on gargoyle; acceptance 20–28 from the main session.
-- ☐ Release 1.4.0.
+## Phase 9 — Omarchy / Hyprland front end `pipedeck-ui` (SPEC-UI.md) — built 2026-10-27 on gargoyle
+
+- ☑ Daemon and CLI build on Arch unmodified; smart-filter EQ measured working on PW 1.6.9 / WP 0.5.18
+- ☑ Design reviewed with Codex (`docs/2026-10-26-ui-design-review.md`), pre-build quick review folded in
+- ☑ Daemon additions §6: `StreamSinks`, manual-target precedence, `$XDG_DATA_DIRS` presets, Arch unit paths,
+  requested-target fallback to node properties, "Follow default" writes `target.object=-1`
+- ☑ `ui/` lane: Qt Quick, hand-written QtDBus proxy, one refresh state machine, 55 offscreen tests
+- ☑ Two adversarial reviews (`docs/2026-10-27-adversarial-review.md`), every item fixed with a test
+- ☑ Layout: SoundSource's System/Applications table (Jan's screenshots, 2026-10-27); 600 px wide
+- ☑ `packaging/arch/` PKGBUILD for the omarchy-pkgs gates, built with `makepkg -fd`
+- ☑ Acceptance 20–28 on gargoyle (`docs/2026-10-27-acceptance-gargoyle.md`); 22 needs headphones
+- ☐ Release 1.4.0 (tag, GitHub release, `updpkgsums`)
+- ☐ Jan: `pacman -U` the package (JAN-TODO on gargoyle); decide on publishing to `omacom/omarchy-pkgs`
+- ☐ v1.1 backlog in SPEC-UI §10; audio-chain review session (terminal repo TODO)
 
 ## v1.2 ideas (from first real use, 2026-09-05)
 - **ALSA Auto-Mute Mode.** On Realtek codecs, `Auto-Mute Mode = Enabled` hard-mutes Line Out while

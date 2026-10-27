@@ -495,12 +495,11 @@ async fn eq_command(daemon: &DaemonProxy<'_>, cmd: EqCmd) -> Result<()> {
                 .search_order()
                 .map(|d| d.display().to_string())
                 .collect();
-            let path = dirs.find(&id).ok_or_else(|| {
-                anyhow::anyhow!("no preset `{id}.toml` in {}", searched.join(", "))
+            // `find` applies the daemon's own selection (file-name slug,
+            // validation, precedence), so this shows what `SetEq` would apply.
+            let (preset, path) = dirs.find(&id).ok_or_else(|| {
+                anyhow::anyhow!("no valid preset `{id}` in {}", searched.join(", "))
             })?;
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("could not read {}", path.display()))?;
-            let preset = eq::parse_preset(&id, &text).map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{}  ({})", preset.name, preset.id);
             println!("file: {}", path.display());
             println!("preamp: {:+.1} dB", preset.preamp_db);

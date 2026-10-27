@@ -39,7 +39,7 @@ use crate::command::Command;
 use crate::config::Config;
 use crate::eq::{self, Preset};
 use crate::error::{Error, Result};
-use crate::links::{self, LinkedNode};
+use crate::links::{self, LinkedNode, TargetSources};
 use crate::matching::{is_notification_stream, plan_notification_routing, RoutingCandidate};
 use crate::meta;
 use crate::route::{
@@ -159,6 +159,9 @@ struct NodeEntry {
     /// request (`pw-play --target`, `PULSE_SINK`), distinct from the metadata
     /// key of the same name that `SetStreamTarget` writes.
     prop_target: Option<String>,
+    /// The node's deprecated `node.target` property (a node id or a name),
+    /// which WirePlumber still honours after `target.object`.
+    prop_node_target: Option<String>,
     virtual_: bool,
     /// One of our own filter-chain nodes (SPEC §7.1): tracked, never published.
     hidden: bool,
@@ -265,6 +268,8 @@ struct Inner {
     links: HashMap<u32, (u32, u32)>,
     /// Raw `target.object` metadata values by subject node id.
     targets: HashMap<u32, String>,
+    /// Raw `target.node` metadata values by subject node id (read only).
+    target_nodes: HashMap<u32, String>,
     metadata: Option<Rc<MetadataEntry>>,
     /// Stream ids we have pointed at the notification sink, so we can undo it.
     routed: HashSet<u32>,
@@ -282,25 +287,34 @@ struct Inner {
 }
 
 impl Inner {
-    /// The stream's *requested* sink: its `target.object` metadata, else the
-    /// node's own `target.object` property — see [`links::requested_target`].
+    /// The stream's *requested* sink, by WirePlumber's precedence — see
+    /// [`links::TargetSources`] and [`links::requested_target`].
     ///
     /// Through 1.3.0 this returned the live link's destination first, so
     /// `Streams.target_name` was observation, not intent; the observation now
     /// lives in [`Inner::observed_sink`] / `StreamSinks` (SPEC-UI §6.1).
     fn resolve_target(&self, stream_id: u32) -> String {
         links::requested_target(
-            self.targets.get(&stream_id).map(String::as_str),
-            self.nodes
-                .get(&stream_id)
-                .and_then(|n| n.prop_target.as_deref()),
+            self.target_sources(stream_id),
             |serial| {
                 self.nodes
                     .values()
                     .find(|n| n.serial == Some(serial))
                     .map(|n| n.name.as_str())
             },
+            |id| self.nodes.get(&id).map(|n| n.name.as_str()),
         )
+    }
+
+    /// Everything that can name a target for `stream_id`, raw.
+    fn target_sources(&self, stream_id: u32) -> TargetSources<'_> {
+        let node = self.nodes.get(&stream_id);
+        TargetSources {
+            meta_object: self.targets.get(&stream_id).map(String::as_str),
+            meta_node: self.target_nodes.get(&stream_id).map(String::as_str),
+            prop_object: node.and_then(|n| n.prop_target.as_deref()),
+            prop_node: node.and_then(|n| n.prop_node_target.as_deref()),
+        }
     }
 
     /// Where the stream is *actually* playing, from the `Link` globals
@@ -919,6 +933,7 @@ fn run(
         devices: HashMap::new(),
         links: HashMap::new(),
         targets: HashMap::new(),
+        target_nodes: HashMap::new(),
         metadata: None,
         routed: HashSet::new(),
         manual: HashSet::new(),
@@ -1052,7 +1067,8 @@ fn on_node_global(
                 let inner = inner.clone();
                 move |info| {
                     if let Some(props) = info.props() {
-                        on_node_info(&inner, id, props);
+                        let full = info.change_mask().contains(NodeChangeMask::PROPS);
+                        on_node_info(&inner, id, props, full);
                     }
                     if info.change_mask().contains(NodeChangeMask::PARAMS) {
                         let reported = reported_params(info.params());
@@ -1095,6 +1111,7 @@ fn on_node_global(
         media_name: props.get(keys::MEDIA_NAME).unwrap_or_default().to_owned(),
         media_role: props.get(keys::MEDIA_ROLE).unwrap_or_default().to_owned(),
         prop_target: props.get(meta::KEY_TARGET_OBJECT).map(str::to_owned),
+        prop_node_target: props.get(meta::PROP_NODE_TARGET).map(str::to_owned),
         virtual_,
         hidden,
         serial: props.get(keys::OBJECT_SERIAL).and_then(|s| s.parse().ok()),
@@ -1498,6 +1515,7 @@ fn on_global_remove(inner: &Rc<RefCell<Inner>>, id: u32) {
     guard.routed.remove(&id);
     guard.manual.remove(&id);
     guard.targets.remove(&id);
+    guard.target_nodes.remove(&id);
     // SPEC §9.2: a node that went away can never confirm its switch.
     guard.pending_port_caps.remove_node(id);
     if guard
@@ -1523,7 +1541,15 @@ fn on_global_remove(inner: &Rc<RefCell<Inner>>, id: u32) {
     guard.publish();
 }
 
-fn on_node_info(inner: &Rc<RefCell<Inner>>, id: u32, props: &spa::utils::dict::DictRef) {
+/// `props_changed`: the info carries `NodeChangeMask::PROPS`, i.e. `props` is
+/// the node's complete, current property set — so a key missing from it has
+/// been removed, not merely left out.
+fn on_node_info(
+    inner: &Rc<RefCell<Inner>>,
+    id: u32,
+    props: &spa::utils::dict::DictRef,
+    props_changed: bool,
+) {
     let mut guard = inner.borrow_mut();
     let Some(entry) = guard.nodes.get_mut(&id) else {
         return;
@@ -1543,11 +1569,25 @@ fn on_node_info(inner: &Rc<RefCell<Inner>>, id: u32, props: &spa::utils::dict::D
         }
     }
     // Probably not in the registry whitelist either, so the node `info` is
-    // where it reliably arrives.
-    if let Some(value) = props.get(meta::KEY_TARGET_OBJECT) {
-        if entry.prop_target.as_deref() != Some(value) {
-            entry.prop_target = Some(value.to_owned());
-            changed = true;
+    // where they reliably arrive. A full property set without the key means
+    // the client dropped its request: clear it, or `Streams.target_name`
+    // keeps reporting a target WirePlumber no longer sees.
+    for (key, field) in [
+        (meta::KEY_TARGET_OBJECT, &mut entry.prop_target),
+        (meta::PROP_NODE_TARGET, &mut entry.prop_node_target),
+    ] {
+        match props.get(key) {
+            Some(value) => {
+                if field.as_deref() != Some(value) {
+                    *field = Some(value.to_owned());
+                    changed = true;
+                }
+            }
+            None if props_changed && field.is_some() => {
+                *field = None;
+                changed = true;
+            }
+            None => {}
         }
     }
     if let Some(value) = props.get(keys::NODE_DESCRIPTION) {
@@ -1662,6 +1702,15 @@ fn on_metadata_property(
             DeviceKind::Sink => guard.default_sink = name,
             DeviceKind::Source => guard.default_source = name,
         }
+        guard.publish();
+        return;
+    }
+
+    if key == meta::KEY_TARGET_NODE {
+        match value {
+            Some(value) => guard.target_nodes.insert(subject, value.to_owned()),
+            None => guard.target_nodes.remove(&subject),
+        };
         guard.publish();
         return;
     }
@@ -1927,10 +1976,22 @@ fn set_stream_target(inner: &Rc<RefCell<Inner>>, id: u32, name: &str) -> Result<
         .ok_or_else(|| Error::pipewire("the `default` metadata object is not available"))?;
 
     if name.is_empty() {
-        metadata
-            .proxy
-            .set_property(id, meta::KEY_TARGET_OBJECT, None, None);
-        guard.targets.remove(&id);
+        // SPEC-UI §6.1 "Follow default": delete our key, or write `-1` when
+        // the node's own request would otherwise win — `follow_default_value`.
+        if let Some(value) = links::follow_default_value(&guard.target_sources(id)) {
+            metadata.proxy.set_property(
+                id,
+                meta::KEY_TARGET_OBJECT,
+                Some(meta::TYPE_SPA_ID),
+                Some(value),
+            );
+            guard.targets.insert(id, value.to_owned());
+        } else {
+            metadata
+                .proxy
+                .set_property(id, meta::KEY_TARGET_OBJECT, None, None);
+            guard.targets.remove(&id);
+        }
         guard.routed.remove(&id);
     } else {
         metadata.proxy.set_property(

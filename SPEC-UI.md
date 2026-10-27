@@ -229,13 +229,20 @@ app never writes these.
      **lowest node id**, so the value does not flicker;
    - no link → `""`.
 
-   **`Streams.target_name` is the *requested* target** — the stream's `target.object`
-   metadata, else the stream node's own `target.object` property (the client's connect-time
-   request: `pw-play --target`, `PULSE_SINK`, pipewire-pulse clients), each resolved serial →
-   `node.name` (or the raw value); `""` when neither exists ("Follow default"). Metadata wins
-   when both exist, so a `SetStreamTarget` overrides the client's request — and
-   `SetStreamTarget(id, "")` clears only the metadata, so such a stream then reads as its own
-   node property again, which is what WirePlumber falls back to as well. Through 1.3.0 it
+   **`Streams.target_name` is the *requested* target**, read in WirePlumber 0.5.18's own
+   precedence (`linking/find-defined-target.lua`): the `default` metadata's `target.object`,
+   else its `target.node`, else the stream node's own `target.object` property (the client's
+   connect-time request: `pw-play --target`, `PULSE_SINK`, pipewire-pulse clients), else the
+   deprecated node property `node.target`. A numeric `target.object` is an `object.serial`, a
+   numeric `target.node` / `node.target` a node **id**; each resolves to `node.name` (or is
+   reported raw). `-1` (WirePlumber's "no target") or no value at all = `""` ("Follow default").
+   **"Follow default" = `SetStreamTarget(id, "")`**, and it does follow the default: when
+   deleting the `target.object` metadata would leave nothing else naming a sink, the daemon
+   deletes it; when the node's own `target.object` / `node.target` (or a `target.node` other
+   than `-1`) would then win, it writes `target.object = "-1"` instead, so WirePlumber links
+   the stream to the default rather than snapping it back to its connect-time request. Either
+   way the stream then reads `""`. The daemon also clears its copy of a node's own target
+   property when the client drops it from its properties. Through 1.3.0 `target_name`
    returned the live link first, i.e. it was observed state; that changed with this item
    (CHANGELOG `Changed`).
    CLI: `pipedeck status`/`streams` show `-> requested` and `on: observed` when they differ
@@ -254,9 +261,11 @@ app never writes these.
    `<dir>/pipedeck/presets/*.toml` for each absolute `<dir>` in `$XDG_DATA_DIRS` (default
    `/usr/local/share:/usr/share`), read-only — so the package's `/usr/share/pipedeck/presets/`
    is live without a first-run copy. For one preset id the user directory wins, then earlier
-   `$XDG_DATA_DIRS` entries. `EqPresets` lists the merged set; `pipedeck eq import` still writes
-   only the user dir; `eq show` searches in the same order. No system dir present = the 1.3
-   behaviour exactly.
+   `$XDG_DATA_DIRS` entries — the first directory holding a *valid* preset for the id, so a
+   broken user file does not hide a bundled one. `EqPresets` lists the merged set; `pipedeck eq
+   import` still writes only the user dir; `eq show` goes through the daemon's selection and
+   shows exactly what `SetEq` applies. A rescan that cannot list an existing preset directory
+   keeps the previous library. No system dir present = the 1.3 behaviour exactly.
 Everything else the UI needs exists in 1.3.0 (`Devices`, `Streams`, `Ports`, `Eq`,
 `EqPresets`, `AutoMute`, `NotificationSink`, `PortSwitchCap`, `Version`, the setters).
 

@@ -300,26 +300,50 @@ pub fn presets_dir() -> Result<PathBuf, crate::config::ConfigError> {
     Ok(crate::config::Config::config_dir()?.join(PRESETS_DIR))
 }
 
-/// Load every `*.toml` in a presets directory, ordered by id.
-///
-/// A missing directory yields an empty list. A file that fails to parse or
-/// validate is skipped and reported in the second return value rather than
-/// failing the whole scan — one bad file must not cost the user their others.
-#[must_use]
-pub fn load_presets(dir: &Path) -> (Vec<Preset>, Vec<String>) {
-    let mut presets: Vec<Preset> = Vec::new();
-    let mut problems: Vec<String> = Vec::new();
+/// One directory's scan: the valid presets with the file each came from, and
+/// whatever was skipped.
+#[derive(Debug, Default)]
+struct DirScan {
+    /// Ordered by id; one entry per id.
+    presets: Vec<(Preset, PathBuf)>,
+    problems: Vec<String>,
+    /// The directory exists but could not be listed (EACCES, ENOTDIR, an I/O
+    /// error mid-listing). A missing directory is *not* a failure.
+    unreadable: bool,
+}
 
+/// The single loader every preset lookup goes through, so the daemon's library
+/// and `pipedeck eq show` can never disagree about which file serves an id.
+///
+/// - Only `*.toml`; the id is [`slugify`] of the file stem, so `Bass Boost.toml`
+///   serves `bass-boost`.
+/// - A file that fails to read, parse or validate is skipped and reported.
+/// - Two valid files in one directory with the same id (`Bass Boost.toml` and
+///   `bass-boost.toml`): the lexically smaller path wins, so the choice does
+///   not depend on `readdir` order.
+fn scan_dir(dir: &Path) -> DirScan {
+    let mut scan = DirScan::default();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (presets, problems),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return scan,
         Err(e) => {
-            problems.push(format!("could not read {}: {e}", dir.display()));
-            return (presets, problems);
+            scan.problems
+                .push(format!("could not read {}: {e}", dir.display()));
+            scan.unreadable = true;
+            return scan;
         }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                scan.problems
+                    .push(format!("could not read {}: {e}", dir.display()));
+                scan.unreadable = true;
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
@@ -329,21 +353,52 @@ pub fn load_presets(dir: &Path) -> (Vec<Preset>, Vec<String>) {
         };
         let id = slugify(stem);
         if id.is_empty() {
-            problems.push(format!("{}: file name has no usable id", path.display()));
+            scan.problems
+                .push(format!("{}: file name has no usable id", path.display()));
             continue;
         }
         match std::fs::read_to_string(&path) {
             Ok(text) => match parse_preset(&id, &text) {
-                Ok(preset) => presets.push(preset),
-                Err(e) => problems.push(format!("{}: {e}", path.display())),
+                Ok(preset) => scan.presets.push((preset, path)),
+                Err(e) => scan.problems.push(format!("{}: {e}", path.display())),
             },
-            Err(e) => problems.push(format!("{}: {e}", path.display())),
+            Err(e) => scan.problems.push(format!("{}: {e}", path.display())),
         }
     }
 
-    presets.sort_by(|a, b| a.id.cmp(&b.id));
-    presets.dedup_by(|a, b| a.id == b.id);
-    (presets, problems)
+    scan.presets
+        .sort_by(|a, b| a.0.id.cmp(&b.0.id).then_with(|| a.1.cmp(&b.1)));
+    scan.presets
+        .dedup_by(|later, first| later.0.id == first.0.id);
+    scan
+}
+
+/// Load every `*.toml` in a presets directory, ordered by id.
+///
+/// A missing directory yields an empty list. A file that fails to parse or
+/// validate is skipped and reported in the second return value rather than
+/// failing the whole scan — one bad file must not cost the user their others.
+/// Selection rules: [`scan_dir`].
+#[must_use]
+pub fn load_presets(dir: &Path) -> (Vec<Preset>, Vec<String>) {
+    let scan = scan_dir(dir);
+    (
+        scan.presets.into_iter().map(|(preset, _)| preset).collect(),
+        scan.problems,
+    )
+}
+
+/// The merged library across every [`PresetDirs`] directory.
+#[derive(Debug, Default)]
+pub struct PresetScan {
+    /// By id: the preset and the file it was taken from.
+    pub presets: BTreeMap<String, (Preset, PathBuf)>,
+    /// Skipped files and unreadable directories, for the log.
+    pub problems: Vec<String>,
+    /// At least one existing directory could not be listed, so `presets` may
+    /// be missing entries — or serving a shadowed one. A caller holding an
+    /// older library should keep it.
+    pub incomplete: bool,
 }
 
 /// Where system presets live under each `$XDG_DATA_DIRS` entry (SPEC §7.2):
@@ -421,31 +476,47 @@ impl PresetDirs {
             .chain(self.system.iter().map(PathBuf::as_path))
     }
 
-    /// Load the merged library, ordered by id. For a given id the first
-    /// directory in [`Self::search_order`] wins, so a user can shadow a bundled
-    /// preset by saving one with the same file name. Missing directories are
-    /// silently empty, exactly like [`load_presets`] — with no system
-    /// directory present this is the user-only scan it always was.
+    /// Scan every directory into the merged library. For a given id the first
+    /// directory in [`Self::search_order`] that holds a *valid* preset for it
+    /// wins, so a user can shadow a bundled preset by saving one with the same
+    /// id — and a broken user file falls through to the bundled one rather than
+    /// hiding it. Missing directories are silently empty.
     #[must_use]
-    pub fn load(&self) -> (Vec<Preset>, Vec<String>) {
-        let mut merged: BTreeMap<String, Preset> = BTreeMap::new();
-        let mut problems = Vec::new();
+    pub fn scan(&self) -> PresetScan {
+        let mut merged = PresetScan::default();
         for dir in self.search_order() {
-            let (presets, mut found) = load_presets(dir);
-            problems.append(&mut found);
-            for preset in presets {
-                merged.entry(preset.id.clone()).or_insert(preset);
+            let mut scan = scan_dir(dir);
+            merged.problems.append(&mut scan.problems);
+            merged.incomplete |= scan.unreadable;
+            for (preset, path) in scan.presets {
+                merged
+                    .presets
+                    .entry(preset.id.clone())
+                    .or_insert((preset, path));
             }
         }
-        (merged.into_values().collect(), problems)
+        merged
     }
 
-    /// The file `<id>.toml` that [`Self::load`] would take preset `id` from.
+    /// The merged library, ordered by id — [`Self::scan`] without the paths.
+    /// With no system directory present this is the user-only scan it always
+    /// was.
     #[must_use]
-    pub fn find(&self, id: &str) -> Option<PathBuf> {
-        self.search_order()
-            .map(|dir| dir.join(format!("{id}.toml")))
-            .find(|path| path.is_file())
+    pub fn load(&self) -> (Vec<Preset>, Vec<String>) {
+        let scan = self.scan();
+        (
+            scan.presets
+                .into_values()
+                .map(|(preset, _)| preset)
+                .collect(),
+            scan.problems,
+        )
+    }
+
+    /// Exactly what [`Self::load`] serves for `id`, and the file it came from.
+    #[must_use]
+    pub fn find(&self, id: &str) -> Option<(Preset, PathBuf)> {
+        self.scan().presets.remove(id.trim())
     }
 }
 
@@ -1124,9 +1195,10 @@ gain_db = -1.2
             got,
             vec![("bass", "Local bass"), ("flat", "Flat"), ("hd650", "Mine")]
         );
-        assert_eq!(dirs.find("hd650"), Some(user.join("hd650.toml")));
-        assert_eq!(dirs.find("flat"), Some(usr.join("flat.toml")));
-        assert_eq!(dirs.find("nope"), None);
+        let path_of = |id: &str| dirs.find(id).map(|(_, path)| path);
+        assert_eq!(path_of("hd650"), Some(user.join("hd650.toml")));
+        assert_eq!(path_of("flat"), Some(usr.join("flat.toml")));
+        assert_eq!(path_of("nope"), None);
 
         // No system dir on disk: identical to the user-only scan.
         let user_only = PresetDirs {
@@ -1134,6 +1206,72 @@ gain_db = -1.2
             system: vec![root.path().join("absent")],
         };
         assert_eq!(user_only.load(), load_presets(&user));
+    }
+
+    /// `find` serves exactly what `load` serves: a broken user file does not
+    /// shadow a valid system one, a spaced file name is found by its slug id,
+    /// and two files with one id resolve the same way every time.
+    #[test]
+    fn find_selects_what_load_serves() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let user = root.path().join("user");
+        let usr = root.path().join("usr");
+        for dir in [&user, &usr] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        std::fs::write(user.join("bass.toml"), "name = 5\n").expect("write");
+        std::fs::write(usr.join("bass.toml"), "name = \"Bundled bass\"\n").expect("write");
+        std::fs::write(user.join("Bass Boost.toml"), "name = \"Spaced\"\n").expect("write");
+        std::fs::write(user.join("bass-boost.toml"), "name = \"Dashed\"\n").expect("write");
+
+        let dirs = PresetDirs {
+            user: Some(user.clone()),
+            system: vec![usr.clone()],
+        };
+        let (presets, problems) = dirs.load();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        for preset in &presets {
+            let (found, path) = dirs.find(&preset.id).expect("load's ids are findable");
+            assert_eq!(&found, preset);
+            assert!(path.is_file());
+        }
+        let (bass, path) = dirs.find("bass").expect("bass");
+        assert_eq!(bass.name, "Bundled bass");
+        assert_eq!(path, usr.join("bass.toml"));
+        // "Bass Boost.toml" < "bass-boost.toml" (uppercase sorts first).
+        let (boost, path) = dirs.find("bass-boost").expect("bass-boost");
+        assert_eq!(boost.name, "Spaced");
+        assert_eq!(path, user.join("Bass Boost.toml"));
+        assert!(dirs.find("Bass Boost").is_none(), "ids, not file names");
+    }
+
+    /// A directory that exists but cannot be listed marks the scan incomplete;
+    /// a missing one does not.
+    #[test]
+    fn an_unreadable_dir_marks_the_scan_incomplete() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let usr = root.path().join("usr");
+        std::fs::create_dir_all(&usr).expect("mkdir");
+        std::fs::write(usr.join("flat.toml"), "name = \"Flat\"\n").expect("write");
+        // A regular file where the user dir should be: ENOTDIR, deterministic
+        // even when the tests run as root (who would read through chmod 000).
+        let not_a_dir = root.path().join("user");
+        std::fs::write(&not_a_dir, "").expect("write");
+
+        let missing = PresetDirs {
+            user: Some(root.path().join("absent")),
+            system: vec![usr.clone()],
+        };
+        assert!(!missing.scan().incomplete);
+
+        let broken = PresetDirs {
+            user: Some(not_a_dir),
+            system: vec![usr],
+        };
+        let scan = broken.scan();
+        assert!(scan.incomplete);
+        assert_eq!(scan.problems.len(), 1, "{:?}", scan.problems);
+        assert!(scan.presets.contains_key("flat"));
     }
 
     #[test]

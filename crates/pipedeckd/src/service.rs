@@ -91,10 +91,15 @@ impl Daemon {
         if self.presets_dirs.is_empty() {
             return;
         }
-        let (presets, problems) = self.presets_dirs.load();
-        for problem in problems {
+        let scan = self.presets_dirs.scan();
+        for problem in &scan.problems {
             warn!("skipping EQ preset: {problem}");
         }
+        if scan.incomplete {
+            warn!("keeping the previous EQ preset library: a preset directory could not be read");
+            return;
+        }
+        let presets: Vec<Preset> = scan.presets.into_values().map(|(p, _)| p).collect();
         match self.presets.write() {
             Ok(mut guard) => *guard = presets,
             Err(poisoned) => {
@@ -1056,6 +1061,45 @@ mod tests {
         // With no presets dir configured, a rescan must not wipe the library.
         daemon.rescan_presets();
         assert_eq!(daemon.eq_presets().await.len(), 1);
+    }
+
+    /// The rescan doc's promise: an unreadable directory keeps the previous
+    /// library; once it reads again, the rescan replaces it; a directory that
+    /// is merely missing is an empty, complete scan.
+    #[tokio::test]
+    async fn an_unreadable_preset_dir_keeps_the_previous_library() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let user = root.path().join("eq");
+        std::fs::write(&user, "").expect("a file where the dir should be");
+        let daemon = Daemon::new(
+            Arc::new(RwLock::new(State::default())),
+            PwHandle::disconnected(),
+            Config::default(),
+            None,
+            Arc::new(RwLock::new(vec![preset("hd650", "Sennheiser HD 650")])),
+            eq::PresetDirs {
+                user: Some(user.clone()),
+                system: Vec::new(),
+            },
+        );
+        daemon.rescan_presets();
+        assert_eq!(
+            daemon.eq_presets().await,
+            vec![("hd650".to_owned(), "Sennheiser HD 650".to_owned())]
+        );
+
+        std::fs::remove_file(&user).expect("rm");
+        std::fs::create_dir(&user).expect("mkdir");
+        std::fs::write(user.join("flat.toml"), "name = \"Flat\"\n").expect("write");
+        daemon.rescan_presets();
+        assert_eq!(
+            daemon.eq_presets().await,
+            vec![("flat".to_owned(), "Flat".to_owned())]
+        );
+
+        std::fs::remove_dir_all(&user).expect("rm -r");
+        daemon.rescan_presets();
+        assert!(daemon.eq_presets().await.is_empty());
     }
 
     /// SPEC §7.3: NotFound for an unknown node or preset, InvalidArgument for a

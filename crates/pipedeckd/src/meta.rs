@@ -23,6 +23,13 @@ pub const KEY_CONFIGURED_SINK: &str = "default.configured.audio.sink";
 pub const KEY_CONFIGURED_SOURCE: &str = "default.configured.audio.source";
 /// Per-stream routing key read by WirePlumber's node policy.
 pub const KEY_TARGET_OBJECT: &str = "target.object";
+/// Older per-stream routing key: a node **id** (or name), still honoured by
+/// WirePlumber after `target.object`, and written by WirePlumber itself as
+/// `-1` when it links a stream to the default. Read, never written.
+pub const KEY_TARGET_NODE: &str = "target.node";
+/// The deprecated node *property* counterpart of `target.object`: a node id
+/// (or name) the client asked for at connect time.
+pub const PROP_NODE_TARGET: &str = "node.target";
 
 /// SPA type string used for the JSON-encoded default-device values.
 pub const TYPE_SPA_JSON: &str = "Spa:String:JSON";
@@ -32,6 +39,9 @@ pub const TYPE_SPA_JSON: &str = "Spa:String:JSON";
 /// (numeric) or as a `node.name`. We always write `node.name` because it
 /// survives re-plugs and session restarts, so a plain string type is correct.
 pub const TYPE_SPA_STRING: &str = "Spa:String";
+/// SPA type string for a numeric id value — what WirePlumber uses for the
+/// `-1` "follow the default" sentinel.
+pub const TYPE_SPA_ID: &str = "Spa:Id";
 
 #[derive(Debug, Deserialize)]
 struct NameIn {

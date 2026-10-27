@@ -42,6 +42,21 @@ milestones map to the numbered sections of `SPEC.md`.
   sink is `StreamSinks`, shown separately by `pipedeck status`. The GNOME extension does not render
   the field.
 
+### Fixed
+- **"Follow default" now follows the default for streams that picked a sink when they
+  connected** (`pw-play --target`, `PULSE_SINK`). `SetStreamTarget(id, "")` used to delete the
+  `target.object` metadata, and WirePlumber then fell back to the stream's own request, so it
+  snapped straight back. The daemon now writes WirePlumber's `-1` "no target" value when the
+  stream has a request of its own (and still just deletes the key when it doesn't);
+  `target_name` reads `-1` as `""`, and also honours the older `target.node` metadata and
+  `node.target` property (node ids), in WirePlumber's order.
+- **A stream that drops its connect-time target no longer keeps reporting it** in
+  `target_name`.
+- **`pipedeck eq show <id>` shows the preset the daemon actually uses**: a broken user file no
+  longer hides a valid bundled preset of the same id, and a file named `Bass Boost.toml` is
+  found as `bass-boost`. A preset rescan that cannot read a preset directory (permissions)
+  now keeps the previous preset list instead of emptying it.
+
 ## [1.3.0] — 2026-09-07
 
 Loudness safety (SPEC §9).

@@ -49,9 +49,12 @@ The panel is a thin D-Bus client, so a KDE/Sway/CLI front end later is just anot
 - **Stream** = node with `media.class` `Stream/Output/Audio` (playback) — v1 shows playback only,
   capture streams are listed but not rendered. Fields: `id`, `app_name` (`application.name`),
   `binary` (`application.process.binary`), `media_name` (`media.name`), `role` (`media.role`),
-  `target` (the *requested* sink: metadata `target.object`, else the stream node's own
-  `target.object` property — metadata wins — resolved to a `node.name`, "" when neither exists
-  — after 1.3.0; through 1.3.0 the current link won), `observed_sink` (where its links actually
+  `target` (the *requested* sink, in WirePlumber 0.5's own precedence
+  (`linking/find-defined-target.lua`): metadata `target.object`, else metadata `target.node`,
+  else the node property `target.object`, else the deprecated node property `node.target`;
+  a numeric `target.object` is an `object.serial`, a numeric `target.node`/`node.target` a node
+  **id**; resolved to a `node.name` (or reported raw); `-1` or no value at all = "" — after
+  1.3.0; through 1.3.0 the current link won), `observed_sink` (where its links actually
   go — published as `StreamSinks`, SPEC-UI §6.1),
   `volume`, `mute`.
 - Defaults: read/write WirePlumber **metadata object `default`**:
@@ -71,6 +74,12 @@ The panel is a thin D-Bus client, so a KDE/Sway/CLI front end later is just anot
   0.5 resolves either `object.serial` or `node.name`; use `node.name`, it survives reconnects) so
   WirePlumber links it there. If the target sink is absent, leave the stream alone (falls back to
   default) and re-apply when the sink appears.
+- **`SetStreamTarget(id, "")` = follow the default** (1.4.0): if, with the stream's
+  `target.object` metadata gone, nothing else would name a sink (no node `target.object` /
+  `node.target`, no `target.node` other than `-1`), the daemon **deletes** the key; otherwise it
+  **writes `target.object = "-1"`** (`Spa:Id`), WirePlumber's "no target" value, which overrides
+  the client's connect-time request — deleting alone would let WirePlumber fall back to that
+  request and the stream would snap back. A `-1` anywhere reads back as `""`.
 - **Manual targets win** (SPEC-UI §6.2): a stream that received `SetStreamTarget` this session —
   including `""`, "follow default" — is never routed or released by notification routing again.
   The set is in memory only and forgets a stream when its node disappears.
@@ -291,7 +300,12 @@ Also read, read-only: `<dir>/pipedeck/presets/*.toml` for each absolute `<dir>` 
 `$XDG_DATA_DIRS` (default `/usr/local/share:/usr/share`) — where a distro package installs the
 bundled presets (SPEC-UI §6.4). For one id, the user directory wins, then earlier
 `$XDG_DATA_DIRS` entries. Nothing ever writes there: `pipedeck eq import` writes the user dir only;
-`eq show` searches in the same order. With no system directory present the behaviour is the
+`eq show` uses the daemon's own selection — the same file-stem → id slug, the same validation, the
+same precedence — so it shows exactly the file `SetEq` would apply: a user file that fails to
+parse does not shadow a valid system one, and `Bass Boost.toml` is `eq show bass-boost`. Two files
+in one directory that slug to one id: the lexically smaller path wins. A rescan in which an
+existing preset directory cannot be listed (EACCES, not a directory) keeps the previous library;
+a missing directory is simply empty. With no system directory present the behaviour is the
 user-only scan of 1.3.
 ```toml
 name = "Sennheiser HD 650 (AutoEq)"

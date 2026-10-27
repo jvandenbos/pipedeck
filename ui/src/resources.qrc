@@ -1,0 +1,31 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="Main.qml">Main.qml</file>
+        <file alias="DaemonBanner.qml">DaemonBanner.qml</file>
+        <file alias="DeviceEntry.qml">DeviceEntry.qml</file>
+        <file alias="DeviceSection.qml">DeviceSection.qml</file>
+        <file alias="EqSection.qml">EqSection.qml</file>
+        <file alias="LevelSlider.qml">LevelSlider.qml</file>
+        <file alias="MuteButton.qml">MuteButton.qml</file>
+        <file alias="NotifySection.qml">NotifySection.qml</file>
+        <file alias="PercentLabel.qml">PercentLabel.qml</file>
+        <file alias="PickerBox.qml">PickerBox.qml</file>
+        <file alias="PortSelector.qml">PortSelector.qml</file>
+        <file alias="SafetySection.qml">SafetySection.qml</file>
+        <file alias="SectionTitle.qml">SectionTitle.qml</file>
+        <file alias="ShortcutOverlay.qml">ShortcutOverlay.qml</file>
+        <file alias="StatusLine.qml">StatusLine.qml</file>
+        <file alias="StreamEntry.qml">StreamEntry.qml</file>
+        <file alias="StreamSection.qml">StreamSection.qml</file>
+        <file alias="icons/app.svg">icons/app.svg</file>
+        <file alias="icons/mic.svg">icons/mic.svg</file>
+        <file alias="icons/mic-muted.svg">icons/mic-muted.svg</file>
+        <file alias="icons/volume.svg">icons/volume.svg</file>
+        <file alias="icons/volume-muted.svg">icons/volume-muted.svg</file>
+        <file alias="i18n/da.json">i18n/da.json</file>
+        <file alias="i18n/de.json">i18n/de.json</file>
+        <file alias="i18n/es.json">i18n/es.json</file>
+        <file alias="i18n/fr.json">i18n/fr.json</file>
+        <file alias="i18n/nl.json">i18n/nl.json</file>
+    </qresource>
+</RCC>

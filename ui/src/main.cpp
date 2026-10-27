@@ -1,0 +1,110 @@
+// pipedeck-ui — the PipeDeck window for Omarchy: outputs, inputs, per-stream
+// routing, notification routing, EQ and safety, all through pipedeckd.
+
+#include <QGuiApplication>
+#include <QIcon>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickStyle>
+#include <QQuickWindow>
+#include <QSocketNotifier>
+#include <QUrl>
+
+#include <csignal>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "appicons.h"
+#include "backend.h"
+#include "singleinstance.h"
+#include "theme.h"
+#include "translator.h"
+
+#ifndef PIPEDECK_UI_VERSION
+#define PIPEDECK_UI_VERSION "0.0.0"
+#endif
+
+namespace {
+
+int signalPipe[2] = {-1, -1};
+
+void onTerminate(int) {
+    const char byte = 1;
+    // Only write(2) is safe here; the event loop does the actual quitting.
+    [[maybe_unused]] const auto written = ::write(signalPipe[0], &byte, 1);
+}
+
+// SIGTERM (logout, `timeout`, systemd) and SIGINT quit through the event
+// loop, so destructors run and the single-instance lock and socket go away
+// instead of being left for the next launch to clean up.
+void quitOnSignals(QGuiApplication &app) {
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, signalPipe) != 0)
+        return;
+    auto *notifier = new QSocketNotifier(signalPipe[1], QSocketNotifier::Read, &app);
+    QObject::connect(notifier, &QSocketNotifier::activated, &app, [] {
+        char byte;
+        [[maybe_unused]] const auto read = ::read(signalPipe[1], &byte, 1);
+        QGuiApplication::quit();
+    });
+    struct sigaction action = {};
+    action.sa_handler = onTerminate;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGTERM, &action, nullptr);
+    sigaction(SIGINT, &action, nullptr);
+}
+
+} // namespace
+
+int main(int argc, char *argv[]) {
+    QGuiApplication app(argc, argv);
+    app.setApplicationName("pipedeck-ui");
+    app.setApplicationVersion(PIPEDECK_UI_VERSION);
+
+    // Matches the window to pipedeck-ui.desktop, so the compositor (Wayland
+    // app_id) and the launcher pick up the installed icon.
+    app.setDesktopFileName("pipedeck-ui");
+    app.setWindowIcon(QIcon::fromTheme("pipedeck-ui"));
+
+    // The launcher and the keybind both just run the binary; a second run
+    // hands its request to the window that is already open and leaves.
+    SingleInstance instance;
+    if (!instance.becomePrimary())
+        return instance.signalPrimary() ? 0 : 1;
+
+    quitOnSignals(app);
+    QQuickStyle::setStyle("Material");
+
+    // Installed before anything is translated, and every qsTr() binding is
+    // re-evaluated when the Omarchy language changes.
+    Translator translator;
+    app.installTranslator(&translator);
+
+    Theme theme;
+    Backend backend;
+
+    QQmlApplicationEngine engine;
+    engine.addImageProvider("appicon", new AppIconProvider);
+    QObject::connect(&translator, &Translator::changed, &engine, &QQmlEngine::retranslate);
+    engine.rootContext()->setContextProperty("translator", &translator);
+    engine.rootContext()->setContextProperty("theme", &theme);
+    engine.rootContext()->setContextProperty("backend", &backend);
+    engine.load(QUrl("qrc:/Main.qml"));
+    if (engine.rootObjects().isEmpty())
+        return 1;
+
+    auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
+    QObject::connect(&instance, &SingleInstance::showRequested, window, [window](const QString &token) {
+        // Qt's Wayland backend activates with $XDG_ACTIVATION_TOKEN when it is
+        // set, so the token the second launch was given lets the compositor
+        // focus this window rather than just mark it urgent.
+        if (!token.isEmpty())
+            qputenv("XDG_ACTIVATION_TOKEN", token.toUtf8());
+        window->setWindowStates(window->windowStates() & ~Qt::WindowMinimized);
+        window->show();
+        window->raise();
+        window->requestActivate();
+    });
+
+    return app.exec();
+}

@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+mkdir -p "$ROOT/build/tests"
+cd "$ROOT/build/tests"
+
+qmake6 "$ROOT/tests/pipedeck-ui_tests.pro"
+make -j"$(nproc)"
+
+# A private session bus for the fake daemon, so the tests never see (or
+# disturb) a real pipedeckd on the user's bus. Without a display in the
+# environment, and with Qt's portal lookups off, nothing that bus activates
+# (xdg-desktop-portal and its backends) reaches the live desktop either; the
+# GTK platform theme goes too, since it exits the process without a display.
+exec dbus-run-session -- env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_IM_MODULE \
+    QT_QPA_PLATFORM=offscreen QT_NO_XDG_DESKTOP_PORTAL=1 ./pipedeck-ui_tests "$@"

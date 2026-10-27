@@ -1,0 +1,10 @@
+#!/bin/sh
+# Builds and installs the whole `pipedeck` package (daemon, CLI and this UI)
+# from packaging/arch, so the app lands in the launcher (SPEC-UI §7). Where
+# sudo wants a password, run `makepkg -fd` there instead and `pacman -U` the
+# result by hand, or use bin/install-user for a user-level install.
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT/../packaging/arch"
+exec makepkg -fsi "$@"

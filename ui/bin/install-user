@@ -1,0 +1,25 @@
+#!/bin/sh
+# Installs pipedeck-ui for this user only, under ~/.local, until the package
+# is installed (SPEC-UI §7). The daemon and CLI come from the root
+# install.sh; this script only builds and places the window.
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+"$ROOT/bin/build"
+
+BIN="$HOME/.local/bin"
+APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+ICONS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+mkdir -p "$BIN" "$APPS" "$ICONS"
+
+install -m755 "$ROOT/build/pipedeck-ui" "$BIN/pipedeck-ui"
+install -m644 "$ROOT/pkgbuild/pipedeck-ui.svg" "$ICONS/pipedeck-ui.svg"
+# The launcher may not have ~/.local/bin on its PATH, so the user-level entry
+# names the binary by its full path.
+sed "s|^Exec=pipedeck-ui|Exec=$BIN/pipedeck-ui|" "$ROOT/pkgbuild/pipedeck-ui.desktop" > "$APPS/pipedeck-ui.desktop"
+chmod 644 "$APPS/pipedeck-ui.desktop"
+
+command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" || true
+command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "${ICONS%/scalable/apps}" || true
+
+echo "Installed $BIN/pipedeck-ui, $APPS/pipedeck-ui.desktop and $ICONS/pipedeck-ui.svg"

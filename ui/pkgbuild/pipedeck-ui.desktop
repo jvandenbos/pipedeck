@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Name=PipeDeck
+Name[da]=PipeDeck
+Name[de]=PipeDeck
+Name[es]=PipeDeck
+Name[fr]=PipeDeck
+Name[nl]=PipeDeck
+GenericName=Audio routing
+GenericName[da]=Lydrouting
+GenericName[de]=Audio-Routing
+GenericName[es]=Enrutado de audio
+GenericName[fr]=Routage audio
+GenericName[nl]=Audiorouting
+Comment=Route each stream, notifications, ports, EQ and level safety for PipeWire
+Comment[da]=Send hver strøm, notifikationer, porte, EQ og lydniveausikkerhed til den rette udgang i PipeWire
+Comment[de]=Streams, Benachrichtigungen, Ports, EQ und Pegelschutz für PipeWire steuern
+Comment[es]=Enruta cada flujo, notificaciones, puertos, EQ y límites de nivel en PipeWire
+Comment[fr]=Routage de chaque flux, des notifications, ports, EQ et sécurité de niveau pour PipeWire
+Comment[nl]=Routeer elke stream, meldingen, poorten, EQ en niveaubeveiliging voor PipeWire
+Exec=pipedeck-ui
+Icon=pipedeck-ui
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;sound;volume;output;pipewire;equalizer;routing;
+StartupWMClass=pipedeck-ui
+StartupNotify=true

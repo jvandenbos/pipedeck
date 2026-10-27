@@ -1,0 +1,81 @@
+# Maintainer: Jan Vandenbos
+# The whole project in one package (SPEC-UI §7): the pipedeckd daemon, the
+# pipedeck CLI and the pipedeck-ui Qt Quick window. Written to the
+# omacom/omarchy-pkgs gates so it can be copied there as
+# pkgbuilds/pipedeck/{PKGBUILD,pipedeck.install} verbatim.
+pkgname=pipedeck
+pkgver=1.4.0
+pkgrel=1
+pkgdesc='SoundSource-style audio control for PipeWire: per-stream routing, notification sink, ports, EQ, level safety'
+arch=('x86_64' 'aarch64')
+url='https://github.com/jvandenbos/pipedeck'
+license=('MIT')
+# pipewire/wireplumber/qt6-svg/qt6-wayland are needed at run time; the libs
+# after them are what the binaries link directly (readelf NEEDED), listed
+# per Arch's packaging standard rather than left to arrive transitively.
+depends=('pipewire' 'wireplumber' 'alsa-lib' 'qt6-base' 'qt6-declarative' 'qt6-svg'
+         'qt6-wayland' 'hicolor-icon-theme'
+         'libpipewire' 'glibc' 'libgcc' 'libstdc++')
+# clang: bindgen (pipewire-sys, libspa-sys) needs libclang. The PipeWire and
+# ALSA headers come with libpipewire/alsa-lib, which depends already pulls in.
+makedepends=('rust' 'clang' 'pkgconf' 'qt6-base' 'qt6-declarative' 'qt6-svg')
+# dbus-run-session gives the UI tests a private session bus (ui/bin/test).
+checkdepends=('dbus')
+options=('!debug')
+install=pipedeck.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# The v1.4.0 tag does not exist yet; the release step runs `updpkgsums` once
+# the GitHub release is out, and the omarchy-pkgs PR carries the real sum.
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # libspa-sys compiles a C shim with makepkg's CFLAGS; under the default
+  # `lto` option its object holds only GIMPLE and rust-lld cannot resolve
+  # libspa_rs_type_param. Fat objects keep LTO for the C++ side.
+  export CFLAGS+=" -ffat-lto-objects"
+  cargo build --release --locked --workspace
+  ui/bin/build
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # libspa-sys compiles a C shim with makepkg's CFLAGS; under the default
+  # `lto` option its object holds only GIMPLE and rust-lld cannot resolve
+  # libspa_rs_type_param. Fat objects keep LTO for the C++ side.
+  export CFLAGS+=" -ffat-lto-objects"
+  cargo test --release --locked --workspace
+  # Offscreen Qt against a fake daemon on a private bus: needs no display,
+  # no PipeWire and no user session. ui/bin/test strips the display vars.
+  ui/bin/test
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/pipedeckd "$pkgdir/usr/bin/pipedeckd"
+  install -Dm755 target/release/pipedeck "$pkgdir/usr/bin/pipedeck"
+  install -Dm755 ui/build/pipedeck-ui "$pkgdir/usr/bin/pipedeck-ui"
+
+  install -Dm644 packaging/arch/pipedeckd.service "$pkgdir/usr/lib/systemd/user/pipedeckd.service"
+  install -Dm644 packaging/arch/dev.pipedeck.Daemon.service \
+    "$pkgdir/usr/share/dbus-1/services/dev.pipedeck.Daemon.service"
+
+  install -Dm644 ui/pkgbuild/pipedeck-ui.desktop "$pkgdir/usr/share/applications/pipedeck-ui.desktop"
+  install -Dm644 ui/pkgbuild/pipedeck-ui.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/pipedeck-ui.svg"
+
+  # Read by the daemon through $XDG_DATA_DIRS (SPEC-UI §6.4); no first-run copy.
+  install -Dm644 -t "$pkgdir/usr/share/pipedeck/presets" presets/*.toml
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

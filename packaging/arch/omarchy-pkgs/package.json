@@ -1,0 +1,1 @@
+{"source":"local","upstream":{"watch":{"github":"jvandenbos/pipedeck","pattern":"v(?P<version>[0-9]+(?:\\.[0-9]+)*)"}}}

@@ -5,7 +5,13 @@ milestones map to the numbered sections of `SPEC.md`.
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-10-26
+
 ### Added
+- **`pipedeck-ui`**, the Qt Quick window for Omarchy / Hyprland (`ui/`), and the Arch package
+  `pipedeck` (`packaging/arch/PKGBUILD`: daemon, CLI, UI, user unit, D-Bus activation, launcher
+  entry and system presets in one package; SPEC-UI §7). `ui/bin/install-user` installs the UI
+  under `~/.local` without root.
 - `SPEC-UI.md`: the Qt Quick front end for Omarchy / Hyprland (`pipedeck-ui`), reviewed with Codex
   (`docs/2026-10-26-ui-design-review.md`). Daemon and CLI verified to build and run unmodified on Arch
   (PipeWire 1.6.9, WirePlumber 0.5.18); the smart-filter EQ measured working there.
@@ -119,6 +125,8 @@ First public release.
   volume sliders.
 - Docker dev image mirroring the target (Ubuntu 26.04, PipeWire 1.6, Rust 1.93).
 
+[Unreleased]: https://github.com/jvandenbos/pipedeck/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/jvandenbos/pipedeck/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/jvandenbos/pipedeck/releases/tag/v1.3.0
 [1.2.0]: https://github.com/jvandenbos/pipedeck/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jvandenbos/pipedeck/compare/v1.0.1...v1.1.0

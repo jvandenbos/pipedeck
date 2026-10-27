@@ -2,7 +2,7 @@
 
 SoundSource-style audio control for PipeWire desktops: a Quick Settings panel for GNOME Shell with output / input / **notification** device pickers, headphone-vs-speaker port switching, per-application volume, and a parametric equalizer with AutoEq import — built on nothing but libpipewire, WirePlumber and the GNOME Shell APIs.
 
-> **Status:** v1.3.0. Developed and tested on one machine (Ubuntu 26.04.1,
+> **Status:** v1.4.0. Developed and tested on one machine (Ubuntu 26.04.1,
 > GNOME Shell 50.1, PipeWire 1.6.2, WirePlumber 0.5.13, Realtek ALC892 + NVIDIA HDMI). Reports from
 > other cards, Bluetooth devices and multi-channel outputs are welcome. See [CHANGELOG.md](CHANGELOG.md).
 
@@ -30,6 +30,7 @@ pipedeck CLI (Rust, same crate) ─────┘
 - **pipedeckd** — A lightweight daemon that manages all PipeWire interaction via D-Bus
 - **extension** — A GNOME Shell extension that provides the Quick Settings UI
 - **pipedeck CLI** — Command-line tool for scripting and testing
+- **pipedeck-ui** — a Qt Quick window for Omarchy / Hyprland, the same controls without GNOME Shell ([ui/README.md](ui/README.md))
 
 ## Requirements
 
@@ -55,6 +56,33 @@ The install script will:
 3. Install the systemd user service and D-Bus activation file
 4. Copy the GNOME Shell extension to `~/.local/share/gnome-shell/extensions/`
 5. Enable the extension and start the daemon
+
+### Arch / Omarchy
+
+One package, `pipedeck`, carries the daemon, the CLI, `pipedeck-ui` with its launcher entry, the
+systemd user unit, D-Bus activation and the bundled presets (`packaging/arch/`, see its README):
+
+```bash
+cd packaging/arch
+makepkg -fsi                                  # or: makepkg -fd, then sudo pacman -U pipedeck-*.pkg.tar.zst
+systemctl --user enable --now pipedeckd
+```
+
+Without root, install user-level instead: the daemon and CLI with the root script, the window
+with the UI's own:
+
+```bash
+./install.sh --no-extension
+ui/bin/install-user
+```
+
+Then bind a key in `~/.config/hypr/bindings.lua` (the optional floating-window rule is in
+[ui/README.md](ui/README.md)):
+
+```lua
+-- SUPER+CTRL+SHIFT+A opens PipeDeck; SUPER+CTRL+A stays Omarchy's audio panel.
+o.bind("SUPER + CTRL + SHIFT + A", "PipeDeck", "pipedeck-ui")
+```
 
 ### Installation options
 

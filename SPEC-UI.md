@@ -277,8 +277,12 @@ pinned release source + `sha256sums`, every supported `arch`, a clean-chroot bui
   `/usr/share/pipedeck/presets/` (read by the daemon via `$XDG_DATA_DIRS`, §6.4 — no
   first-run copy), LICENSE and README.
   `depends`: `pipewire`, `wireplumber`, `alsa-lib`, `qt6-base`, `qt6-declarative`, `qt6-svg`,
-  `qt6-wayland`, `hicolor-icon-theme`. `makedepends`: `rust`, `clang`, `pkgconf`,
-  `qt6-base`, `qt6-declarative`, `qt6-svg` (nothing from `qt6-tools`).
+  `qt6-wayland`, `hicolor-icon-theme`, plus the directly linked `libpipewire`, `glibc`,
+  `libgcc`, `libstdc++`. `makedepends`: `rust`, `clang`, `pkgconf`,
+  `qt6-base`, `qt6-declarative`, `qt6-svg` (nothing from `qt6-tools`); `checkdepends`: `dbus`
+  (`check()` runs `cargo test` and `ui/bin/test`, which needs no display). `build()`/`check()`
+  add `-ffat-lto-objects` to `CFLAGS`: under makepkg's default `lto`, libspa-sys's C shim is
+  GIMPLE-only and rust-lld fails on `libspa_rs_type_param`.
 - **`packaging/arch/omarchy-pkgs/package.json`** — the `.omarchy/package.json` for that repo:
   `{"source":"local","upstream":{"watch":{"github":"jvandenbos/pipedeck","pattern":"v(?P<version>[0-9]+(?:\\.[0-9]+)*)"}}}`.
 - `ui/bin/install` = `makepkg -fsi` in `packaging/arch/` so the app lands in the launcher.

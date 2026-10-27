@@ -230,11 +230,14 @@ app never writes these.
    - no link → `""`.
 
    **`Streams.target_name` is the *requested* target** — the stream's `target.object`
-   metadata, serial resolved to `node.name` (or the raw value), `""` when there is none
-   ("Follow default"). Through 1.3.0 it returned the live link first, i.e. it was observed state;
-   that changed with this item (CHANGELOG `Changed`). A client-side `target.object` *node
-   property* (`pw-play --target`, `PULSE_SINK`) is not metadata and reads as `""` — the row
-   shows "Follow default · playing on X", which is where WirePlumber put it.
+   metadata, else the stream node's own `target.object` property (the client's connect-time
+   request: `pw-play --target`, `PULSE_SINK`, pipewire-pulse clients), each resolved serial →
+   `node.name` (or the raw value); `""` when neither exists ("Follow default"). Metadata wins
+   when both exist, so a `SetStreamTarget` overrides the client's request — and
+   `SetStreamTarget(id, "")` clears only the metadata, so such a stream then reads as its own
+   node property again, which is what WirePlumber falls back to as well. Through 1.3.0 it
+   returned the live link first, i.e. it was observed state; that changed with this item
+   (CHANGELOG `Changed`).
    CLI: `pipedeck status`/`streams` show `-> requested` and `on: observed` when they differ
    (ASCII arrow, matching the rest of the CLI's output).
 2. **Manual target precedence**: the daemon remembers stream ids it received a

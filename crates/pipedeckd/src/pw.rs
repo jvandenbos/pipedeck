@@ -155,6 +155,10 @@ struct NodeEntry {
     binary: String,
     media_name: String,
     media_role: String,
+    /// The node's own `target.object` property — the client's connect-time
+    /// request (`pw-play --target`, `PULSE_SINK`), distinct from the metadata
+    /// key of the same name that `SetStreamTarget` writes.
+    prop_target: Option<String>,
     virtual_: bool,
     /// One of our own filter-chain nodes (SPEC §7.1): tracked, never published.
     hidden: bool,
@@ -278,24 +282,25 @@ struct Inner {
 }
 
 impl Inner {
-    /// The stream's *requested* sink: its `target.object` metadata, resolved
-    /// from an `object.serial` (what pipewire-pulse writes on a move) to a
-    /// `node.name`, or the raw value when it names nothing we know. `""` means
-    /// no request — follow the default.
+    /// The stream's *requested* sink: its `target.object` metadata, else the
+    /// node's own `target.object` property — see [`links::requested_target`].
     ///
     /// Through 1.3.0 this returned the live link's destination first, so
     /// `Streams.target_name` was observation, not intent; the observation now
     /// lives in [`Inner::observed_sink`] / `StreamSinks` (SPEC-UI §6.1).
     fn resolve_target(&self, stream_id: u32) -> String {
-        let Some(raw) = self.targets.get(&stream_id) else {
-            return String::new();
-        };
-        if let Ok(serial) = raw.parse::<u64>() {
-            if let Some(entry) = self.nodes.values().find(|n| n.serial == Some(serial)) {
-                return entry.name.clone();
-            }
-        }
-        raw.clone()
+        links::requested_target(
+            self.targets.get(&stream_id).map(String::as_str),
+            self.nodes
+                .get(&stream_id)
+                .and_then(|n| n.prop_target.as_deref()),
+            |serial| {
+                self.nodes
+                    .values()
+                    .find(|n| n.serial == Some(serial))
+                    .map(|n| n.name.as_str())
+            },
+        )
     }
 
     /// Where the stream is *actually* playing, from the `Link` globals
@@ -1089,6 +1094,7 @@ fn on_node_global(
             .to_owned(),
         media_name: props.get(keys::MEDIA_NAME).unwrap_or_default().to_owned(),
         media_role: props.get(keys::MEDIA_ROLE).unwrap_or_default().to_owned(),
+        prop_target: props.get(meta::KEY_TARGET_OBJECT).map(str::to_owned),
         virtual_,
         hidden,
         serial: props.get(keys::OBJECT_SERIAL).and_then(|s| s.parse().ok()),
@@ -1534,6 +1540,14 @@ fn on_node_info(inner: &Rc<RefCell<Inner>>, id: u32, props: &spa::utils::dict::D
                 *field = value.to_owned();
                 changed = true;
             }
+        }
+    }
+    // Probably not in the registry whitelist either, so the node `info` is
+    // where it reliably arrives.
+    if let Some(value) = props.get(meta::KEY_TARGET_OBJECT) {
+        if entry.prop_target.as_deref() != Some(value) {
+            entry.prop_target = Some(value.to_owned());
+            changed = true;
         }
     }
     if let Some(value) = props.get(keys::NODE_DESCRIPTION) {

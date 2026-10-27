@@ -49,8 +49,9 @@ The panel is a thin D-Bus client, so a KDE/Sway/CLI front end later is just anot
 - **Stream** = node with `media.class` `Stream/Output/Audio` (playback) — v1 shows playback only,
   capture streams are listed but not rendered. Fields: `id`, `app_name` (`application.name`),
   `binary` (`application.process.binary`), `media_name` (`media.name`), `role` (`media.role`),
-  `target` (the *requested* sink: metadata `target.object` resolved to a `node.name`, "" when
-  none — after 1.3.0; through 1.3.0 the current link won), `observed_sink` (where its links actually
+  `target` (the *requested* sink: metadata `target.object`, else the stream node's own
+  `target.object` property — metadata wins — resolved to a `node.name`, "" when neither exists
+  — after 1.3.0; through 1.3.0 the current link won), `observed_sink` (where its links actually
   go — published as `StreamSinks`, SPEC-UI §6.1),
   `volume`, `mute`.
 - Defaults: read/write WirePlumber **metadata object `default`**:

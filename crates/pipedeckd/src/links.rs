@@ -5,6 +5,8 @@
 //! client can show "-> Headphones · playing on Speaker" when the two differ —
 //! e.g. a requested sink that has gone away and WirePlumber fell back.
 //!
+//! [`requested_target`] is the other half: the request itself.
+//!
 //! Pure: the PipeWire thread hands over its link table and a node lookup.
 
 use std::collections::BTreeSet;
@@ -65,6 +67,39 @@ where
         })
 }
 
+/// The `node.name` a stream *asked* for (`Streams.target_name`), or `""` for
+/// "follow the default".
+///
+/// `metadata` is the stream's `target.object` in the `default` metadata — what
+/// `SetStreamTarget`, notification routing and pipewire-pulse's move write.
+/// `node_prop` is the `target.object` property on the stream node itself —
+/// what `pw-play --target`, `PULSE_SINK` and pipewire-pulse clients set at
+/// connect time. Metadata wins when both exist: WirePlumber prefers it, and a
+/// `SetStreamTarget` has to override what the client asked for. Either value
+/// may be an `object.serial` (resolved through `by_serial`) or a `node.name`;
+/// one that resolves to nothing we know is reported raw rather than dropped,
+/// so a request for an absent sink still shows as a request.
+pub fn requested_target<'a, F>(
+    metadata: Option<&str>,
+    node_prop: Option<&str>,
+    by_serial: F,
+) -> String
+where
+    F: Fn(u64) -> Option<&'a str>,
+{
+    let Some(raw) = metadata
+        .or(node_prop)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return String::new();
+    };
+    raw.parse::<u64>()
+        .ok()
+        .and_then(&by_serial)
+        .map_or_else(|| raw.to_owned(), str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +126,34 @@ mod tests {
                 is_eq: *is_eq,
             })
         })
+    }
+
+    fn request(metadata: Option<&str>, node_prop: Option<&str>) -> String {
+        requested_target(metadata, node_prop, |serial| {
+            (serial == 4711).then_some("hdmi-sink")
+        })
+    }
+
+    #[test]
+    fn metadata_wins_over_the_node_property() {
+        assert_eq!(request(Some(SPEAKER), Some("hdmi-sink")), SPEAKER);
+        // A serial in the metadata resolves too, and still wins.
+        assert_eq!(request(Some("4711"), Some(SPEAKER)), "hdmi-sink");
+    }
+
+    #[test]
+    fn the_node_property_is_used_without_metadata() {
+        assert_eq!(request(None, Some(SPEAKER)), SPEAKER);
+        assert_eq!(request(None, Some("4711")), "hdmi-sink");
+        // An unknown serial or an absent sink is reported raw.
+        assert_eq!(request(None, Some("99")), "99");
+        assert_eq!(request(None, Some("gone-sink")), "gone-sink");
+    }
+
+    #[test]
+    fn no_request_reads_as_follow_default() {
+        assert_eq!(request(None, None), "");
+        assert_eq!(request(None, Some("  ")), "");
     }
 
     #[test]

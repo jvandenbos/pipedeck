@@ -29,7 +29,8 @@ milestones map to the numbered sections of `SPEC.md`.
 
 ### Changed
 - **`Streams.target_name` is now the *requested* target** — the stream's `target.object`
-  metadata (serial resolved to `node.name`), `""` when it has none. Through 1.3.0 it reported the
+  metadata, else the stream node's own `target.object` property (`pw-play --target`,
+  `PULSE_SINK`), metadata winning; serials resolve to `node.name`, `""` when there is neither. Through 1.3.0 it reported the
   live link's destination first, so it was observed state (and read `pipedeck.eq.<sink>` while EQ
   was on). The CLI's `-> <sink>` and anything else reading the field now show intent; the observed
   sink is `StreamSinks`, shown separately by `pipedeck status`. The GNOME extension does not render

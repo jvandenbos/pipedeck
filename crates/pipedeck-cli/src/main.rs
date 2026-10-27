@@ -14,7 +14,7 @@ use futures_util::StreamExt as _;
 use pipedeckd::eq;
 use pipedeckd::route::PortTuple;
 use pipedeckd::state::{
-    AutoMuteTuple, DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, StreamTuple,
+    AutoMuteTuple, DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, StreamSinkTuple, StreamTuple,
 };
 use pipedeckd::volume::{linear_to_percent, percent_to_linear, MAX_VOLUME};
 
@@ -323,7 +323,17 @@ fn eq_labels(eq: &[EqTuple], presets: &[EqPresetTuple]) -> BTreeMap<u32, String>
         .collect()
 }
 
-fn stream_line(stream: &StreamTuple) -> String {
+/// Stream id -> the sink it is actually playing on (SPEC-UI §6.1). An older
+/// daemon without `StreamSinks` yields an empty map, and the lines simply show
+/// no `on:` part.
+fn observed_sinks(rows: Vec<StreamSinkTuple>) -> BTreeMap<u32, String> {
+    rows.into_iter().collect()
+}
+
+/// One stream row: `-> <requested>` when the stream has an explicit target,
+/// then `on: <observed>` when it is playing somewhere else (or has no target
+/// and is simply following the default).
+fn stream_line(stream: &StreamTuple, observed: Option<&str>) -> String {
     let (id, app_name, binary, media_name, target_name, volume, mute) = stream;
     let label = if app_name.is_empty() {
         binary
@@ -331,11 +341,14 @@ fn stream_line(stream: &StreamTuple) -> String {
         app_name
     };
     let muted = if *mute { " [muted]" } else { "" };
-    let target = if target_name.is_empty() {
+    let mut target = if target_name.is_empty() {
         String::new()
     } else {
         format!("  -> {target_name}")
     };
+    if let Some(observed) = observed.filter(|o| !o.is_empty() && o != target_name) {
+        target.push_str(&format!("  on: {observed}"));
+    }
     format!(
         "  {id:>5}  {:>4.0}%  {label}{muted}{target}\n            {media_name}",
         linear_to_percent(*volume)
@@ -351,6 +364,7 @@ async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
     );
     let auto_mute = daemon.auto_mute().await.unwrap_or_default();
     let streams = daemon.streams().await?;
+    let observed = observed_sinks(daemon.stream_sinks().await.unwrap_or_default());
     let notify = daemon.notification_sink().await?;
     let version = daemon.version().await.unwrap_or_default();
 
@@ -392,7 +406,10 @@ async fn status(daemon: &DaemonProxy<'_>) -> Result<()> {
         println!("  (none)");
     }
     for stream in &streams {
-        println!("{}", stream_line(stream));
+        println!(
+            "{}",
+            stream_line(stream, observed.get(&stream.0).map(String::as_str))
+        );
     }
     Ok(())
 }
@@ -437,11 +454,15 @@ async fn list_ports(daemon: &DaemonProxy<'_>) -> Result<()> {
 
 async fn list_streams(daemon: &DaemonProxy<'_>) -> Result<()> {
     let streams = daemon.streams().await?;
+    let observed = observed_sinks(daemon.stream_sinks().await.unwrap_or_default());
     if streams.is_empty() {
         println!("(no streams)");
     }
     for stream in &streams {
-        println!("{}", stream_line(stream));
+        println!(
+            "{}",
+            stream_line(stream, observed.get(&stream.0).map(String::as_str))
+        );
     }
     Ok(())
 }
@@ -467,12 +488,21 @@ async fn eq_command(daemon: &DaemonProxy<'_>, cmd: EqCmd) -> Result<()> {
             Ok(())
         }
         EqCmd::Show { id } => {
-            let dir = eq::presets_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let path = dir.join(format!("{id}.toml"));
+            // Same search order as the daemon: a user preset shadows a
+            // bundled one of the same id (SPEC §7.2).
+            let (dirs, _) = eq::PresetDirs::discover();
+            let searched: Vec<String> = dirs
+                .search_order()
+                .map(|d| d.display().to_string())
+                .collect();
+            let path = dirs.find(&id).ok_or_else(|| {
+                anyhow::anyhow!("no preset `{id}.toml` in {}", searched.join(", "))
+            })?;
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("could not read {}", path.display()))?;
             let preset = eq::parse_preset(&id, &text).map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{}  ({})", preset.name, preset.id);
+            println!("file: {}", path.display());
             println!("preamp: {:+.1} dB", preset.preamp_db);
             if preset.bands.is_empty() {
                 println!("  (no bands — flat)");
@@ -1121,31 +1151,67 @@ mod tests {
 
     #[test]
     fn stream_line_falls_back_to_the_binary_name() {
-        let line = stream_line(&(
-            7,
-            String::new(),
-            "firefox".to_owned(),
-            "Some Track".to_owned(),
-            "sink-a".to_owned(),
-            1.0,
-            false,
-        ));
+        let line = stream_line(
+            &(
+                7,
+                String::new(),
+                "firefox".to_owned(),
+                "Some Track".to_owned(),
+                "sink-a".to_owned(),
+                1.0,
+                false,
+            ),
+            Some("sink-a"),
+        );
         assert!(line.contains("firefox"));
         assert!(line.contains("-> sink-a"));
+        // Requested == observed: no `on:` part.
+        assert!(!line.contains("on:"));
         assert!(line.contains("Some Track"));
 
-        let untargeted = stream_line(&(
-            8,
-            "Firefox".to_owned(),
-            "firefox".to_owned(),
-            "Track".to_owned(),
-            String::new(),
-            1.0,
-            true,
-        ));
+        let untargeted = stream_line(
+            &(
+                8,
+                "Firefox".to_owned(),
+                "firefox".to_owned(),
+                "Track".to_owned(),
+                String::new(),
+                1.0,
+                true,
+            ),
+            None,
+        );
         assert!(untargeted.contains("Firefox"));
         assert!(untargeted.contains("[muted]"));
         assert!(!untargeted.contains("->"));
+        assert!(!untargeted.contains("on:"));
+    }
+
+    /// SPEC-UI §6.1: the observed sink is shown when it differs from the
+    /// request — including "no request, following the default".
+    #[test]
+    fn stream_line_shows_the_observed_sink_when_it_differs() {
+        let stream = |target: &str| {
+            (
+                9,
+                "mpv".to_owned(),
+                "mpv".to_owned(),
+                "song.flac".to_owned(),
+                target.to_owned(),
+                1.0,
+                false,
+            )
+        };
+        let fell_back = stream_line(&stream("hdmi-sink"), Some("speaker-sink"));
+        assert!(fell_back.contains("-> hdmi-sink  on: speaker-sink"));
+
+        let following = stream_line(&stream(""), Some("speaker-sink"));
+        assert!(following.contains("on: speaker-sink"));
+        assert!(!following.contains("->"));
+
+        // Not linked anywhere yet (or an older daemon): nothing extra.
+        assert!(!stream_line(&stream("hdmi-sink"), Some("")).contains("on:"));
+        assert!(!stream_line(&stream("hdmi-sink"), None).contains("on:"));
     }
 
     /// SPEC §9.2: `pipedeck cap` shows, `pipedeck cap <value>` sets — so the

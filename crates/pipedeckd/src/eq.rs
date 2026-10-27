@@ -346,6 +346,109 @@ pub fn load_presets(dir: &Path) -> (Vec<Preset>, Vec<String>) {
     (presets, problems)
 }
 
+/// Where system presets live under each `$XDG_DATA_DIRS` entry (SPEC §7.2):
+/// `<dir>/pipedeck/presets/*.toml`, e.g. `/usr/share/pipedeck/presets/` from
+/// the Arch package.
+pub const SYSTEM_PRESETS_SUBDIR: &str = "pipedeck/presets";
+
+/// The XDG Base Directory default for an unset or empty `$XDG_DATA_DIRS`.
+pub const DEFAULT_XDG_DATA_DIRS: &str = "/usr/local/share:/usr/share";
+
+/// The system preset directories for a given `$XDG_DATA_DIRS`, most important
+/// first.
+///
+/// Relative entries are skipped (the XDG spec says they are invalid) and
+/// repeats dropped — Flatpak and Nix setups routinely list a dir twice.
+#[must_use]
+pub fn system_presets_dirs_from(xdg_data_dirs: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let raw = xdg_data_dirs
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| std::ffi::OsStr::new(DEFAULT_XDG_DATA_DIRS));
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in std::env::split_paths(raw) {
+        if !entry.is_absolute() {
+            continue;
+        }
+        let dir = entry.join(SYSTEM_PRESETS_SUBDIR);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Every directory presets are read from: the user's (writable, wins) and the
+/// system ones (read-only).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PresetDirs {
+    /// `~/.config/pipedeck/eq` — the only directory anything writes to.
+    pub user: Option<PathBuf>,
+    /// `<XDG_DATA_DIRS entry>/pipedeck/presets`, most important first.
+    pub system: Vec<PathBuf>,
+}
+
+impl PresetDirs {
+    /// The directories for this process's environment. A missing config dir
+    /// (no `$HOME`) leaves `user` empty and is reported, not fatal: system
+    /// presets still work.
+    #[must_use]
+    pub fn discover() -> (Self, Option<crate::config::ConfigError>) {
+        let system = system_presets_dirs_from(std::env::var_os("XDG_DATA_DIRS").as_deref());
+        match presets_dir() {
+            Ok(user) => (
+                Self {
+                    user: Some(user),
+                    system,
+                },
+                None,
+            ),
+            Err(e) => (Self { user: None, system }, Some(e)),
+        }
+    }
+
+    /// No directory at all — nothing to scan.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.user.is_none() && self.system.is_empty()
+    }
+
+    /// Search order: user first, then the system dirs in `$XDG_DATA_DIRS`
+    /// order.
+    pub fn search_order(&self) -> impl Iterator<Item = &Path> {
+        self.user
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(self.system.iter().map(PathBuf::as_path))
+    }
+
+    /// Load the merged library, ordered by id. For a given id the first
+    /// directory in [`Self::search_order`] wins, so a user can shadow a bundled
+    /// preset by saving one with the same file name. Missing directories are
+    /// silently empty, exactly like [`load_presets`] — with no system
+    /// directory present this is the user-only scan it always was.
+    #[must_use]
+    pub fn load(&self) -> (Vec<Preset>, Vec<String>) {
+        let mut merged: BTreeMap<String, Preset> = BTreeMap::new();
+        let mut problems = Vec::new();
+        for dir in self.search_order() {
+            let (presets, mut found) = load_presets(dir);
+            problems.append(&mut found);
+            for preset in presets {
+                merged.entry(preset.id.clone()).or_insert(preset);
+            }
+        }
+        (merged.into_values().collect(), problems)
+    }
+
+    /// The file `<id>.toml` that [`Self::load`] would take preset `id` from.
+    #[must_use]
+    pub fn find(&self, id: &str) -> Option<PathBuf> {
+        self.search_order()
+            .map(|dir| dir.join(format!("{id}.toml")))
+            .find(|path| path.is_file())
+    }
+}
+
 /// Write a preset into a presets directory as `<id>.toml`, creating the
 /// directory if needed.
 ///
@@ -432,6 +535,18 @@ pub fn eq_node_name(sink_name: &str) -> String {
 #[must_use]
 pub fn eq_playback_node_name(sink_name: &str) -> String {
     format!("pipedeck.eq.{sink_name}.out")
+}
+
+/// The sink a chain's main node fronts: `pipedeck.eq.<sink>` -> `<sink>`.
+///
+/// `None` for a name that is not one of ours. Only meaningful for the main
+/// node: the `.out` node is a playback stream, never a link destination, so
+/// callers only ever ask about sinks.
+#[must_use]
+pub fn fronted_sink(eq_node_name: &str) -> Option<&str> {
+    eq_node_name
+        .strip_prefix("pipedeck.eq.")
+        .filter(|sink| !sink.is_empty())
 }
 
 /// `node.link-group` (and `filter.smart.name`) shared by both of a chain's
@@ -975,6 +1090,71 @@ gain_db = -1.2
         let (empty, none) = load_presets(&dir.path().join("absent"));
         assert!(empty.is_empty());
         assert!(none.is_empty());
+    }
+
+    /// SPEC §7.2: user presets shadow system ones by id; earlier
+    /// `$XDG_DATA_DIRS` entries shadow later ones; everything else is merged.
+    #[test]
+    fn user_presets_override_system_presets_by_id() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let user = root.path().join("user");
+        let local = root.path().join("local");
+        let usr = root.path().join("usr");
+        for dir in [&user, &local, &usr] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        std::fs::write(user.join("hd650.toml"), "name = \"Mine\"\n").expect("write");
+        std::fs::write(local.join("hd650.toml"), "name = \"Local\"\n").expect("write");
+        std::fs::write(local.join("bass.toml"), "name = \"Local bass\"\n").expect("write");
+        std::fs::write(usr.join("hd650.toml"), "name = \"Bundled\"\n").expect("write");
+        std::fs::write(usr.join("bass.toml"), "name = \"Bundled bass\"\n").expect("write");
+        std::fs::write(usr.join("flat.toml"), "name = \"Flat\"\n").expect("write");
+
+        let dirs = PresetDirs {
+            user: Some(user.clone()),
+            system: vec![local.clone(), usr.clone(), root.path().join("absent")],
+        };
+        let (presets, problems) = dirs.load();
+        assert!(problems.is_empty(), "{problems:?}");
+        let got: Vec<(&str, &str)> = presets
+            .iter()
+            .map(|p| (p.id.as_str(), p.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("bass", "Local bass"), ("flat", "Flat"), ("hd650", "Mine")]
+        );
+        assert_eq!(dirs.find("hd650"), Some(user.join("hd650.toml")));
+        assert_eq!(dirs.find("flat"), Some(usr.join("flat.toml")));
+        assert_eq!(dirs.find("nope"), None);
+
+        // No system dir on disk: identical to the user-only scan.
+        let user_only = PresetDirs {
+            user: Some(user.clone()),
+            system: vec![root.path().join("absent")],
+        };
+        assert_eq!(user_only.load(), load_presets(&user));
+    }
+
+    #[test]
+    fn system_dirs_follow_xdg_data_dirs() {
+        use std::ffi::OsStr;
+        let defaults = vec![
+            PathBuf::from("/usr/local/share/pipedeck/presets"),
+            PathBuf::from("/usr/share/pipedeck/presets"),
+        ];
+        assert_eq!(system_presets_dirs_from(None), defaults);
+        assert_eq!(system_presets_dirs_from(Some(OsStr::new(""))), defaults);
+        assert_eq!(
+            system_presets_dirs_from(Some(OsStr::new(
+                "/opt/share:relative:/usr/share:/opt/share"
+            ))),
+            vec![
+                PathBuf::from("/opt/share/pipedeck/presets"),
+                PathBuf::from("/usr/share/pipedeck/presets"),
+            ]
+        );
+        assert!(PresetDirs::default().is_empty());
     }
 
     #[test]

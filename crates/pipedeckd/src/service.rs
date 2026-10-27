@@ -21,7 +21,8 @@ use crate::error::{Error, Result};
 use crate::pw::PwHandle;
 use crate::route::PortTuple;
 use crate::state::{
-    AlsaCard, AutoMuteTuple, DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, State, StreamTuple,
+    AlsaCard, AutoMuteTuple, DeviceKind, DeviceTuple, EqPresetTuple, EqTuple, State,
+    StreamSinkTuple, StreamTuple,
 };
 use crate::volume::clamp_volume;
 
@@ -50,8 +51,9 @@ pub struct Daemon {
     config_path: Option<std::path::PathBuf>,
     /// The preset library, shared with the PipeWire thread (SPEC §7.3).
     presets: Arc<RwLock<Vec<Preset>>>,
-    /// Where presets are scanned from; `None` disables rescanning.
-    presets_dir: Option<std::path::PathBuf>,
+    /// Where presets are scanned from — the user dir, then the read-only
+    /// system dirs (SPEC §7.2); empty disables rescanning.
+    presets_dirs: eq::PresetDirs,
     /// Cached `Auto-Mute Mode` state per ALSA card (SPEC §8.1). Only ever
     /// touched from the tokio side; the mixer reads and writes behind it run on
     /// `spawn_blocking`, never on the PipeWire thread.
@@ -67,7 +69,7 @@ impl Daemon {
         config: Config,
         config_path: Option<std::path::PathBuf>,
         presets: Arc<RwLock<Vec<Preset>>>,
-        presets_dir: Option<std::path::PathBuf>,
+        presets_dirs: eq::PresetDirs,
     ) -> Self {
         Self {
             state,
@@ -75,7 +77,7 @@ impl Daemon {
             config: Arc::new(Mutex::new(config)),
             config_path,
             presets,
-            presets_dir,
+            presets_dirs,
             auto_mute_cache: Arc::new(Mutex::new(AutoMuteCache::new())),
         }
     }
@@ -86,10 +88,10 @@ impl Daemon {
     /// A directory that cannot be read leaves the previous library in place — a
     /// transient I/O error must not silently empty the panel's preset list.
     fn rescan_presets(&self) {
-        let Some(dir) = self.presets_dir.as_ref() else {
+        if self.presets_dirs.is_empty() {
             return;
-        };
-        let (presets, problems) = eq::load_presets(dir);
+        }
+        let (presets, problems) = self.presets_dirs.load();
         for problem in problems {
             warn!("skipping EQ preset: {problem}");
         }
@@ -508,7 +510,13 @@ impl Daemon {
         self.snapshot().streams_dbus()
     }
 
-    /// Available EQ presets: `(id, name)`, scanned from the presets directory.
+    /// Where each playback stream is actually playing: `(stream id, sink node.name or "")`.
+    #[zbus(property)]
+    async fn stream_sinks(&self) -> Vec<StreamSinkTuple> {
+        self.snapshot().stream_sinks_dbus()
+    }
+
+    /// Available EQ presets: `(id, name)`, scanned from the user and system presets directories.
     #[zbus(property)]
     async fn eq_presets(&self) -> Vec<EqPresetTuple> {
         self.preset_list().iter().map(Preset::to_dbus).collect()
@@ -724,8 +732,8 @@ impl Daemon {
 pub const CHANGED_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Watch the PipeWire thread's revision counter and emit coalesced change
-/// notifications: one `Changed` signal plus `PropertiesChanged` for the two
-/// list properties, at most ten times a second.
+/// notifications: one `Changed` signal plus `PropertiesChanged` for every
+/// graph-derived property, at most ten times a second.
 pub async fn run_change_notifier(
     iface: zbus::object_server::InterfaceRef<Daemon>,
     mut revisions: watch::Receiver<u64>,
@@ -750,6 +758,9 @@ pub async fn run_change_notifier(
         }
         if let Err(e) = guard.streams_changed(emitter).await {
             warn!("could not emit PropertiesChanged for Streams: {e}");
+        }
+        if let Err(e) = guard.stream_sinks_changed(emitter).await {
+            warn!("could not emit PropertiesChanged for StreamSinks: {e}");
         }
         if let Err(e) = guard.ports_changed(emitter).await {
             warn!("could not emit PropertiesChanged for Ports: {e}");
@@ -779,7 +790,7 @@ mod tests {
             Config::default(),
             None,
             Arc::new(RwLock::new(Vec::new())),
-            None,
+            eq::PresetDirs::default(),
         )
     }
 
@@ -824,7 +835,7 @@ mod tests {
             Config::default(),
             None,
             Arc::new(RwLock::new(vec![preset("hd650", "Sennheiser HD 650")])),
-            None,
+            eq::PresetDirs::default(),
         )
     }
 
@@ -854,6 +865,8 @@ mod tests {
         assert!(xml.contains(r#"<property name="Devices" type="a(usssbbdbs)" access="read"/>"#));
         assert!(xml.contains(r#"<property name="Ports" type="a(uussbb)" access="read"/>"#));
         assert!(xml.contains(r#"<property name="Streams" type="a(ussssdb)" access="read"/>"#));
+        // SPEC-UI §6.1.
+        assert!(xml.contains(r#"<property name="StreamSinks" type="a(us)" access="read"/>"#));
         assert!(xml.contains(r#"<property name="NotificationSink" type="s" access="read"/>"#));
         assert!(xml.contains(r#"<property name="Version" type="s" access="read"/>"#));
         assert!(xml.contains(r#"<signal name="Changed">"#));
@@ -1006,7 +1019,7 @@ mod tests {
             },
             None,
             Arc::new(RwLock::new(Vec::new())),
-            None,
+            eq::PresetDirs::default(),
         );
         let devices = daemon.devices().await;
         assert_eq!(devices.len(), 1);
@@ -1028,6 +1041,7 @@ mod tests {
         assert_eq!(daemon.notification_sink().await, "sink-a");
         assert_eq!(daemon.version().await, crate::VERSION);
         assert!(daemon.streams().await.is_empty());
+        assert!(daemon.stream_sinks().await.is_empty());
     }
 
     /// SPEC §7.3: `EqPresets` projects the library, `Eq` projects the snapshot.
@@ -1122,7 +1136,7 @@ mod tests {
             Config::default(),
             None,
             Arc::new(RwLock::new(Vec::new())),
-            None,
+            eq::PresetDirs::default(),
         )
     }
 

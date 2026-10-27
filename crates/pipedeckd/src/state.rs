@@ -45,6 +45,9 @@ impl fmt::Display for DeviceKind {
 pub type DeviceTuple = (u32, String, String, String, bool, bool, f64, bool, String);
 /// D-Bus tuple for one entry of the `Streams` property: `(ussssdb)`.
 pub type StreamTuple = (u32, String, String, String, String, f64, bool);
+/// D-Bus tuple for one entry of the `StreamSinks` property: `(us)` —
+/// `(stream id, node.name of the sink it is linked to, or "")` (SPEC-UI §6.1).
+pub type StreamSinkTuple = (u32, String);
 /// D-Bus tuple for one entry of the `Eq` property: `(us)` — `(node_id, preset
 /// id or "")`, one row per output device (SPEC §7.3).
 pub type EqTuple = (u32, String);
@@ -126,8 +129,13 @@ pub struct Stream {
     pub media_name: String,
     /// `media.role`, kept for notification matching (not on the wire).
     pub role: String,
-    /// `node.name` of the sink this stream is routed to, or "" when unknown.
+    /// The *requested* sink: the stream's `target.object` metadata resolved to
+    /// a `node.name`, or "" when it has none (follow the default).
     pub target_name: String,
+    /// The *observed* sink: where its links actually go, with PipeDeck's own
+    /// EQ filter collapsed to the sink it fronts, or "" when unlinked
+    /// (SPEC-UI §6.1). Published as `StreamSinks`, not in the `Streams` tuple.
+    pub observed_sink: String,
     /// Linear volume, 0.0–3.375 (150 % cubic).
     pub volume: f64,
     /// Mute flag.
@@ -192,6 +200,17 @@ impl State {
             .values()
             .filter(|s| s.playback)
             .map(Stream::to_dbus)
+            .collect()
+    }
+
+    /// `StreamSinks` property payload — playback streams only, like `Streams`,
+    /// ordered by stream id.
+    #[must_use]
+    pub fn stream_sinks_dbus(&self) -> Vec<StreamSinkTuple> {
+        self.streams
+            .values()
+            .filter(|s| s.playback)
+            .map(|s| (s.id, s.observed_sink.clone()))
             .collect()
     }
 
@@ -309,6 +328,7 @@ mod tests {
             media_name: "Playback".to_owned(),
             role: String::new(),
             target_name: "sink-a".to_owned(),
+            observed_sink: "sink-b".to_owned(),
             volume: 1.0,
             mute: false,
             playback,
@@ -480,6 +500,8 @@ mod tests {
         let listed = state.streams_dbus();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0, 1);
+        // SPEC-UI §6.1: `StreamSinks` covers exactly the rows `Streams` does.
+        assert_eq!(state.stream_sinks_dbus(), vec![(1, "sink-b".to_owned())]);
     }
 
     #[test]

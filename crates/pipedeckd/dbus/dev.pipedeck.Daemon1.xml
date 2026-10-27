@@ -91,7 +91,7 @@
    -->
   <property name="Eq" type="a(us)" access="read"/>
   <!--
-   Available EQ presets: `(id, name)`, scanned from the presets directory.
+   Available EQ presets: `(id, name)`, scanned from the user and system presets directories.
    -->
   <property name="EqPresets" type="a(ss)" access="read"/>
   <!--
@@ -106,6 +106,10 @@
    Selectable ports: `(node_id, route_index, name, description, available, active)`.
    -->
   <property name="Ports" type="a(uussbb)" access="read"/>
+  <!--
+   Where each playback stream is actually playing: `(stream id, sink node.name or "")`.
+   -->
+  <property name="StreamSinks" type="a(us)" access="read"/>
   <!--
    Playback streams: `(id, app_name, binary, media_name, target_name, volume, mute)`.
    -->

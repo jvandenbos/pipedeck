@@ -64,18 +64,14 @@ async fn serve() -> Result<()> {
         "loaded config"
     );
 
-    // SPEC §7.2: presets live in `<config dir>/eq/*.toml`. A missing directory
-    // is normal — it just means no EQ presets yet.
-    let presets_dir = match eq::presets_dir() {
-        Ok(dir) => Some(dir),
-        Err(e) => {
-            warn!("running without EQ presets: {e}");
-            None
-        }
-    };
-    let (presets, problems) = presets_dir
-        .as_ref()
-        .map_or_else(|| (Vec::new(), Vec::new()), |dir| eq::load_presets(dir));
+    // SPEC §7.2: presets live in `<config dir>/eq/*.toml`, plus read-only
+    // system presets in `<XDG_DATA_DIRS entry>/pipedeck/presets/*.toml`.
+    // Missing directories are normal — they just contribute no presets.
+    let (presets_dirs, dir_error) = eq::PresetDirs::discover();
+    if let Some(e) = dir_error {
+        warn!("running without user EQ presets: {e}");
+    }
+    let (presets, problems) = presets_dirs.load();
     for problem in &problems {
         warn!("skipping EQ preset: {problem}");
     }
@@ -101,7 +97,7 @@ async fn serve() -> Result<()> {
         config,
         config_path,
         presets,
-        presets_dir,
+        presets_dirs,
     );
 
     // `serve_at` + `request_name` (rather than `name`) so a second instance

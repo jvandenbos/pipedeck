@@ -4,7 +4,9 @@
 //! `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`.
 
 use pipedeckd::route::PortTuple;
-use pipedeckd::state::{AutoMuteTuple, DeviceTuple, EqPresetTuple, EqTuple, StreamTuple};
+use pipedeckd::state::{
+    AutoMuteTuple, DeviceTuple, EqPresetTuple, EqTuple, StreamSinkTuple, StreamTuple,
+};
 
 #[zbus::proxy(
     interface = "dev.pipedeck.Daemon1",
@@ -23,6 +25,10 @@ pub trait Daemon {
     /// `(id, app_name, binary, media_name, target_name, volume, mute)`.
     #[zbus(property)]
     fn streams(&self) -> zbus::Result<Vec<StreamTuple>>;
+
+    /// Where each playback stream is actually playing: `(stream id, sink node.name or "")`.
+    #[zbus(property)]
+    fn stream_sinks(&self) -> zbus::Result<Vec<StreamSinkTuple>>;
 
     /// Available EQ presets: `(id, name)`.
     #[zbus(property)]

@@ -39,7 +39,8 @@ use crate::command::Command;
 use crate::config::Config;
 use crate::eq::{self, Preset};
 use crate::error::{Error, Result};
-use crate::matching::is_notification_stream;
+use crate::links::{self, LinkedNode};
+use crate::matching::{is_notification_stream, plan_notification_routing, RoutingCandidate};
 use crate::meta;
 use crate::route::{
     self, ActiveRoute, Availability, DeviceRoutes, PendingPortSwitch, PendingPortSwitches, Port,
@@ -263,6 +264,11 @@ struct Inner {
     metadata: Option<Rc<MetadataEntry>>,
     /// Stream ids we have pointed at the notification sink, so we can undo it.
     routed: HashSet<u32>,
+    /// Stream ids that received a `SetStreamTarget` this session — including
+    /// `""`, "follow default" — which notification routing must never touch
+    /// again (SPEC-UI §6.2). Dropped with the stream node; never persisted,
+    /// because node ids do not survive a session.
+    manual: HashSet<u32>,
     /// SPEC §9.2: port switches PipeDeck has issued and not yet seen take
     /// effect, each carrying the level cap to apply when it does.
     pending_port_caps: PendingPortSwitches,
@@ -272,15 +278,15 @@ struct Inner {
 }
 
 impl Inner {
+    /// The stream's *requested* sink: its `target.object` metadata, resolved
+    /// from an `object.serial` (what pipewire-pulse writes on a move) to a
+    /// `node.name`, or the raw value when it names nothing we know. `""` means
+    /// no request — follow the default.
+    ///
+    /// Through 1.3.0 this returned the live link's destination first, so
+    /// `Streams.target_name` was observation, not intent; the observation now
+    /// lives in [`Inner::observed_sink`] / `StreamSinks` (SPEC-UI §6.1).
     fn resolve_target(&self, stream_id: u32) -> String {
-        // The live link is the truth; the metadata value is the intent.
-        for (out_node, in_node) in self.links.values() {
-            if *out_node == stream_id {
-                if let Some(entry) = self.nodes.get(in_node) {
-                    return entry.name.clone();
-                }
-            }
-        }
         let Some(raw) = self.targets.get(&stream_id) else {
             return String::new();
         };
@@ -290,6 +296,18 @@ impl Inner {
             }
         }
         raw.clone()
+    }
+
+    /// Where the stream is *actually* playing, from the `Link` globals
+    /// (SPEC-UI §6.1) — see [`links::observed_sink`] for the rules.
+    fn observed_sink(&self, stream_id: u32) -> String {
+        links::observed_sink(stream_id, self.links.values().copied(), |id| {
+            self.nodes.get(&id).map(|n| LinkedNode {
+                name: n.name.as_str(),
+                is_sink: n.role == NodeRole::Sink,
+                is_eq: n.hidden,
+            })
+        })
     }
 
     /// The card, profile-device and route table behind a node, when it has one.
@@ -408,6 +426,7 @@ impl Inner {
                         media_name: entry.media_name.clone(),
                         role: entry.media_role.clone(),
                         target_name: self.resolve_target(*id),
+                        observed_sink: self.observed_sink(*id),
                         volume: entry.volume,
                         mute: entry.mute,
                         playback: entry.role == NodeRole::PlaybackStream,
@@ -715,22 +734,20 @@ impl Inner {
             debug!(sink = %target, "notification sink absent; leaving streams alone");
         }
 
-        let mut to_route: Vec<u32> = Vec::new();
-        let mut to_release: Vec<u32> = Vec::new();
-
-        for (id, entry) in &self.nodes {
-            if !entry.role.is_stream() {
-                continue;
-            }
-            let matches = self.is_notification(entry);
-            if matches && target_present {
-                if self.targets.get(id).map(String::as_str) != Some(target.as_str()) {
-                    to_route.push(*id);
-                }
-            } else if self.routed.contains(id) {
-                to_release.push(*id);
-            }
-        }
+        let candidates: Vec<RoutingCandidate<'_>> = self
+            .nodes
+            .iter()
+            .filter(|(_, entry)| entry.role.is_stream())
+            .map(|(id, entry)| RoutingCandidate {
+                id: *id,
+                is_notification: self.is_notification(entry),
+                target: self.targets.get(id).map(String::as_str),
+                routed_by_us: self.routed.contains(id),
+                manual: self.manual.contains(id),
+            })
+            .collect();
+        let (to_route, to_release) =
+            plan_notification_routing(&candidates, &target, target_present);
 
         for id in to_route {
             debug!(stream = id, sink = %target, "routing notification stream");
@@ -899,6 +916,7 @@ fn run(
         targets: HashMap::new(),
         metadata: None,
         routed: HashSet::new(),
+        manual: HashSet::new(),
         pending_port_caps: PendingPortSwitches::default(),
         default_sink: None,
         default_source: None,
@@ -1472,6 +1490,7 @@ fn on_global_remove(inner: &Rc<RefCell<Inner>>, id: u32) {
     changed |= guard.devices.remove(&id).is_some();
     changed |= guard.links.remove(&id).is_some();
     guard.routed.remove(&id);
+    guard.manual.remove(&id);
     guard.targets.remove(&id);
     // SPEC §9.2: a node that went away can never confirm its switch.
     guard.pending_port_caps.remove_node(id);
@@ -1909,6 +1928,9 @@ fn set_stream_target(inner: &Rc<RefCell<Inner>>, id: u32, name: &str) -> Result<
         guard.targets.insert(id, name.to_owned());
         guard.routed.remove(&id);
     }
+    // SPEC-UI §6.2: from now on this stream's destination is the user's, and
+    // notification routing leaves it alone — for "" as much as for a sink.
+    guard.manual.insert(id);
     guard.publish();
     Ok(())
 }

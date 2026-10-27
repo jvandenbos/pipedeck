@@ -1,0 +1,19 @@
+# Arch / Omarchy variant of ../pipedeckd.service (SPEC-UI §6.3, §7): the
+# package installs the daemon to /usr/bin, not ~/.local/bin. Installed to
+# /usr/lib/systemd/user/; each user enables it (`systemctl --user enable --now
+# pipedeckd`) — a package cannot enable a user service for every user.
+[Unit]
+Description=PipeDeck audio control daemon
+Documentation=https://github.com/jvandenbos/pipedeck
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pipedeckd
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

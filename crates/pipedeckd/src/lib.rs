@@ -6,7 +6,7 @@
 //!
 //! Module layout follows one rule: [`pw`] is the *only* module that links
 //! against libpipewire, and [`alsa_mixer`] is the only one that links against
-//! alsa-lib. Everything else — [`config`], [`eq`], [`matching`], [`meta`],
+//! alsa-lib. Everything else — [`config`], [`eq`], [`links`], [`matching`], [`meta`],
 //! [`route`], [`state`], [`volume`] — is pure data and is unit-tested without a
 //! graph, as are all of [`alsa_mixer`] except its two mixer calls.
 
@@ -17,6 +17,7 @@ pub mod command;
 pub mod config;
 pub mod eq;
 pub mod error;
+pub mod links;
 pub mod matching;
 pub mod meta;
 pub mod pw;

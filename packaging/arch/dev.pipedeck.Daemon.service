@@ -1,0 +1,9 @@
+# Arch / Omarchy variant of ../dev.pipedeck.Daemon.service (SPEC-UI §6.3, §7).
+# Installed to /usr/share/dbus-1/services/. D-Bus activation hands off to the
+# systemd user unit, so the daemon runs under the same unit however it starts;
+# Exec is the real binary rather than /bin/false so activation still works on a
+# session bus that is not systemd-managed.
+[D-BUS Service]
+Name=dev.pipedeck.Daemon
+Exec=/usr/bin/pipedeckd
+SystemdService=pipedeckd.service

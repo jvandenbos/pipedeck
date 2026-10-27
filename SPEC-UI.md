@@ -215,16 +215,45 @@ app never writes these.
 
 ## 6. Daemon changes (additive; existing signatures unchanged)
 1. **`StreamSinks a(us)`** — `(stream id, node.name of the sink it is currently linked to,
-   or "")`, derived from `Link` globals (output port's node → sink node), coalesced like the
-   rest. This is the *observed* destination; `Streams.target_name` stays the *requested* one.
-   CLI: `pipedeck status` shows `→ requested` and `on: observed` when they differ.
+   or "")`, one row per playback stream (same rows as `Streams`), derived from `Link` globals
+   and emitted with the same coalesced `PropertiesChanged` + `Changed` as the rest. This is the
+   *observed* destination. Resolution (`crates/pipedeckd/src/links.rs`):
+   - collect the input nodes of every link whose output node is the stream — the per-channel
+     links (FL, FR, …) collapse to one destination;
+   - only sink nodes count (`Audio/Sink*`); a capture stream recording straight off the
+     playback stream is not a destination;
+   - a destination that is one of PipeDeck's EQ filters (`pipedeck.eq.<sink>`) reports
+     `<sink>`, the physical sink it fronts — the filter is hidden from `Devices` and its
+     playback side is pinned to that sink;
+   - several distinct sinks at once (a fan-out client, or the instant of a move) → the
+     **lowest node id**, so the value does not flicker;
+   - no link → `""`.
+
+   **`Streams.target_name` is the *requested* target** — the stream's `target.object`
+   metadata, serial resolved to `node.name` (or the raw value), `""` when there is none
+   ("Follow default"). Through 1.3.0 it returned the live link first, i.e. it was observed state;
+   that changed with this item (CHANGELOG `Changed`). A client-side `target.object` *node
+   property* (`pw-play --target`, `PULSE_SINK`) is not metadata and reads as `""` — the row
+   shows "Follow default · playing on X", which is where WirePlumber put it.
+   CLI: `pipedeck status`/`streams` show `-> requested` and `on: observed` when they differ
+   (ASCII arrow, matching the rest of the CLI's output).
 2. **Manual target precedence**: the daemon remembers stream ids it received a
-   `SetStreamTarget` for in this session and skips them when (re)applying notification
-   routing. Unit test: an `event` stream with a manual target is not re-targeted by
-   `SetNotificationSink`.
-3. **Arch packaging paths**: `packaging/pipedeckd.service` and the D-Bus activation file must
-   not assume `%h/.local/bin` — add `packaging/arch/` variants with `/usr/bin/pipedeckd`, or
-   template the path in the PKGBUILD.
+   `SetStreamTarget` for in this session — `SetStreamTarget(id, "")` included — and skips them
+   when (re)applying notification routing (`SetNotificationSink`, new streams, hotplug,
+   `Refresh`): never routed, never released. The set is in memory and drops a stream when its
+   node disappears. Unit test (`matching::plan_notification_routing`): an `event` stream with a
+   manual target is not re-targeted by a later `SetNotificationSink`; one without is.
+3. **Arch packaging paths**: `packaging/arch/pipedeckd.service` (user unit,
+   `ExecStart=/usr/bin/pipedeckd`) and `packaging/arch/dev.pipedeck.Daemon.service` (D-Bus
+   activation, `Exec=/usr/bin/pipedeckd`, `SystemdService=pipedeckd.service`). The top-level
+   `packaging/*.service` stay as they are for `install.sh` on Ubuntu (`%h/.local/bin`).
+4. **System presets directory**: besides `~/.config/pipedeck/eq/*.toml`, the daemon reads
+   `<dir>/pipedeck/presets/*.toml` for each absolute `<dir>` in `$XDG_DATA_DIRS` (default
+   `/usr/local/share:/usr/share`), read-only — so the package's `/usr/share/pipedeck/presets/`
+   is live without a first-run copy. For one preset id the user directory wins, then earlier
+   `$XDG_DATA_DIRS` entries. `EqPresets` lists the merged set; `pipedeck eq import` still writes
+   only the user dir; `eq show` searches in the same order. No system dir present = the 1.3
+   behaviour exactly.
 Everything else the UI needs exists in 1.3.0 (`Devices`, `Streams`, `Ports`, `Eq`,
 `EqPresets`, `AutoMute`, `NotificationSink`, `PortSwitchCap`, `Version`, the setters).
 

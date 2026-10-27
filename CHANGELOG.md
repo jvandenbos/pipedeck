@@ -9,6 +9,31 @@ milestones map to the numbered sections of `SPEC.md`.
 - `SPEC-UI.md`: the Qt Quick front end for Omarchy / Hyprland (`pipedeck-ui`), reviewed with Codex
   (`docs/2026-10-26-ui-design-review.md`). Daemon and CLI verified to build and run unmodified on Arch
   (PipeWire 1.6.9, WirePlumber 0.5.18); the smart-filter EQ measured working there.
+- **`StreamSinks a(us)`** D-Bus property (SPEC-UI §6.1): where each playback stream is
+  *actually* playing, `(stream id, sink node.name or "")`, derived from PipeWire `Link` globals.
+  Per-channel links collapse to one destination, PipeDeck's own EQ filter resolves to the physical
+  sink it fronts, and a stream linked to two sinks at once reports the lower node id. Emitted with
+  `PropertiesChanged` + `Changed` like the other properties. `pipedeck status`/`streams` print
+  `on: <sink>` after the requested target when the two differ.
+- **Manual stream targets beat notification routing** (SPEC-UI §6.2): a stream that received
+  `SetStreamTarget` this session — `""` ("follow default") included — is never re-targeted or
+  released by notification routing, on `SetNotificationSink`, new streams or hotplug. Forgotten
+  when the stream goes away.
+- **System EQ presets** (SPEC-UI §6.4, SPEC §7.2): `<dir>/pipedeck/presets/*.toml` for each
+  `$XDG_DATA_DIRS` entry (default `/usr/local/share:/usr/share`) is read alongside
+  `~/.config/pipedeck/eq/`, read-only; a user preset with the same id wins. `pipedeck eq import`
+  still writes the user directory only; `eq show` finds system presets too.
+- **Arch packaging units** (SPEC-UI §6.3): `packaging/arch/pipedeckd.service` and
+  `packaging/arch/dev.pipedeck.Daemon.service` run `/usr/bin/pipedeckd`; the `%h/.local/bin`
+  units stay for `install.sh`.
+
+### Changed
+- **`Streams.target_name` is now the *requested* target** — the stream's `target.object`
+  metadata (serial resolved to `node.name`), `""` when it has none. Through 1.3.0 it reported the
+  live link's destination first, so it was observed state (and read `pipedeck.eq.<sink>` while EQ
+  was on). The CLI's `-> <sink>` and anything else reading the field now show intent; the observed
+  sink is `StreamSinks`, shown separately by `pipedeck status`. The GNOME extension does not render
+  the field.
 
 ## [1.3.0] — 2026-09-07
 

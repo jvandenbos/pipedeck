@@ -49,7 +49,9 @@ The panel is a thin D-Bus client, so a KDE/Sway/CLI front end later is just anot
 - **Stream** = node with `media.class` `Stream/Output/Audio` (playback) — v1 shows playback only,
   capture streams are listed but not rendered. Fields: `id`, `app_name` (`application.name`),
   `binary` (`application.process.binary`), `media_name` (`media.name`), `role` (`media.role`),
-  `target` (node name it is routed to, from metadata `target.object` or its current link),
+  `target` (the *requested* sink: metadata `target.object` resolved to a `node.name`, "" when
+  none — after 1.3.0; through 1.3.0 the current link won), `observed_sink` (where its links actually
+  go — published as `StreamSinks`, SPEC-UI §6.1),
   `volume`, `mute`.
 - Defaults: read/write WirePlumber **metadata object `default`**:
   `default.configured.audio.sink` / `default.configured.audio.source` with value
@@ -68,6 +70,9 @@ The panel is a thin D-Bus client, so a KDE/Sway/CLI front end later is just anot
   0.5 resolves either `object.serial` or `node.name`; use `node.name`, it survives reconnects) so
   WirePlumber links it there. If the target sink is absent, leave the stream alone (falls back to
   default) and re-apply when the sink appears.
+- **Manual targets win** (SPEC-UI §6.2): a stream that received `SetStreamTarget` this session —
+  including `""`, "follow default" — is never routed or released by notification routing again.
+  The set is in memory only and forgets a stream when its node disappears.
 - Optional convenience: `create_notification_sink = true` creates a null sink named
   `pipedeck.notifications` via a PipeWire `adapter` node (`support.null-audio-sink`) — v1.1.
 
@@ -89,6 +94,10 @@ Properties (read-only, emit PropertiesChanged):
   Devices        a(usssbbdbs)  (id, name, description, kind, is_default, virtual, volume, mute, nick)
                                nick = node.nick, falling back to description (ALSA descriptions truncate)
   Streams        a(ussssdb)    (id, app_name, binary, media_name, target_name, volume, mute)
+                               target_name = the *requested* sink (metadata), "" = follow default
+  StreamSinks    a(us)         (stream id, node.name of the sink it is linked to, or "") — the
+                               *observed* destination, from Link globals; PipeDeck's EQ filter
+                               resolves to the sink it fronts (SPEC-UI §6.1, after 1.3.0)
   NotificationSink  s          node.name or ""
   Version        s
 
@@ -276,6 +285,13 @@ Filters), and `libpipewire-module-filter-chain` is present. Design:
   and when the sink (re)appears. Unknown preset name → log warn, treat as off.
 
 ### 7.2 Preset files — `~/.config/pipedeck/eq/<slug>.toml`
+
+Also read, read-only: `<dir>/pipedeck/presets/*.toml` for each absolute `<dir>` in
+`$XDG_DATA_DIRS` (default `/usr/local/share:/usr/share`) — where a distro package installs the
+bundled presets (SPEC-UI §6.4). For one id, the user directory wins, then earlier
+`$XDG_DATA_DIRS` entries. Nothing ever writes there: `pipedeck eq import` writes the user dir only;
+`eq show` searches in the same order. With no system directory present the behaviour is the
+user-only scan of 1.3.
 ```toml
 name = "Sennheiser HD 650 (AutoEq)"
 preamp_db = -6.4
@@ -296,7 +312,8 @@ TOML, prints the id. Unit-tested against a real AutoEq sample embedded in the te
 ### 7.3 D-Bus additions (interface `dev.pipedeck.Daemon1`, existing signatures unchanged)
 ```
 Properties:
-  EqPresets   a(ss)    (id, name) — scanned from the presets dir (rescanned on Refresh and on SetEq)
+  EqPresets   a(ss)    (id, name) — scanned from the user + system preset dirs (§7.2; rescanned
+                       on Refresh and on SetEq)
   Eq          a(us)    (node_id, preset id or "") — one row per output device
 Methods:
   SetEq(node_id u, preset s)     "" = off. NotFound for unknown node/preset; InvalidArgument for

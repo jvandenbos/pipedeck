@@ -246,3 +246,34 @@ Use an xdg toplevel. The proposed controls and file chooser benefit from ordinar
 Document optional float/size rules; make pinning optional. Specify single-instance activation and test activation through the launcher and keybind. Escape should dismiss transient controls before closing anything; `Q` must not quit while typing in a field.
 
 **My v1:** outputs/inputs, nested ports, stream volume/mute/routing, notification target, existing cap controls, and EQ preset/off only if validated. Cut meters, bar integration, CLI replacement, bundled generic EQ and in-app AutoEq import. Keep import in the existing CLI initially. That delivers the missing capabilities without turning this into a desktop audio-stack redesign.
+
+---
+
+## Pre-build quick review (same day, Codex)
+
+### Brief
+
+Quick pre-build review of SPEC-UI.md in this repo (PipeDeck's Qt front end for Omarchy). You reviewed the design earlier today (docs/2026-10-26-ui-design-review.md); the decisions are folded into SPEC-UI.md. We build it in the next hour with coding agents. I want the top implementability gaps only — things an implementer would hit or get wrong — ranked, under 450 words, no restating what is fine.
+
+Facts since your last pass:
+- Build host is this Omarchy 4.5 box: Qt 6.12 (qt6-base, qt6-declarative, qt6-svg, qt6-wayland), NO qt6-tools, so no qdbusxml2cpp and no lupdate/lrelease. Plan: a hand-written QDBusAbstractInterface proxy + a unit test that parses crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml and asserts the proxy covers every method/property/signal with matching signatures. Translations are JSON per the Omarchy app guide (~/.claude/skills/omarchy-app/SKILL.md + templates.md), not .ts.
+- sudo needs a password, so the package is built with makepkg but installed by Jan; the session installs user-level (~/.local/bin, ~/.local/share/applications, ~/.config/systemd/user, ~/.local/share/dbus-1/services) to run it today.
+- Target: pass omacom/omarchy-pkgs PR gates (README in /tmp/.../scratchpad/omarchy-pkgs/README.md; hype/omacut PKGBUILDs there too): release-tarball source + sha256, arch=(x86_64 aarch64), options=('!debug'), complete makedepends for a clean-chroot build (rust, clang, pkgconf, qt6-base, qt6-declarative), .install for icon cache, .omarchy/package.json with a GitHub release watch. PKGBUILD will live at packaging/arch/ (whole project = one package `pipedeck`), desktop file + svg under ui/pkgbuild/.
+- Presets: the pacman package installs bundled presets to /usr/share/pipedeck/presets; the daemon today reads only ~/.config/pipedeck/eq. Plan: daemon also scans $XDG_DATA_DIRS/pipedeck/presets read-only, user dir wins on id collision (additive, §6).
+- Keybind decided: SUPER+CTRL+SHIFT+A.
+
+Look especially at: §5 reconnect/coalescing semantics vs what QtDBus actually gives you (PropertiesChanged on org.freedesktop.DBus.Properties — check whether the daemon emits it or only its own `Changed` signal: read crates/pipedeckd/src), §4.3 observed-vs-requested derivation from Link globals (edge cases: EQ filter in between — the stream links to pipedeck.eq.<sink>, not the sink; what should StreamSinks report?), §4.1 cubic slider vs the daemon's volume units (read SetVolume/Devices in the XML and src), the single-instance socket, and anything in §7/§8 that a clean chroot build would reject.
+
+### Codex reply (verbatim)
+
+1. **§4.3/§6: `Streams.target_name` is not requested state today.** In [pw.rs](/home/janv/Work/pipedeck/crates/pipedeckd/src/pw.rs:275), `resolve_target()` returns the first live link’s destination **before** consulting target metadata. Consequently, “Follow default” reports a sink, and fallback hides the absent requested sink. Split intent from observation explicitly; changing this projection is required alongside adding `StreamSinks`. For observed routing, collapse PipeDeck’s known EQ chain to its physical destination using the daemon’s EQ-instance mapping; reporting `pipedeck.eq.<sink>` would reference a hidden picker entry. Define unlinked as `""`, deduplicate channel links, and specify deterministic handling of multiple destinations.
+
+2. **§5: specify one refresh/reconnect state machine.** [service.rs](/home/janv/Work/pipedeck/crates/pipedeckd/src/service.rs:748) emits **both** standard `PropertiesChanged` and custom `Changed`, including separate property emissions per graph update. Subscribe before the initial snapshot; explicitly connect the standard Properties interface. Funnel notifications into one coalescer with one refresh in flight and a trailing dirty flag. Tag replies with an owner generation and reject obsolete callbacks, including direct owner replacement. “Drop pending writes” must distinguish unsent work from already dispatched calls. Define release ordering too: an older observed value must not overwrite the final slider request before its echo arrives.
+
+3. **§2/§7/§8 still direct agents toward the superseded build.** Fold in the supplied decisions before handoff: handwritten proxy plus XML coverage test; JSON translations; `packaging/arch/PKGBUILD`; `makepkg` without installation; separate user installation; XDG preset scanning instead of first-run copying. Pin the release source/checksum, architectures, `!debug`, icon hook, watch metadata, and complete dependencies. Specify `QT += dbus network …`; the socket needs Qt Network. The fake-bus test target must exclude production `main.cpp` rather than literally compiling every source.
+
+4. **§5/§8: define QtDBus decoding, not just signature coverage.** Arrays of structs such as `a(usssbbdbs)` need registered tuple/list metatypes and D-Bus stream operators, or explicit `QDBusArgument` decoding. Require asynchronous `Properties.GetAll/Get` and wire-level fake-daemon round trips; a proxy/XML comparison alone cannot verify decoding.
+
+5. **§2: socket ownership and crash recovery are unspecified.** Add a lock around primary election/stale-socket recovery, bounded activation acknowledgement, and restore/show/raise behavior. Never unlink merely because `listen()` fails: Qt explicitly warns against removing a running instance’s socket. [Qt documentation](https://doc.qt.io/qt-6/qlocalserver.html)
+
+6. **§4.1/§4.6: finish the volume contract.** Specify writes as `(percent/100)^3`: 50% → `0.125`, 150% → `3.375`; `PortSwitchCap` instead takes integer percentages. Define displaying externally observed overdrive with the toggle off without writing a clamp back.

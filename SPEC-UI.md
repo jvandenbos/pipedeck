@@ -80,19 +80,30 @@ fallback, and anything that touches Omarchy's own config or `/usr/share/omarchy-
   `Translator` classes): `ui/pipedeck-ui.pro`, `ui/bin/{build,test,install}`,
   `ui/src/{main.cpp,backend.h,backend.cpp,daemon.h,daemon.cpp,theme.*,translator.*,
   Main.qml,*.qml,resources.qrc,i18n/}`, `ui/tests/`, `ui/pkgbuild/`. `src/` stays flat.
-- **C++ owns everything that can fail**: the D-Bus proxy (generated from
-  `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml` with `qdbusxml2cpp` at build time — the
-  XML is the contract), the model (devices, ports, streams, EQ, caps as `QAbstractListModel`s
-  or `QVariantList` properties with `NOTIFY`), coalescing, reconnection, error text.
-  **QML owns layout and keys only.**
+- **C++ owns everything that can fail**: the D-Bus proxy, the model (devices, ports,
+  streams, EQ, caps as `QAbstractListModel`s or `QVariantList` properties with `NOTIFY`),
+  coalescing, reconnection, error text. **QML owns layout and keys only.**
+- **D-Bus proxy is hand-written** (`daemon.h/.cpp`, a `QDBusAbstractInterface` subclass):
+  the build host has no `qt6-tools`, so no `qdbusxml2cpp`, and the interface is small
+  (9 methods, 10 properties, 1 signal). `crates/pipedeckd/dbus/dev.pipedeck.Daemon1.xml`
+  stays the contract: a unit test parses it and asserts every method, property and signal
+  is covered with the same signature. Every struct-array property (`a(usssbbdbs)` etc.) gets
+  a registered tuple type with `QDBusArgument` stream operators, and the fake-daemon tests
+  round-trip each one at wire level — signature coverage alone does not prove decoding.
+  Property reads go through `org.freedesktop.DBus.Properties` `GetAll`/`Get`,
+  asynchronously. qmake: `QT += quick quickcontrols2 dbus network svg`.
 - `QGuiApplication`, `setDesktopFileName("pipedeck-ui")`, Material dark style, accent and
   corner radius from the Omarchy theme with the guide's fallbacks, strings through `qsTr`,
   language from `~/.config/omarchy/language`. Never modify Omarchy's config.
 - No shelling out to `wpctl`/`pactl`/`pw-cli` from the app (platform-library rule, SPEC §4).
   The one exception is `hyprctl getoption decoration:rounding` via `QProcess`, as the guide
   prescribes for the corner radius.
-- **Single instance**: a `QLocalServer` on `$XDG_RUNTIME_DIR/pipedeck-ui.sock`; a second
-  launch asks the first to raise/show and exits. Launcher and keybind both go through this.
+- **Single instance**: a `QLocalServer` on `$XDG_RUNTIME_DIR/pipedeck-ui.sock`, guarded by
+  a `QLockFile` (`pipedeck-ui.lock`) for primary election: the lock holder listens; a second
+  launch connects, sends `show`, waits ≤1 s for `ok`, and exits. A stale socket is removed
+  **only** after the lock was acquired (Qt warns never to unlink a running instance's socket
+  just because `listen()` failed). `show` = restore from minimised, `requestActivate()`,
+  raise. Launcher and keybind both go through this.
 
 ## 3. Ownership contract — who decides what on a laptop
 
@@ -129,6 +140,12 @@ text field has focus; `Esc` closes an open picker first, then the window.
 - Default radio → `SetDefault("sink", name)`. Slider → `SetVolume` coalesced to ≤20/s while
   dragging, final value on release; mute → `SetMute`. Volume and mute are independent writes
   (SPEC §9.1 — the UI never sends a cached mute with a volume).
+- **Volume contract**: the daemon speaks linear volume (`Devices.volume`, `SetVolume` take
+  `d`, 1.0 = 100 %). The slider position is `pos = (vol)^(1/3)` and a write is
+  `vol = (percent/100)^3` — 50 % → 0.125, 100 % → 1.0, 150 % → 3.375. An observed volume
+  above the slider's range (overdrive set elsewhere while the §4.6 toggle is off) is shown
+  at the slider's end with the real percentage in the label; the UI never writes a clamp
+  back on its own.
 
 ### 4.2 Inputs
 Same row shape for `kind=source`, no EQ badge, no auto-mute switch.
@@ -161,7 +178,7 @@ only; the daemon rejects the rest with `InvalidArgument`, which the UI shows (§
 
 ### 4.6 Safety
 - **Port-switch cap**: a spin box 0–150 % / Off bound to `PortSwitchCap` / `SetPortSwitchCap`
-  (D-Bus surface added in 1.3.0 — confirm the exact signature from the XML).
+  — `u`, an integer **percentage**, 0 = off (unlike `SetVolume`, which is linear `d`).
 - **Allow up to 150 %**: UI-only toggle (QSettings `ui/allowOverdrive`) that widens sliders
   from 100 % to 150 % (linear 3.375). It enforces nothing in the daemon.
 
@@ -176,17 +193,25 @@ app never writes these.
 - All D-Bus calls **asynchronous** (`QDBusPendingCallWatcher`); errors surface in a status
   line at the bottom of the window with the daemon's error name and message, and clear on
   the next successful call. No modal dialogs for errors.
-- On start: `GetAll` snapshot, then `PropertiesChanged` and `Changed` keep the model current;
-  on `Changed` the client re-reads only the properties it uses (coalesced to ≤10/s).
+- **One refresh state machine.** The daemon emits both standard
+  `org.freedesktop.DBus.Properties.PropertiesChanged` (one per changed property) and its own
+  `Changed` after each coalesced graph update (`service.rs`). The client subscribes to both
+  **before** the initial `GetAll` snapshot, funnels them into one coalescer with **one refresh
+  in flight and a trailing dirty flag**, and re-reads only the properties it uses (≤10/s).
+  Every reply is tagged with an **owner generation** (bumped on each `NameOwnerChanged`,
+  including direct owner replacement) and dropped when stale.
 - Daemon absent: show "PipeDeck daemon not running" + a **Start** button that calls
   `org.freedesktop.DBus.StartServiceByName` (D-Bus activation, §7). On `NameOwnerChanged` →
-  lost: grey the window, drop every pending write; → gained: full snapshot again. **Never
-  replay queued slider writes across a reconnect** — node ids are new.
+  lost: grey the window, drop every **unsent** write (a call already dispatched simply has
+  its reply ignored via the generation tag); → gained: full snapshot again. **Never replay
+  queued slider writes across a reconnect** — node ids are new.
 - A pending write for a node that vanished is discarded, with no error shown.
 - Older daemon: a missing property or method (`UnknownProperty`/`UnknownMethod`) hides that
   control instead of failing the window; `Version` is shown in Status.
-- Sliders: while dragging, show the local value; on release and on every observed change,
-  reconcile to the daemon's value (last observed wins after 300 ms of no local input).
+- Sliders: while dragging, show the local value; on release send the final value and keep
+  showing it until either its echo arrives in a snapshot or 300 ms pass with no local input
+  — an *older* observed value arriving in between must not overwrite the final request.
+  After that, last observed wins.
 
 ## 6. Daemon changes (additive; existing signatures unchanged)
 1. **`StreamSinks a(us)`** — `(stream id, node.name of the sink it is currently linked to,
@@ -204,26 +229,44 @@ Everything else the UI needs exists in 1.3.0 (`Devices`, `Streams`, `Ports`, `Eq
 `EqPresets`, `AutoMute`, `NotificationSink`, `PortSwitchCap`, `Version`, the setters).
 
 ## 7. Packaging (Arch / Omarchy)
-- `ui/pkgbuild/PKGBUILD` builds **one package `pipedeck`** from the repo (release tarball
-  once tagged): cargo-builds `pipedeckd` + `pipedeck`, qmake-builds `pipedeck-ui`, installs
-  the systemd user unit and `dev.pipedeck.Daemon.service` D-Bus activation file with
-  `/usr/bin` paths, `pipedeck-ui.desktop`, `pipedeck-ui.svg`, the bundled presets to
-  `/usr/share/pipedeck/presets/` (the daemon still reads `~/.config/pipedeck/eq/`; the
-  installer copies them there on first run as `install.sh` does today). `depends`: `pipewire`,
-  `wireplumber`, `alsa-lib`, `qt6-base`, `qt6-declarative`, `qt6-svg`, `qt6-wayland`;
-  `makedepends`: `cargo`, `clang`, `pkgconf`, `qt6-tools` (for `qdbusxml2cpp`? — it ships in
-  `qt6-base` on Arch; verify at build time).
-- `ui/bin/install` = `makepkg -fsi` so the app lands in the launcher. The user unit is
-  enabled by a post-install note, not by the package (user services are per user).
+Written to pass the `omacom/omarchy-pkgs` PR gates (its README: Arch packaging standards,
+pinned release source + `sha256sums`, every supported `arch`, a clean-chroot build, valid
+`.omarchy/package.json`); the recipe lives here so it can be copied into that repo verbatim.
+- **`packaging/arch/PKGBUILD`** builds **one package `pipedeck`** (the whole project — daemon,
+  CLI, UI — so it does not belong under `ui/`): `source=` the GitHub release tarball
+  `v$pkgver`, `sha256sums` filled with `updpkgsums`, `arch=('x86_64' 'aarch64')`,
+  `options=('!debug')`, `license=('MIT')`, `install=pipedeck.install` (desktop-database +
+  icon-cache refresh, as hype/omacut do). `build()` runs `cargo build --release --locked
+  --workspace` then `ui/bin/build`; `package()` installs `/usr/bin/{pipedeckd,pipedeck,
+  pipedeck-ui}`, `/usr/lib/systemd/user/pipedeckd.service` and
+  `/usr/share/dbus-1/services/dev.pipedeck.Daemon.service` from `packaging/arch/`,
+  `ui/pkgbuild/pipedeck-ui.desktop` → `/usr/share/applications/`, `ui/pkgbuild/pipedeck-ui.svg`
+  → `/usr/share/icons/hicolor/scalable/apps/`, the bundled presets →
+  `/usr/share/pipedeck/presets/` (read by the daemon via `$XDG_DATA_DIRS`, §6.4 — no
+  first-run copy), LICENSE and README.
+  `depends`: `pipewire`, `wireplumber`, `alsa-lib`, `qt6-base`, `qt6-declarative`, `qt6-svg`,
+  `qt6-wayland`, `hicolor-icon-theme`. `makedepends`: `rust`, `clang`, `pkgconf`,
+  `qt6-base`, `qt6-declarative`, `qt6-svg` (nothing from `qt6-tools`).
+- **`packaging/arch/omarchy-pkgs/package.json`** — the `.omarchy/package.json` for that repo:
+  `{"source":"local","upstream":{"watch":{"github":"jvandenbos/pipedeck","pattern":"v(?P<version>[0-9]+(?:\\.[0-9]+)*)"}}}`.
+- `ui/bin/install` = `makepkg -fsi` in `packaging/arch/` so the app lands in the launcher.
+  **On a box where sudo wants a password (gargoyle) the session builds with `makepkg -fd`
+  and Jan runs `pacman -U`**; until then `ui/bin/install-user` installs the UI under
+  `~/.local/{bin,share/applications,share/icons/hicolor/scalable/apps}` and the root
+  `install.sh` keeps installing the daemon/CLI user-level. The user unit is enabled by a
+  post-install note, not by the package.
 - `install.sh` / `Makefile` at the root keep working on Ubuntu/GNOME; they do not build `ui/`.
 - Publishing to `omacom/omarchy-pkgs` is **out of scope** until Jan says so (outward-facing).
 
 ## 8. Build and test
 - `ui/bin/build` → `build/pipedeck-ui`; `ui/bin/test` → Qt Test offscreen
-  (`QT_QPA_PLATFORM=offscreen`), compiling `../src/*.cpp` directly, with a **fake daemon**:
-  a small in-process `QDBusAbstractAdaptor` serving `dev.pipedeck.Daemon1` on the test's
-  private bus (`dbus-run-session`), so model/coalescing/reconnect logic is tested without
-  PipeWire. Theme/Translator tests take temp directories as the guide prescribes.
+  (`QT_QPA_PLATFORM=offscreen`), compiling the `../src/*.cpp` it needs **except `main.cpp`**,
+  with a **fake daemon**: a small in-process `QDBusAbstractAdaptor` serving
+  `dev.pipedeck.Daemon1` on the test's private bus (`dbus-run-session`), so model,
+  decoding, coalescing and reconnect logic (owner-generation drops, unsent-write discard,
+  the §5 slider ordering) are tested without PipeWire. Theme/Translator tests take temp
+  directories as the guide prescribes. Translations are JSON (`src/i18n/<code>.json`) per
+  the guide — no `lupdate`/`lrelease` on the build host.
 - Offscreen QML harness in the scratchpad for screenshots and interaction checks
   (`QT_FORCE_STDERR_LOGGING=1`).
 - Integration on gargoyle only from the main session (fleet rule). `cargo` work on the

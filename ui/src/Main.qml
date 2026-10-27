@@ -9,11 +9,13 @@ import "Columns.js" as Cols
 // footer; the gear swaps the blocks for the Settings page.
 ApplicationWindow {
     id: win
-    width: 560
+    width: 600
     // Hugs its content, from 300 px up to 720; past that the Applications
     // block scrolls.
     height: Math.max(minimumHeight, Math.min(720, Math.ceil(root.implicitHeight)))
-    minimumWidth: 520
+    // A float rule cannot crush the layout below this: every fixed column
+    // stays whole and the titles still show a few characters (SPEC-UI §4).
+    minimumWidth: 560
     minimumHeight: 300
     visible: true
     title: "PipeDeck"

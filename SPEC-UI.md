@@ -136,8 +136,11 @@ reference screenshots; this replaces the stacked list of every device of v1.0), 
 Omarchy's dark Material register with the theme accent where SoundSource uses green.
 Screenshots: `ui/docs/pipedeck-ui{,-devices,-fx}.png`.
 
-- **Geometry**: one `ApplicationWindow`, 560 px wide (SoundSource's proportion), minimum
-  520×300. The window **hugs its content**: its height follows the blocks, from 300 px up to
+- **Geometry**: one `ApplicationWindow`, 600 px wide, minimum 560×300 (set on the window, so
+  a compositor size rule cannot crush the fixed columns). The device / redirect column is
+  172 px: real names ("Digital Microphone", "ALC257 Analog", "Laptop speakers", "Follow
+  Output", "No Redirect") fit unelided at the default 13 px; app titles take what is left
+  (about 94 px), so a stream's media name is elided first and shown whole in the tooltip. The window **hugs its content**: its height follows the blocks, from 300 px up to
   720 px; past that the Applications list scrolls inside its block and nothing else moves.
   Rows are 36 px. Blocks are rounded panels a shade lighter than the window, radius
   `min(10, theme radius)`; buttons round to `min(height/2, theme radius)`, so Omarchy's
@@ -187,7 +190,7 @@ Screenshots: `ui/docs/pipedeck-ui{,-devices,-fx}.png`.
 
 ### 4.2 Row anatomy and the volume contract
 - Columns, left to right: glyph or app icon (20 px) · title (takes the rest) · mute (28) ·
-  slider (112) · percentage (42) · Boost (30) · device or redirect menu (134; Applications
+  slider (112) · percentage (42) · Boost (30) · device or redirect menu (172; Applications
   rows add the FX column's 30 to it) · FX (26). A row without a level (Sound Effects) gives
   its mute/slider/%/Boost cells to the title instead of drawing empty controls.
 - Slider → `SetVolume` coalesced to ≤20/s while dragging, final value on release; mute →

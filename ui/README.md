@@ -70,11 +70,11 @@ right, the rule under it (Omarchy 4.5's Lua helpers, as in
 o.bind("SUPER + CTRL + SHIFT + A", "PipeDeck", "pipedeck-ui")
 
 -- Optional: floating, 12 px from the right edge, on every workspace. No size:
--- the window is 560 px wide and as tall as its content (300-720 px). Drop any
+-- the window is 600 px wide and as tall as its content (300-720 px). Drop any
 -- line you don't want.
 o.window("^pipedeck-ui$", {
   float = true,
-  move = { "(monitor_w-572)", 40 },
+  move = { "(monitor_w-612)", 40 },
   pin = true,
 })
 ```

@@ -8,7 +8,10 @@ var mute = 28
 var slider = 112
 var percent = 42
 var boost = 30
-var device = 134    // the device / redirect popup button, with its warning
+// The device / redirect popup button, with its warning: wide enough for
+// "Digital Microphone" at 13 px in Adwaita Sans (116 px) beside the glyph and
+// the up/down mark (52 px of chrome), unelided.
+var device = 172
 var fx = 26
 var rowHeight = 36
 // "Volume" sits over the slider and percent; the mute cell before them is

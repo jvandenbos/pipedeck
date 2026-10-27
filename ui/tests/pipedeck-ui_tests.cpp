@@ -1287,6 +1287,10 @@ private slots:
         QVERIFY(!w.find("device:output"));
         QVERIFY(!w.find("applications"));
         QVERIFY(w.window->height() >= 300 && w.window->height() <= 720);
+        // The floor a compositor size rule cannot push below (SPEC-UI §4).
+        QCOMPARE(w.window->width(), 600);
+        QCOMPARE(w.window->minimumWidth(), 560);
+        QCOMPARE(w.window->minimumHeight(), 300);
     }
 
     // Opus 5 in the window: a click on the handle of a slider drawn at its

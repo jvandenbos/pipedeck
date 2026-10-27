@@ -57,6 +57,7 @@ AbstractButton {
             verticalAlignment: Text.AlignVCenter
         }
         Glyph {
+            Layout.rightMargin: 6
             name: "unfold"
             size: 14
             opacity: 0.6
